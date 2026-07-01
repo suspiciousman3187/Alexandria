@@ -1,0 +1,328 @@
+@import "tailwindcss";
+
+/* ── Design tokens (Tailwind utilities: text-accent, bg-accent, …) ──────────
+   The one Alexandria theme: Reimu Slate. Tokens below feed every utility. */
+@theme {
+  --color-bg:            #0d1311;
+  --color-accent:        #62a59a;
+  --color-accent-hover:  #78b4aa;
+  --color-accent-deep:   #49837a;
+  --color-on-accent:     #07140f; /* text/icons sitting on an accent fill */
+
+  --color-fg:     #f4f1ea; /* headings */
+  --color-fg-2:   #ddd8cd; /* body / labels */
+  --color-fg-3:   #dbd6ca; /* secondary */
+  --color-fg-4:   #c5c0b3; /* faint / captions */
+  --color-line:   #232c27;
+  --color-line-2: #38453d;
+  --color-track:  rgba(255, 255, 255, 0.15); /* toggle-off track */
+  --color-field:  rgba(0, 0, 0, 0.26);       /* input / segmented track */
+}
+
+/* ── Alexandria (Reimu Slate): rainy-shrine teal-green glass + rain slate ─── */
+:root {
+  --glass-nav:            rgba(10, 16, 13, 0.86);
+  --glass-surface:        rgba(16, 23, 19, 0.83);
+  --glass-surface-raised: rgba(23, 31, 26, 0.85);
+  --glass-surface-hover:  rgba(30, 40, 34, 0.86);
+  --glass-panel:          rgba(14, 20, 17, 0.83);
+  --glass-panel-alt:      rgba(22, 30, 25, 0.83);
+
+  --bg-glow:        rgba(98, 165, 154, 0.17);
+  --bg-grad-top:    #131a16;
+  --bg-grad-bottom: #0d1311;
+  --bg-dim:         rgba(8, 13, 11, 0.78);
+
+  --hairline:       rgba(255, 255, 255, 0.10);
+  --color-knob:     #ffffff;
+  --color-slider:     var(--color-accent);
+  --color-scrollbar:  rgba(255, 255, 255, 0.12);
+  --color-nav-active: var(--color-accent);
+  --color-toggle:     var(--color-accent);
+
+  --note-text:   rgb(252 211 77 / 0.92);
+  --note-bg:     rgb(245 158 11 / 0.12);
+  --note-border: rgb(245 158 11 / 0.55);
+
+  --ok-text:     #6ee7b7;
+  --ok-bg:       rgba(6, 78, 59, 0.40);
+  --ok-bg-hover: rgba(6, 78, 59, 0.60);
+  --ok-border:   rgba(16, 185, 129, 0.30);
+
+  --dur-instant: 90ms;
+  --dur-fast:    140ms;
+  --dur-base:    200ms;
+  --dur-slow:    320ms;
+  --dur-page:    420ms;
+  --ease-out:    cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in:     cubic-bezier(0.4, 0, 1, 1);
+  --ease-spring: cubic-bezier(0.34, 1.4, 0.64, 1);
+}
+
+.le-tap { transition: transform var(--dur-instant) var(--ease-spring), filter var(--dur-fast) var(--ease-out); }
+.le-tap:active:not(:disabled) { transform: scale(0.96); }
+.le-lift { transition: transform var(--dur-fast) var(--ease-out), background-color var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out); }
+.le-lift:hover:not(:disabled) { transform: translateY(-1px); }
+.le-lift:active:not(:disabled) { transform: translateY(0); }
+
+html, body, #root { height: 100%; }
+body {
+  margin: 0;
+  background: var(--color-bg);
+  color: #e4e4e7;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+/* ── Glass surfaces ──────────────────────────────────────────────────────────
+   The original design: translucent tint + GPU backdrop-filter blur. Works now
+   that the app runs non-elevated and WebView2 can composite on the GPU. */
+.bg-nav            { background-color: var(--glass-nav);            backdrop-filter: blur(18px) saturate(130%); -webkit-backdrop-filter: blur(18px) saturate(130%); }
+.bg-surface        { background-color: var(--glass-surface);        background-color: rgb(from var(--glass-surface) r g b / calc(alpha * var(--panel-opacity, 1)));        backdrop-filter: blur(18px) saturate(125%); -webkit-backdrop-filter: blur(18px) saturate(125%); }
+.bg-surface-raised { background-color: var(--glass-surface-raised); background-color: rgb(from var(--glass-surface-raised) r g b / calc(alpha * var(--panel-opacity, 1))); backdrop-filter: blur(18px) saturate(125%); -webkit-backdrop-filter: blur(18px) saturate(125%); }
+.bg-surface-hover  { background-color: var(--glass-surface-hover);  background-color: rgb(from var(--glass-surface-hover) r g b / calc(alpha * var(--panel-opacity, 1))); }
+.bg-panel          { background-color: var(--glass-panel);          background-color: rgb(from var(--glass-panel) r g b / calc(alpha * var(--panel-opacity, 1)));          backdrop-filter: blur(18px) saturate(125%); -webkit-backdrop-filter: blur(18px) saturate(125%); }
+.bg-panel-alt      { background-color: var(--glass-panel-alt);      background-color: rgb(from var(--glass-panel-alt) r g b / calc(alpha * var(--panel-opacity, 1))); }
+.bg-popover        { background-color: var(--glass-surface-raised); background-color: rgb(from var(--glass-surface-raised) r g b / 1); backdrop-filter: blur(18px) saturate(130%); -webkit-backdrop-filter: blur(18px) saturate(130%); }
+
+.bg-surface, .bg-surface-raised, .bg-panel, .bg-panel-alt {
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 1px 24px rgba(0, 0, 0, 0.30);
+}
+
+/* ── Semantic chips driven by tokens (re-theme automatically) ───────────── */
+.note   { color: var(--note-text); background: var(--note-bg); border-left: 2px solid var(--note-border); }
+.pill-on       { color: var(--color-on-accent); background: var(--color-accent); border: 1px solid transparent; }
+.pill-on:hover { background: var(--color-accent-hover); }
+.nav-active    { color: var(--color-on-accent); background-color: var(--color-nav-active); }
+
+/* ── Ambient background: glow + vertical gradient ────────────────────────── */
+/* absolute (not fixed) so it fills the app's own box — important for the
+   windowed dev preview, where the app is smaller than the viewport. */
+.le-bg {
+  position: absolute; inset: 0; z-index: -1; pointer-events: none;
+  background:
+    radial-gradient(1100px 460px at 60% -10%, var(--bg-glow), transparent 70%),
+    linear-gradient(var(--bg-dim), var(--bg-dim)),
+    url('/bg-reimu.jpg') center / cover no-repeat;
+  filter: brightness(var(--wallpaper-bright, 1));
+}
+
+:root[data-theme="lesserevil"] {
+  --color-bg:           #0f0f11;
+  --color-accent:       #c44545;
+  --color-accent-hover: #d65a5a;
+  --color-accent-deep:  #a52c2c;
+  --color-on-accent:    #ffffff;
+
+  --color-fg:   #fafafa;
+  --color-fg-2: #e4e4e7;
+  --color-fg-3: #dadae0;
+  --color-fg-4: #b8b8c2;
+  --color-line:   #2a2a30;
+  --color-line-2: #3f3f46;
+  --color-track:  rgba(255, 255, 255, 0.16);
+  --color-field:  rgba(0, 0, 0, 0.22);
+
+  --color-knob:       #ffffff;
+  --color-toggle:     #c44545;
+  --color-slider:     #c44545;
+  --color-nav-active: #c44545;
+  --color-scrollbar:  rgba(255, 255, 255, 0.12);
+
+  --glass-nav:            rgba(18, 18, 21, 0.85);
+  --glass-surface:        rgba(27, 27, 31, 0.85);
+  --glass-surface-raised: rgba(33, 33, 38, 0.85);
+  --glass-surface-hover:  rgba(40, 40, 46, 0.85);
+  --glass-panel:          rgba(23, 23, 27, 0.85);
+  --glass-panel-alt:      rgba(33, 33, 38, 0.85);
+
+  --bg-glow: rgba(165, 44, 44, 0.20);
+  --bg-dim:  rgba(23, 23, 28, 0.80);
+}
+:root[data-theme="lesserevil"] .le-bg {
+  background:
+    radial-gradient(1100px 420px at 50% -14%, var(--bg-glow), transparent 70%),
+    linear-gradient(var(--bg-dim), var(--bg-dim)),
+    url('/bg-overlay.jpg') center / cover no-repeat;
+  filter: brightness(var(--wallpaper-bright, 1));
+}
+
+:root[data-theme="gnosis"] {
+  --color-bg:           #0c120d;
+  --color-accent:       #5fa564;
+  --color-accent-hover: #74b878;
+  --color-accent-deep:  #4a8a50;
+  --color-on-accent:    #06140a;
+
+  --color-fg:   #f3f6f1;
+  --color-fg-2: #dde4da;
+  --color-fg-3: #c9d0c5;
+  --color-fg-4: #aab1a5;
+  --color-line:   #1e2a1f;
+  --color-line-2: #324034;
+  --color-track:  rgba(255, 255, 255, 0.15);
+  --color-field:  rgba(0, 0, 0, 0.24);
+
+  --color-knob:       #ffffff;
+  --color-toggle:     #5fa564;
+  --color-slider:     #5fa564;
+  --color-nav-active: #5fa564;
+  --color-scrollbar:  rgba(255, 255, 255, 0.12);
+
+  --glass-nav:            rgba(10, 16, 11, 0.86);
+  --glass-surface:        rgba(16, 23, 17, 0.84);
+  --glass-surface-raised: rgba(22, 30, 23, 0.85);
+  --glass-surface-hover:  rgba(29, 38, 30, 0.86);
+  --glass-panel:          rgba(14, 20, 15, 0.84);
+  --glass-panel-alt:      rgba(22, 30, 23, 0.84);
+
+  --bg-glow: rgba(95, 165, 100, 0.18);
+  --bg-dim:  rgba(8, 13, 9, 0.78);
+}
+:root[data-theme="gnosis"] .le-bg {
+  background:
+    radial-gradient(1100px 460px at 60% -10%, var(--bg-glow), transparent 70%),
+    linear-gradient(var(--bg-dim), var(--bg-dim)),
+    url('/bg-meadow.jpg') center / cover no-repeat;
+  filter: brightness(var(--wallpaper-bright, 1));
+}
+
+:root[data-theme="dawn"] {
+  --color-bg:           #0e1117;
+  --color-accent:       #d99a4e;
+  --color-accent-hover: #e6ac63;
+  --color-accent-deep:  #bd8038;
+  --color-on-accent:    #1a1206;
+
+  --color-fg:   #f4f3ef;
+  --color-fg-2: #dcdde2;
+  --color-fg-3: #c8cbd3;
+  --color-fg-4: #a7aab4;
+  --color-line:   #232734;
+  --color-line-2: #353b4d;
+  --color-track:  rgba(255, 255, 255, 0.15);
+  --color-field:  rgba(0, 0, 0, 0.24);
+
+  --color-knob:       #ffffff;
+  --color-toggle:     #d99a4e;
+  --color-slider:     #d99a4e;
+  --color-nav-active: #d99a4e;
+  --color-scrollbar:  rgba(255, 255, 255, 0.12);
+
+  --glass-nav:            rgba(12, 15, 22, 0.86);
+  --glass-surface:        rgba(18, 22, 31, 0.84);
+  --glass-surface-raised: rgba(24, 29, 40, 0.85);
+  --glass-surface-hover:  rgba(31, 37, 50, 0.86);
+  --glass-panel:          rgba(16, 20, 28, 0.84);
+  --glass-panel-alt:      rgba(24, 29, 40, 0.84);
+
+  --bg-glow: rgba(217, 154, 78, 0.18);
+  --bg-dim:  rgba(11, 14, 20, 0.74);
+}
+:root[data-theme="dawn"] .le-bg {
+  background:
+    radial-gradient(1100px 460px at 60% -10%, var(--bg-glow), transparent 70%),
+    linear-gradient(var(--bg-dim), var(--bg-dim)),
+    url('/bg-dawn.jpg') center / cover no-repeat;
+  filter: brightness(var(--wallpaper-bright, 1));
+}
+
+:root[data-maximized="1"] .le-bg {
+  background:
+    radial-gradient(1400px 520px at 50% -10%, var(--bg-glow), transparent 70%),
+    linear-gradient(var(--bg-dim), var(--bg-dim)),
+    url('/bg-reimu-wide.jpg') center / cover no-repeat;
+  filter: brightness(var(--wallpaper-bright, 1));
+}
+
+/* ── Smooth view-in on section switch ────────────────────────────────────── */
+@keyframes le-view-in {
+  from { opacity: 0; transform: translateY(14px); }
+  to   { opacity: 1; transform: none; }
+}
+.le-view {
+  animation: le-view-in var(--dur-page) var(--ease-out) both;
+  /* Reserve a stable scrollbar gutter so the scrollbar doesn't overlap the
+     right padding when it appears. Without this, panels look pushed against
+     the right edge (the scrollbar eats ~10px of the inner padding). */
+  scrollbar-gutter: stable;
+}
+
+/* Horizontal padding for the scrollable section content. Container queries
+   (anchored on the App root's @container) push more breathing room at narrow
+   widths — the Tailwind utility version of this wasn't honored consistently. */
+.le-pad > * { padding-left: 20px; padding-right: 20px; }
+@container (max-width: 460px) {
+  .le-pad > * { padding-left: 14px; padding-right: 24px; }
+}
+
+/* ── Open transitions for floating UI (dropdowns, menus, modals) ─────────────
+   These run on mount (the element is conditionally rendered), turning the
+   previously-instant pop-in into a quick, polished fade+scale. */
+@keyframes le-pop {
+  from { opacity: 0; transform: translateY(-4px) scale(0.97); }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes le-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes le-rise {
+  from { opacity: 0; transform: translateY(6px) scale(0.97); }
+  to   { opacity: 1; transform: none; }
+}
+.le-pop  { animation: le-pop var(--dur-fast) var(--ease-out) both; }
+.le-fade { animation: le-fade var(--dur-fast) ease-out both; }
+.le-rise { animation: le-rise var(--dur-base) var(--ease-out) both; }
+
+/* ── List item enter/leave (inventory rows, treasure pool) ───────────────────
+   Items added to or removed from a live list collapse/expand height + fade so
+   they glide in and out instead of jerking. max-height is capped at a value
+   above the tallest row; opacity hides the cap overshoot. */
+@keyframes le-row-in {
+  from { opacity: 0; max-height: 0; transform: translateX(-6px); }
+  to   { opacity: 1; max-height: 76px; transform: none; }
+}
+@keyframes le-row-out {
+  from { opacity: 1; max-height: 76px; transform: none; }
+  to   { opacity: 0; max-height: 0; transform: translateX(10px); }
+}
+.le-row-in  { animation: le-row-in var(--dur-base) var(--ease-out) both; overflow: hidden; }
+.le-row-out { animation: le-row-out var(--dur-base) var(--ease-in) both; overflow: hidden; pointer-events: none; }
+
+@keyframes le-tile-in  { from { opacity: 0; transform: scale(0.82); } to { opacity: 1; transform: none; } }
+@keyframes le-tile-out { from { opacity: 1; transform: scale(1); }    to { opacity: 0; transform: scale(0.82); } }
+.le-tile-in  { animation: le-tile-in var(--dur-fast) var(--ease-out) both; }
+.le-tile-out { animation: le-tile-out var(--dur-base) var(--ease-in) both; pointer-events: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-fg-4) transparent;
+}
+*::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--color-fg-4);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--color-fg-2);
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}

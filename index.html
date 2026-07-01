@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en" data-theme="crimson">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Alexandria</title>
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem('alexandria-theme');
+          var ok = { crimson: 1, meadow: 1, dawn: 1, minimalist: 1 };
+          if (t && ok[t]) document.documentElement.dataset.theme = t;
+        } catch (e) { /* default crimson */ }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

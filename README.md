@@ -198,6 +198,8 @@ For that, I would like to give thanks to all the addons that were used to make t
 - **Itemizer**
 - **AuctionHelper**
 - **Auctioneer**
+- **Icon Extractor**
+- **Lua Memory Helper**
 - **Drop**
 - **Dupefind**
 - **Trade**

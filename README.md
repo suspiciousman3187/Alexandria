@@ -179,7 +179,7 @@ page. Two assets are provided:
 ## Requirements
 
 - Windows 10 / 11
-- Final Fantasy XI installed (any region)
+- Final Fantasy XI installed
 - [Windower 4](https://www.windower.net/) with the Alexandria addon loaded
 - WebView2 runtime (pre-installed on modern Windows; auto-installs if missing)
 

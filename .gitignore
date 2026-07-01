@@ -4,21 +4,18 @@ dist-ssr
 *.local
 .DS_Store
 
-# Tauri (Rust build artifacts + generated bindings)
 src-tauri/target
 src-tauri/gen
 
-# updater signing key (KEEP SECRET, do not commit)
 src-tauri/alexandria-updater.key
 
-# generated icon pack + atlases (regenerate with: npm run build:icons / build:atlas)
 public/icons
 public/atlas
 
-# dev-only tooling (lookup/indexing, local-counter, verify script) - not part of the app
 tools/
 *.pyc
 
-# local dev noise / third-party reference material (not part of Alexandria)
+scripts/
+
 devlog.txt
 Auctioneer-main

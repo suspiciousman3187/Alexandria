@@ -1,6 +1,6 @@
 _addon.name = 'Alexandria'
 _addon.author = 'Noirblanc'
-_addon.version = '0.9.1'
+_addon.version = '0.0.1'
 _addon.commands = {'alexandria', 'alex', 'ax'}
 
 local socket = require('socket')

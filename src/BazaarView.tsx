@@ -1,17 +1,18 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { useKnownCharacters, useAvailableIcons, useBzBuy, bzOpen, bzApply, bzClose, bzMySync, bzScan, bzDeepScan, bzScanStop, bzBuy, nextBzBuy, bzRange, bzWatch, type MyBazaarItem, type BazaarSeller, type BazaarListing, type BazaarScan } from './bridge';
 import { IconInner } from './atlasIcon';
-import { Group, Segmented, Slider, SectionTabs, CharacterSelect, GilInput, Stepper, SearchInput } from './ui';
-import { Crossfade, Modal } from './overlay';
+import { Group, Segmented, SectionTabs, CharacterSelect, GilInput, Stepper, SearchInput } from './ui';
+import { Crossfade, Modal, Collapse } from './overlay';
 import { useItemHover } from './ItemTooltip';
 import { useCart, addToCart, setCartQty, removeFromCart, clearCart, getCart, cartKey, type CartEntry } from './bzCart';
 import { useSticky, useStickyChar } from './sticky';
 import { useSettings } from './settings';
 import { OpCard } from './OpCard';
+import { useBzBlacklist, addBzBlacklist, removeBzBlacklist } from './bzBlacklist';
+import { itemNameMatches } from './itemNames';
 
-const RANGE_KEY = 'alex_bz_range';
-const initialRange = () => { const v = Number(localStorage.getItem(RANGE_KEY)); return v >= 6 && v <= 50 ? v : 20; };
+const SCAN_RANGE = 50;
 
 const fmtGil = (v: number) => v.toLocaleString();
 
@@ -66,6 +67,24 @@ function MyBazaarPanel({ conn, items, assets, iconSet }: { conn: number; items: 
   const toggleAll = () => setSel(allOn ? new Set() : new Set(items.map((i) => i.slot)));
   const selSlots = items.filter((i) => sel.has(i.slot)).map((i) => i.slot);
 
+  // Click+drag to paint a selection across rows (like the inventory grid). The first row sets the
+  // mode (add if it wasn't selected, remove if it was); dragging over rows applies that mode.
+  const dragMode = useRef<boolean | null>(null);
+  const startDrag = (slot: number) => {
+    const adding = !sel.has(slot);
+    dragMode.current = adding;
+    setSel((s) => { const n = new Set(s); if (adding) n.add(slot); else n.delete(slot); return n; });
+  };
+  const dragOver = (slot: number) => {
+    if (dragMode.current === null) return;
+    setSel((s) => { const n = new Set(s); if (dragMode.current) n.add(slot); else n.delete(slot); return n; });
+  };
+  useEffect(() => {
+    const up = () => { dragMode.current = null; };
+    window.addEventListener('pointerup', up);
+    return () => window.removeEventListener('pointerup', up);
+  }, []);
+
   const listSelected = () => {
     const price = Number(bulkPrice);
     if (!price || price <= 0 || selSlots.length === 0) return;
@@ -112,15 +131,18 @@ function MyBazaarPanel({ conn, items, assets, iconSet }: { conn: number; items: 
               animate={{ opacity: 1, x: 0 }}
               exit={{ opacity: 0, x: 10 }}
               transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
+              onPointerEnter={() => dragOver(it.slot)}
               className="flex items-center gap-3 px-3 py-2"
             >
             <Check on={sel.has(it.slot)} onClick={() => toggle(it.slot)} />
-            <Icon id={it.id} n={it.n} assets={assets} iconSet={iconSet} />
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2">
-                <span className="text-[13px] font-semibold text-fg truncate">{it.n}</span>
-                {it.count > 1 && <span className="shrink-0 text-[10px] font-bold tabular-nums px-1.5 py-0.5 rounded bg-field text-fg-3">×{it.count}</span>}
-                {it.listed && <span className="shrink-0 text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300">listed</span>}
+            <div className="flex items-center gap-3 min-w-0 flex-1 cursor-pointer select-none" onPointerDown={(e) => { e.preventDefault(); startDrag(it.slot); }}>
+              <Icon id={it.id} n={it.n} assets={assets} iconSet={iconSet} />
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <span className="text-[13px] font-semibold text-fg truncate">{it.n}</span>
+                  {it.count > 1 && <span className="shrink-0 text-[10px] font-bold tabular-nums px-1.5 py-0.5 rounded bg-field text-fg-3">×{it.count}</span>}
+                  {it.listed && <span className="shrink-0 text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300">listed</span>}
+                </div>
               </div>
             </div>
             <div className="flex items-center gap-1.5 shrink-0">
@@ -207,6 +229,7 @@ function ItemRow({ row, assets, iconSet, inCart, onBuy, onAddList }: { row: Row;
 
 function BuyModal({ conn, row, gil, assets, iconSet, onClose }: { conn: number; row: Row; gil: number; assets?: string; iconSet: Set<number>; onClose: () => void }) {
   const [qty, setQty] = useState(1);
+  const [note, setNote] = useState<string | null>(null);
   const total = row.price * qty;
   const afford = gil >= total;
   const inCart = getCart().some((c) => c.key === cartKey(row.sellerId, row.bidx));
@@ -235,11 +258,12 @@ function BuyModal({ conn, row, gil, assets, iconSet, onClose }: { conn: number; 
             Buy <span className="font-extrabold text-accent">{qty}{row.qty > 1 ? ` of ${row.qty}` : ''}</span> for <span className={`font-extrabold tabular-nums ${afford ? 'text-amber-300' : 'text-red-300'}`}>{fmtGil(total)} gil</span>?
           </div>
           {!afford && <div className="text-[11px] text-red-300">Not enough gil — you have {fmtGil(gil)}.</div>}
+          {note && <div className="text-[11px] text-amber-300">{note}</div>}
 
           <div className="flex items-center gap-2 pt-1">
             <button onClick={close} className="px-3 py-2 text-[12px] font-semibold rounded-md border border-line text-fg-3 hover:text-fg transition-colors">Cancel</button>
             <button
-              onClick={() => { addToCart(entryFromRow(row, qty)); close(); }}
+              onClick={() => { if (addToCart(entryFromRow(row, qty))) close(); else setNote(`Single ${row.n} is capped at one stack in the buy list.`); }}
               className="le-tap px-3 py-2 text-[12px] font-semibold rounded-md border border-line bg-field text-fg-2 hover:bg-surface-hover transition-colors"
             >
               {inCart ? 'Update List' : 'Add to List'}
@@ -269,6 +293,8 @@ function CartModal({ conn, gil, assets, iconSet, onClose }: { conn: number; gil:
   const total = cart.reduce((s, e) => s + e.price * e.qty, 0);
   const units = cart.reduce((s, e) => s + e.qty, 0);
   const afford = gil >= total;
+  const canMaxAll = cart.some((e) => e.qty < e.maxQty);
+  const maxAll = () => { for (const e of getCart()) if (e.qty < e.maxQty) setCartQty(e.key, e.maxQty); };
 
   const run = async () => {
     const entries = getCart();
@@ -298,7 +324,12 @@ function CartModal({ conn, gil, assets, iconSet, onClose }: { conn: number; gil:
           <div className="flex items-center gap-2 px-4 pt-4 pb-2 shrink-0">
             <span className="text-[14px] font-bold text-fg">Buy List</span>
             <span className="text-[11px] text-fg-4 tabular-nums">{cart.length} listing{cart.length === 1 ? '' : 's'} · {units} item{units === 1 ? '' : 's'}</span>
-            {cart.length > 0 && !running && <button onClick={() => { clearCart(); setStatus({}); setFinished(false); }} className="ml-auto text-[11px] font-semibold text-fg-4 hover:text-red-300 transition-colors">Clear</button>}
+            {cart.length > 0 && !running && (
+              <div className="ml-auto flex items-center gap-2.5">
+                <button onClick={maxAll} disabled={!canMaxAll} className="text-[11px] font-semibold text-accent enabled:hover:text-accent-hover disabled:opacity-40 disabled:cursor-default transition-colors">Max All</button>
+                <button onClick={() => { clearCart(); setStatus({}); setFinished(false); }} className="text-[11px] font-semibold text-fg-4 hover:text-red-300 transition-colors">Clear</button>
+              </div>
+            )}
           </div>
 
           <div className="flex-1 min-h-0 overflow-y-auto px-4 divide-y divide-line">
@@ -357,6 +388,68 @@ function CartModal({ conn, gil, assets, iconSet, onClose }: { conn: number; gil:
   );
 }
 
+function BlacklistModal({ sellerNames, onClose }: { sellerNames: string[]; onClose: () => void }) {
+  const list = useBzBlacklist();
+  const [q, setQ] = useState('');
+  const blockedSet = useMemo(() => new Set(list.map((n) => n.toLowerCase())), [list]);
+  const add = (name?: string) => { const n = (name ?? q).trim(); if (n) { addBzBlacklist(n); setQ(''); } };
+  const candidates = useMemo(() => {
+    const ql = q.trim().toLowerCase();
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const n of sellerNames) {
+      const key = n.toLowerCase();
+      if (seen.has(key) || blockedSet.has(key)) continue;
+      if (ql && !key.includes(ql)) continue;
+      seen.add(key); out.push(n);
+    }
+    return out.sort((a, b) => a.localeCompare(b));
+  }, [sellerNames, blockedSet, q]);
+  return (
+    <Modal onClose={onClose} panelClass="w-[min(94vw,380px)] max-h-[80vh]">
+      <div className="p-4 flex flex-col gap-3">
+        <div className="text-[14px] font-bold text-fg">Blacklisted Sellers</div>
+        <div className="flex items-center gap-2">
+          <input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') add(); }}
+            placeholder="Player name"
+            className="flex-1 bg-field border border-line rounded-md px-3 py-1.5 text-xs text-fg-2 placeholder-fg-4 outline-none focus:border-accent/50"
+          />
+          <button onClick={() => add()} disabled={!q.trim()} className="px-3 py-1.5 text-[12px] font-bold rounded-md bg-accent text-on-accent enabled:hover:bg-accent-hover disabled:opacity-40 transition-colors">Add</button>
+        </div>
+        {candidates.length > 0 && (
+          <div className="flex flex-col gap-1.5">
+            <div className="text-[10px] font-bold tracking-wide text-fg-4 uppercase">Nearby Bazaars</div>
+            <div className="flex flex-wrap gap-1.5 max-h-28 overflow-y-auto">
+              {candidates.map((n) => (
+                <button key={n} onClick={() => add(n)} title={`Blacklist ${n}`} className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium rounded-full border border-line bg-field text-fg-2 hover:border-red-400/50 hover:text-red-200 hover:bg-red-500/10 transition-colors">
+                  <span className="truncate max-w-[130px]">{n}</span>
+                  <svg viewBox="0 0 24 24" className="w-3 h-3 text-fg-4" fill="none" stroke="currentColor" strokeWidth={2.4} strokeLinecap="round"><path d="M12 5v14M5 12h14" /></svg>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        <div className="text-[10px] font-bold tracking-wide text-fg-4 uppercase">Blocked{list.length ? ` · ${list.length}` : ''}</div>
+        {list.length === 0 ? (
+          <div className="text-center text-[12px] text-fg-4 py-3">No Sellers Blocked</div>
+        ) : (
+          <div className="rounded-lg border border-line bg-surface overflow-hidden divide-y divide-line max-h-52 overflow-y-auto">
+            {list.map((n) => (
+              <div key={n} className="flex items-center gap-2 px-3 py-1.5">
+                <span className="min-w-0 flex-1 truncate text-[12px] text-fg-2">{n}</span>
+                <button onClick={() => removeBzBlacklist(n)} aria-label="Unblock" className="shrink-0 grid place-items-center w-5 h-5 rounded text-fg-4 hover:text-fg hover:bg-line transition-colors">×</button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
 type SortKey = 'price' | 'priceDesc' | 'name' | 'dist' | 'seller';
 const SORTS: { v: SortKey; label: string }[] = [
   { v: 'price', label: 'Price' }, { v: 'priceDesc', label: 'Price ↓' }, { v: 'name', label: 'Name' }, { v: 'dist', label: 'Distance' }, { v: 'seller', label: 'Seller' },
@@ -374,9 +467,14 @@ function BrowsePanel({ conn, sellers, listings, scan, mem, gil, assets, iconSet 
   const cartTotal = cart.reduce((s, e) => s + e.price * e.qty, 0);
   const [now, setNow] = useState(Date.now());
   useEffect(() => { const t = setInterval(() => setNow(Date.now()), 30000); return () => clearInterval(t); }, []);
-  const [range, setRange] = useState(initialRange);
-  useEffect(() => { bzRange(conn, range); }, [conn]);
-  const changeRange = (v: number) => { setRange(v); localStorage.setItem(RANGE_KEY, String(v)); bzRange(conn, v); };
+  useEffect(() => { bzRange(conn, SCAN_RANGE); }, [conn]);
+  const blacklist = useBzBlacklist();
+  const blocked = useMemo(() => new Set(blacklist.map((n) => n.toLowerCase())), [blacklist]);
+  const nearby = useMemo(() => sellers.filter((s) => !blocked.has(s.name.toLowerCase())), [sellers, blocked]);
+  const sellerNames = useMemo(() => sellers.map((s) => s.name), [sellers]);
+  const [blOpen, setBlOpen] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  useEffect(() => { if (!notice) return; const t = setTimeout(() => setNotice(null), 3500); return () => clearTimeout(t); }, [notice]);
 
   const byId = useMemo(() => new Map(sellers.map((s) => [s.id, s])), [sellers]);
 
@@ -385,6 +483,7 @@ function BrowsePanel({ conn, sellers, listings, scan, mem, gil, assets, iconSet 
     const count: Record<number, number> = {};
     const all: Row[] = [];
     for (const listing of Object.values(listings)) {
+      if (blocked.has(listing.seller.toLowerCase())) continue;
       const s = byId.get(listing.sellerId);
       for (const it of listing.items) {
         if (min[it.id] === undefined || it.price < min[it.id]) min[it.id] = it.price;
@@ -394,14 +493,14 @@ function BrowsePanel({ conn, sellers, listings, scan, mem, gil, assets, iconSet 
     }
     for (const r of all) r.cheapest = count[r.id] > 1 && r.price === min[r.id];
     return all;
-  }, [listings, byId]);
+  }, [listings, byId, blocked]);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     return rows.filter((r) => {
       if (affordable && r.price > gil) return false;
       if (!q) return true;
-      return r.n.toLowerCase().includes(q) || r.seller.toLowerCase().includes(q);
+      return itemNameMatches(r.id, r.n, q) || r.seller.toLowerCase().includes(q);
     });
   }, [rows, search, affordable, gil]);
 
@@ -429,7 +528,6 @@ function BrowsePanel({ conn, sellers, listings, scan, mem, gil, assets, iconSet 
     return [...m.values()].sort((a, b) => a.dist - b.dist);
   }, [sorted]);
 
-  const inRangeCount = sellers.filter((s) => s.dist <= range).length;
   const scanning = !!scan?.active;
   const newestAt = useMemo(() => Math.max(0, ...Object.values(listings).map((l) => l.at)), [listings]);
   const sellerMatchNote = search.trim() && arrange === 'seller' ? ` · ${groups.length} of ${Object.keys(listings).length} sellers match` : '';
@@ -438,19 +536,21 @@ function BrowsePanel({ conn, sellers, listings, scan, mem, gil, assets, iconSet 
     <>
       <div className="flex items-center justify-between gap-2 mb-3">
         <div className="flex items-center gap-1.5 text-[11px] min-w-0">
-          <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${sellers.length ? 'bg-emerald-400' : 'bg-fg-4'}`} />
-          <span className={`truncate ${sellers.length ? 'text-emerald-300' : 'text-fg-4'}`}>{sellers.length ? `${sellers.length} ${mem ? 'nearby' : 'known'}, ${inRangeCount} to scan` : (mem ? 'No bazaars nearby.' : 'No bazaars known. Walk up to detect, or Deep Scan.')}</span>
+          <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${nearby.length ? 'bg-emerald-400' : 'bg-fg-4'}`} />
+          <span className={`truncate ${nearby.length ? 'text-emerald-300' : 'text-fg-4'}`}>{nearby.length ? `${nearby.length} Bazaar${nearby.length === 1 ? '' : 's'} ${mem ? 'Detected Nearby' : 'Known'}` : (mem ? 'No bazaars nearby.' : 'No bazaars known. Walk up to detect, or Deep Scan.')}</span>
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
-          <button onClick={() => bzScan(conn)} disabled={scanning || inRangeCount === 0} title={inRangeCount === 0 ? 'No bazaars within scan range' : undefined} className="px-3 py-1.5 text-[12px] font-bold rounded-md bg-accent text-on-accent enabled:hover:bg-accent-hover disabled:opacity-40 transition-colors">Scan Nearby</button>
+          <button onClick={() => setBlOpen(true)} title="Blacklisted sellers" className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] font-bold rounded-md border transition-colors ${blacklist.length ? 'border-red-400/50 bg-red-500/15 text-red-200 hover:bg-red-500/25' : 'border-line-2 bg-field text-fg-2 hover:text-fg hover:border-accent/50'}`}>
+            <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2.2} strokeLinecap="round"><circle cx="12" cy="12" r="9" /><path d="M5.6 5.6l12.8 12.8" /></svg>
+            Blacklist
+            {blacklist.length > 0 && <span className="grid place-items-center min-w-[16px] h-4 px-1 rounded-full bg-red-400 text-[10px] font-extrabold tabular-nums text-[#2a0000]">{blacklist.length}</span>}
+          </button>
+          <button onClick={() => bzScan(conn)} disabled={scanning || nearby.length === 0} title={nearby.length === 0 ? 'No bazaars nearby' : undefined} className="px-3 py-1.5 text-[12px] font-bold rounded-md bg-accent text-on-accent enabled:hover:bg-accent-hover disabled:opacity-40 transition-colors">Scan Nearby</button>
           {!mem && <button onClick={() => bzDeepScan(conn)} disabled={scanning} title="Check every nearby player for a bazaar" className="px-2.5 py-1.5 text-[11px] font-semibold rounded-md border border-line bg-field text-fg-3 hover:text-fg disabled:opacity-40 transition-colors">Deep Scan</button>}
         </div>
       </div>
-      <div className="flex items-center gap-3 mb-3">
-        <span className="text-[11px] font-semibold text-fg-3 shrink-0">Scan Range</span>
-        <div className="flex-1"><Slider value={range} min={6} max={50} step={1} suffix="y" onChange={changeRange} /></div>
-      </div>
       {scan && scanning && <ScanBar scan={scan} onStop={() => bzScanStop(conn)} />}
+      <Collapse open={!!notice}>{notice && <div className="mb-3 px-3 py-2 rounded-lg text-[11px] font-semibold border bg-amber-500/15 border-amber-500/40 text-amber-200">{notice}</div>}</Collapse>
 
       {rows.length === 0 ? (
         <div className="text-[12px] text-fg-4 text-center py-10">{scanning ? 'Reading bazaars…' : 'Scan to compile listings from nearby bazaars.'}</div>
@@ -479,7 +579,7 @@ function BrowsePanel({ conn, sellers, listings, scan, mem, gil, assets, iconSet 
               <AnimatePresence mode="popLayout" initial={false}>
                 {sorted.map((r) => (
                   <motion.div key={`${r.sellerId}-${r.bidx}`} layout initial={{ opacity: 0, x: -6 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 10 }} transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}>
-                    <ItemRow row={r} assets={assets} iconSet={iconSet} inCart={cartKeys.has(cartKey(r.sellerId, r.bidx))} onBuy={() => setBuying(r)} onAddList={() => addToCart(entryFromRow(r, 1))} />
+                    <ItemRow row={r} assets={assets} iconSet={iconSet} inCart={cartKeys.has(cartKey(r.sellerId, r.bidx))} onBuy={() => setBuying(r)} onAddList={() => { if (!addToCart(entryFromRow(r, 1))) setNotice(`Single ${r.n} is capped at one stack in the buy list.`); }} />
                   </motion.div>
                 ))}
               </AnimatePresence>
@@ -493,7 +593,8 @@ function BrowsePanel({ conn, sellers, listings, scan, mem, gil, assets, iconSet 
                   right={
                     <div className="flex items-center gap-2">
                       {g.at > 0 && <span className="text-[10px] text-fg-4">{agoLabel(g.at, now)}</span>}
-                      <button onClick={() => bzOpen(conn, g.sellerId, g.sellerIndex)} className="px-2 py-1 text-[10px] font-semibold rounded-md border border-line bg-field text-fg-3 hover:text-fg transition-colors">Refresh</button>
+                      <button onClick={() => bzOpen(conn, g.sellerId, g.sellerIndex)} disabled={!g.inrange} title={g.inrange ? undefined : 'Seller is out of range'} className="px-2 py-1 text-[10px] font-semibold rounded-md border border-line bg-field text-fg-3 enabled:hover:text-fg disabled:opacity-40 transition-colors">Refresh</button>
+                      <button onClick={() => addBzBlacklist(g.seller)} title="Hide this seller from results" className="px-2 py-1 text-[10px] font-semibold rounded-md border border-line bg-field text-fg-3 hover:text-red-300 hover:border-red-400/40 transition-colors">Block</button>
                     </div>
                   }
                 >
@@ -501,7 +602,7 @@ function BrowsePanel({ conn, sellers, listings, scan, mem, gil, assets, iconSet 
                     <AnimatePresence mode="popLayout" initial={false}>
                       {g.rows.map((r) => (
                         <motion.div key={`${r.sellerId}-${r.bidx}`} layout initial={{ opacity: 0, x: -6 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 10 }} transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}>
-                          <ItemRow row={r} assets={assets} iconSet={iconSet} inCart={cartKeys.has(cartKey(r.sellerId, r.bidx))} onBuy={() => setBuying(r)} onAddList={() => addToCart(entryFromRow(r, 1))} />
+                          <ItemRow row={r} assets={assets} iconSet={iconSet} inCart={cartKeys.has(cartKey(r.sellerId, r.bidx))} onBuy={() => setBuying(r)} onAddList={() => { if (!addToCart(entryFromRow(r, 1))) setNotice(`Single ${r.n} is capped at one stack in the buy list.`); }} />
                         </motion.div>
                       ))}
                     </AnimatePresence>
@@ -531,6 +632,7 @@ function BrowsePanel({ conn, sellers, listings, scan, mem, gil, assets, iconSet 
 
       {buying && <BuyModal conn={conn} row={buying} gil={gil} assets={assets} iconSet={iconSet} onClose={() => setBuying(null)} />}
       {cartOpen && <CartModal conn={conn} gil={gil} assets={assets} iconSet={iconSet} onClose={() => setCartOpen(false)} />}
+      {blOpen && <BlacklistModal sellerNames={sellerNames} onClose={() => setBlOpen(false)} />}
     </>
   );
 }

@@ -3,8 +3,9 @@ import { AnimatePresence, motion } from 'motion/react';
 import { useKnownCharacters, useAvailableIcons, dboxOpen, dboxClose, dboxTake, dboxTakeAll, dboxReturn, dboxSendMany, dboxSendGil, GIL_MAIL_CAP, dboxCancel, NOMAD_BAGS, inNomadZone, nomadReachable, type KnownChar, type DboxSlot, type InvItem, type DboxSendItem } from './bridge';
 import { IconInner } from './atlasIcon';
 import { useItemHover } from './ItemTooltip';
+import { itemNameMatches } from './itemNames';
 import { CharacterSelect, Segmented, Stepper, GilInput, BagTag, SearchInput } from './ui';
-import { Modal, Collapse } from './overlay';
+import { Modal, Collapse, Popover } from './overlay';
 import { GilIcon } from './GilIcon';
 import { useStickyChar } from './sticky';
 import { useSettings } from './settings';
@@ -173,8 +174,7 @@ function RecipientCombo({ value, onChange, chars }: { value: string; onChange: (
         placeholder="Recipient character name"
         className="w-full bg-field border border-line rounded-md px-3 py-2 text-[13px] text-fg-2 placeholder-fg-4 outline-none focus:border-accent/50 transition-colors"
       />
-      {open && matches.length > 0 && (
-        <div className="absolute z-[60] left-0 right-0 mt-1 rounded-md border border-line bg-popover shadow-xl max-h-52 overflow-y-auto py-1">
+      <Popover open={open && matches.length > 0} anchor={ref} className="rounded-md border border-line bg-popover shadow-xl max-h-52 overflow-y-auto py-1">
           {matches.map((c) => (
             <button
               key={c.name}
@@ -185,8 +185,7 @@ function RecipientCombo({ value, onChange, chars }: { value: string; onChange: (
               <span className="truncate">{anon(c.name)}</span>
             </button>
           ))}
-        </div>
-      )}
+        </Popover>
     </div>
   );
 }
@@ -226,7 +225,7 @@ function MailModal({ char, recipients, iconSet, onClose }: { char: KnownChar; re
       const items = [];
       for (const it of bag.items) {
         if (!sendable(it)) continue;
-        if (s && !it.n.toLowerCase().includes(s)) continue;
+        if (s && !itemNameMatches(it.id, it.n, s)) continue;
         items.push({ id: it.id, bag: bag.id, bagName: bag.b, slot: it.s, n: it.n, c: it.c });
       }
       if (items.length) out.push({ id: bag.id, name: bag.b, items });

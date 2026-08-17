@@ -5,6 +5,7 @@ import { Group, Row, RowStacked, Select, CharacterSelect, SearchInput } from './
 import { useCommands, setAliases, runAxCommand, VERB_USAGES, VERB_FORMS, type Alias, type Param } from './commands';
 import { useSticky, useStickyChar } from './sticky';
 import { useAnon } from './anonymize';
+import { Collapse } from './overlay';
 
 const BAG_OPTS: [string, string][] = [
   ['inventory', 'Inventory'], ['satchel', 'Satchel'], ['sack', 'Sack'], ['case', 'Case'],
@@ -197,12 +198,12 @@ export default function CommandsView() {
           <svg className={`w-3.5 h-3.5 shrink-0 text-fg-4 transition-transform ${refOpen ? 'rotate-90' : ''}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m9 6 6 6-6 6" /></svg>
           <span className="text-[12px] text-fg-3">{VERB_USAGES.length} built-in verbs</span>
         </button>
-        {refOpen && (
+        <Collapse open={refOpen}>
           <div className="px-3.5 pb-3 flex flex-col gap-1">
             {VERB_USAGES.map((u) => <code key={u} className="text-[11px] font-mono text-fg-3">{u}</code>)}
             <code className="text-[11px] font-mono text-fg-4 mt-1">help · list</code>
           </div>
-        )}
+        </Collapse>
       </Group>
 
       <p className="mt-2 text-[10px] text-fg-4 leading-snug">In-game: <span className="font-mono text-fg-3">//ax &lt;alias-or-verb&gt;</span> (or //alex). Results print to your chat log.</p>

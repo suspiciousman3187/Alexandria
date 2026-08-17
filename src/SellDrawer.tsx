@@ -1,9 +1,9 @@
 import { useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { ahSell, addPendingListing, newBatchId, dismissBatch, useAhListings, type InvItem, type InvBag, type KnownChar } from './bridge';
+import { ahSell, addPendingListing, newBatchId, dismissBatch, useAhListings, type InvItem, type SelItem, type KnownChar } from './bridge';
 import { IconInner } from './atlasIcon';
 import { Segmented, GilInput, Stepper } from './ui';
-import { Modal, Crossfade } from './overlay';
+import { Modal, Crossfade, Collapse } from './overlay';
 import { useItemHover } from './ItemTooltip';
 import { MarketLookup } from './MarketBlock';
 import { useAnon } from './anonymize';
@@ -11,7 +11,7 @@ import { OpCard, OpGlyph, type OpState } from './OpCard';
 
 const toOp = (s: 'pending' | 'ok' | 'fail'): OpState => (s === 'pending' ? 'active' : s);
 
-type StageItem = { item: InvItem; single: number; price: string; qty: number };
+type StageItem = { item: SelItem; single: number; price: string; qty: number };
 const priceOf = (s: string) => Number(s.replace(/[,\s]/g, '')) || 0;
 
 function Icon({ id, n, c, assets, iconSet }: { id: number; n: string; c?: number; assets?: string; iconSet: Set<number> }) {
@@ -50,7 +50,7 @@ function StageRow({ row, assets, iconSet, server, onChange, onRemove }: { row: S
         <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round"><path d="m2 7 4.4-4.4a2 2 0 0 1 1.4-.6h8.4a2 2 0 0 1 1.4.6L22 7" /><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8" /><path d="M2 7h20" /></svg>
         {showMkt ? 'Hide FFXIAH Prices' : 'Show FFXIAH Prices'}
       </button>
-      {showMkt && <MarketLookup id={item.id} stack={single === 0} server={server} />}
+      <Collapse open={showMkt}><MarketLookup id={item.id} stack={single === 0} server={server} /></Collapse>
     </div>
   );
 }
@@ -88,12 +88,13 @@ function BatchProgress({ batchId, onClear }: { batchId: number; onClear: () => v
   );
 }
 
-export function SellDrawer({ char, bag, items, iconSet, onClose, onListed }: { char: KnownChar; bag: InvBag; items: InvItem[]; iconSet: Set<number>; onClose: () => void; onListed?: () => void }) {
+export function SellDrawer({ char, items, iconSet, onClose, onListed }: { char: KnownChar; items: SelItem[]; iconSet: Set<number>; onClose: () => void; onListed?: () => void }) {
   const anon = useAnon();
   const atah = !!(char.atah ?? char.ah?.atah);
   const conn = char.conn ?? undefined;
-  const fromBag = bag.id !== 0;
-  const [stage, setStage] = useState<StageItem[]>(() => items.map((it) => ({ item: it, single: 1, price: '', qty: 1 })));
+  const anyFromBag = items.some((it) => it.bag !== 0);
+  // Defensive: only auction-eligible items can be listed (not Ex/No-Trade or No-AH = 0x0A, and not augmented).
+  const [stage, setStage] = useState<StageItem[]>(() => items.filter((it) => !((it.f ?? 0) & 0x0A) && !(it.aug && it.aug.length)).map((it) => ({ item: it, single: 1, price: '', qty: 1 })));
   const [batchId, setBatchId] = useState<number | null>(null);
 
   const patchRow = (id: number, patch: Partial<StageItem>) => setStage((s) => s.map((x) => (x.item.id === id ? { ...x, ...patch } : x)));
@@ -107,7 +108,8 @@ export function SellDrawer({ char, bag, items, iconSet, onClose, onListed }: { c
     const id = newBatchId();
     for (const r of ready) {
       const price = priceOf(r.price);
-      ahSell(conn, r.item.id, r.single, price, r.qty, fromBag ? bag.id : undefined, fromBag ? r.item.s : undefined);
+      const fb = r.item.bag !== 0;
+      ahSell(conn, r.item.id, r.single, price, r.qty, fb ? r.item.bag : undefined, fb ? r.item.s : undefined);
       for (let i = 0; i < r.qty; i++) addPendingListing(conn, r.item.n, id);
     }
     setBatchId(id);
@@ -135,7 +137,7 @@ export function SellDrawer({ char, bag, items, iconSet, onClose, onListed }: { c
               ) : (
                 <>
                   {!atah && <div className="text-[11px] text-amber-300 border border-amber-500/30 bg-amber-500/10 rounded-md px-2.5 py-1.5">{anon(char.name)} must be in a zone with an auction house to list items for sale.</div>}
-                  {fromBag && <div className="text-[11px] text-fg-4 leading-snug">These aren't in your main Inventory. Alexandria moves each to Inventory first, then lists it. The bag must be accessible from where you're standing.</div>}
+                  {anyFromBag && <div className="text-[11px] text-fg-4 leading-snug">Some of these aren't in your main Inventory. Alexandria moves each to Inventory first, then lists it. The bag must be accessible from where you're standing.</div>}
                   {stage.length === 0 ? (
                     <div className="text-center text-[12px] text-fg-4 py-8">No auctionable items selected.</div>
                   ) : (

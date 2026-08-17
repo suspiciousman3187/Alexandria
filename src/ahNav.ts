@@ -28,6 +28,7 @@ export function closeAhDetail() {
   notify();
 }
 export function clearNavTo() { navTo = null; notify(); }
+export function navToSection(s: Section) { navTo = s; notify(); }
 
 export function useAhDetailTarget(): AhDetailTarget | null {
   return useSyncExternalStore(sub, () => target, () => target);

@@ -67,14 +67,14 @@ export const SKIRMISH_WEAPON: string[] = [
 export const SKIRMISH_ARMOR: string[] = [
   "Beatific Shield", "Beatific Shield +1", "Cizin Breeches", "Cizin Breeches +1", "Cizin Greaves",
   "Cizin Greaves +1", "Cizin Helm", "Cizin Helm +1", "Cizin Mail", "Cizin Mail +1", "Cizin Mufflers",
-  "Cizin Mufflers +1", "Gendewitha Bliaut", "Gendewitha Bliaut +1", "Gendewitha Caubeen",
-  "Gendewitha Caubeen +1", "Gendewitha Gages", "Gendewitha Gages +1", "Gendewitha Galoshes",
-  "Gendewitha Galoshes +1", "Gendewitha Spats", "Gendewitha Spats +1", "Hag. Sabots +1", "Hagondes Coat",
+  "Cizin Mufflers +1", "Gendewitha Bliaut", "Gende. Bliaut +1", "Gende. Caubeen",
+  "Gende. Caubeen +1", "Gendewitha Gages", "Gende. Gages +1", "Gende. Galoshes",
+  "Gende. Galosh. +1", "Gendewitha Spats", "Gende. Spats +1", "Hag. Sabots +1", "Hagondes Coat",
   "Hagondes Coat +1", "Hagondes Cuffs", "Hagondes Cuffs +1", "Hagondes Hat", "Hagondes Hat +1",
   "Hagondes Pants", "Hagondes Pants +1", "Hagondes Sabots", "Iuitl Gaiters", "Iuitl Gaiters +1",
   "Iuitl Headgear", "Iuitl Headgear +1", "Iuitl Tights", "Iuitl Tights +1", "Iuitl Vest", "Iuitl Vest +1",
   "Iuitl Wristbands", "Iuitl Wristbands +1", "Otronif Boots", "Otronif Boots +1", "Otronif Brais",
-  "Otronif Brais +1", "Otronif Gloves", "Otronif Gloves +1", "Otronif Harness", "Otronif Harness +1",
+  "Otronif Brais +1", "Otronif Gloves", "Otronif Gloves +1", "Otronif Harness", "Otro. Harness +1",
   "Otronif Mask", "Otronif Mask +1",
 ];
 
@@ -86,7 +86,7 @@ export const ALLUVION_SKIRMISH_WEAPON: string[] = [
 export const ALLUVION_SKIRMISH_ARMOR: string[] = [
   "Acro Breeches", "Acro Gauntlets", "Acro Helm", "Acro Leggings", "Acro Surcoat", "Helios Band",
   "Helios Boots", "Helios Gloves", "Helios Jacket", "Helios Spats", "Taeon Boots", "Taeon Chapeau",
-  "Taeon Gloves", "Taeon Tabard", "Taeon Tights", "Telchine Braconi", "Telchine Cap", "Telchine Chasuble",
+  "Taeon Gloves", "Taeon Tabard", "Taeon Tights", "Telchine Braconi", "Telchine Cap", "Telchine Chas.",
   "Telchine Gloves", "Telchine Pigaches", "Yorium Barbuta", "Yorium Cuirass", "Yorium Cuisses",
   "Yorium Gauntlets", "Yorium Sabatons",
 ];
@@ -100,7 +100,7 @@ export const GEAS_FETE_ARMOR: string[] = [
   "Chironic Doublet", "Chironic Gloves", "Chironic Hat", "Chironic Hose", "Chironic Slippers",
   "Herculean Boots", "Herculean Gloves", "Herculean Helm", "Herculean Trousers", "Herculean Vest",
   "Merlinic Crackows", "Merlinic Dastanas", "Merlinic Hood", "Merlinic Jubbah", "Merlinic Shalwar",
-  "Odyssean Chestplate", "Odyssean Cuisses", "Odyssean Gauntlets", "Odyssean Greaves", "Odyssean Helm",
+  "Odyss. Chestplate", "Odyssean Cuisses", "Odyssean Gauntlets", "Odyssean Greaves", "Odyssean Helm",
   "Valorous Greaves", "Valorous Hose", "Valorous Mail", "Valorous Mask", "Valorous Mitts",
 ];
 

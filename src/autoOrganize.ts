@@ -1,16 +1,22 @@
 import { useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { useBoxes, runOrganize, appDataPath, inTauri, type OrganizeRules } from './bridge';
+import { useBoxes, runOrganize, appDataPath, inTauri, getKnownCharacters, DEFAULT_ORGANIZE_RULES, normalizeOrganizeRules, type OrganizeRules } from './bridge';
 import { useSettings } from './settings';
+import { resolveLayout } from './tagRules';
 
 async function readCurrentRules(): Promise<OrganizeRules | null> {
   if (!inTauri) return null;
   try {
+    const txt = await invoke<string>('read_text_file', { path: await appDataPath('organize_rules.json') });
+    const r = JSON.parse(txt) as OrganizeRules;
+    if (r && Array.isArray(r.storableBags)) return normalizeOrganizeRules({ ...DEFAULT_ORGANIZE_RULES, ...r });
+  } catch { /* fall through to legacy, then default */ }
+  try {
     const txt = await invoke<string>('read_text_file', { path: await appDataPath('organize_presets.json') });
     const p = JSON.parse(txt) as { current?: string; presets?: Record<string, OrganizeRules> };
-    if (p?.presets && p.current && p.presets[p.current]) return p.presets[p.current];
-  } catch { /* no presets saved */ }
-  return null;
+    if (p?.presets && p.current && p.presets[p.current]) return normalizeOrganizeRules({ ...DEFAULT_ORGANIZE_RULES, ...p.presets[p.current] });
+  } catch { /* no saved rules */ }
+  return DEFAULT_ORGANIZE_RULES;
 }
 
 export function useAutoOrganizeOnMog() {
@@ -38,7 +44,7 @@ export function useAutoOrganizeOnMog() {
           timers.current.delete(conn);
           const live = boxesRef.current.find((x) => x.conn === conn);
           if (!live || !live.mog) return; // left the mog house before the delay elapsed
-          void readCurrentRules().then((rules) => { if (rules) runOrganize(conn, rules); });
+          void readCurrentRules().then((rules) => { if (rules) runOrganize(conn, rules, resolveLayout(getKnownCharacters().find((k) => k.name === live.name))); });
         }, delayMs);
         timers.current.set(conn, t);
       } else if (!now && timers.current.has(conn)) {

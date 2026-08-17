@@ -236,6 +236,14 @@ body {
   filter: brightness(var(--wallpaper-bright, 1));
 }
 
+:root[data-library="1"] .le-bg {
+  background:
+    radial-gradient(1400px 520px at 50% -10%, var(--bg-glow), transparent 70%),
+    linear-gradient(var(--bg-dim), var(--bg-dim)),
+    url('/bg-library.jpg') center / cover no-repeat;
+  filter: brightness(var(--wallpaper-bright, 1));
+}
+
 /* ── Smooth view-in on section switch ────────────────────────────────────── */
 @keyframes le-view-in {
   from { opacity: 0; transform: translateY(14px); }
@@ -272,6 +280,49 @@ body {
 .le-pop  { animation: le-pop var(--dur-fast) var(--ease-out) both; }
 .le-fade { animation: le-fade var(--dur-fast) ease-out both; }
 .le-rise { animation: le-rise var(--dur-base) var(--ease-out) both; }
+
+/* Library tile arrival: a newly-inserted item tile (e.g. an item that just
+   landed in a bag after a move confirms) eases in instead of popping. */
+@keyframes lib-tile-in {
+  from { opacity: 0; transform: scale(0.55); }
+  to   { opacity: 1; transform: scale(1); }
+}
+.lib-tile-in { animation: lib-tile-in 0.16s var(--ease-out) both; }
+
+/* Library location-change flash: any item that just changed location (moved,
+   organized, consolidated, traded in, looted) briefly rings + glows in accent,
+   then fades, so it's easy to spot where things landed. No fill-mode so the
+   tile reverts to its normal ring/hover state afterward. */
+/* The tile itself throbs (scale) with an outer glow + bright ring. Its own
+   box-shadow renders outside the tile so the glow shows (clipped only near a
+   bag's rounded edge). */
+@keyframes lib-flash-glow {
+  0%, 30%, 60%  { box-shadow: 0 0 0 2px #4ade80, 0 0 18px 6px rgba(74, 222, 128, 0.8); transform: scale(1.16); }
+  15%, 45%, 75% { box-shadow: 0 0 0 1px rgba(74, 222, 128, 0.5), 0 0 6px 1px rgba(74, 222, 128, 0.3); transform: scale(1); }
+  100%          { box-shadow: 0 0 0 0 rgba(0,0,0,0); transform: scale(1); }
+}
+.lib-flash-glow { animation: lib-flash-glow 2.6s var(--ease-out); position: relative; z-index: 3; }
+
+/* An overlay washes bright green over the icon + a thick inset ring, so the
+   whole tile clearly lights up (inset stays within the tile, never clipped). */
+@keyframes lib-flash-wash {
+  0%, 30%, 60%  { background: rgba(74, 222, 128, 0.58); box-shadow: inset 0 0 0 3px #4ade80; }
+  15%, 45%, 75% { background: rgba(74, 222, 128, 0.14); box-shadow: inset 0 0 0 2px rgba(74, 222, 128, 0.55); }
+  100%          { background: rgba(0,0,0,0); box-shadow: inset 0 0 0 0 rgba(0,0,0,0); }
+}
+.lib-flash-wash { animation: lib-flash-wash 2.6s var(--ease-out) forwards; }
+
+/* Move beam: a glowing line draws from the source bag to the destination bag
+   while the item travels along it as a comet, then fades before the landing
+   flash fires. --len (the line length) is set inline per beam. */
+@keyframes lib-beam {
+  0%   { stroke-dashoffset: var(--len); opacity: 0; }
+  10%  { opacity: 1; }
+  70%  { stroke-dashoffset: 0; opacity: 1; }
+  86%  { opacity: 1; }
+  100% { stroke-dashoffset: 0; opacity: 0; }
+}
+.lib-beam { stroke-dasharray: var(--len); animation: lib-beam 1.25s var(--ease-out) forwards; }
 
 /* ── List item enter/leave (inventory rows, treasure pool) ───────────────────
    Items added to or removed from a live list collapse/expand height + fade so

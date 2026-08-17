@@ -8,9 +8,25 @@ import { OpGlyph } from './OpCard';
 
 const fmt = (v: number) => v.toLocaleString();
 
+// Zones that contain Waypoint / Proto-Waypoint NPCs (from the FFXI entity DATs). Used only
+// to warn experimental-mode users that those NPCs stay proximity-based (several per zone).
+const WAYPOINT_ZONES = new Set([243, 245, 247, 248, 249, 252, 256, 257, 260, 261, 262, 263, 265, 266, 267]);
+
+// Items USED, not stored: SP Gobbie Key feeds the Gobbie Mystery Box via a menu flow. It appears
+// in the box goblins' sections but with a "Use" action (kept out of "Store All"), and the addon
+// caps how many it uses by free inventory slots since each reward drops an item.
+const USE_IDS = new Set([8973]);
+const isUse = (id: number) => USE_IDS.has(id);
+
 type Holder = { c: KnownChar; count: number };
 type ItemAgg = { id: number; n: string; holders: Holder[]; total: number };
-type NpcAgg = { npc: string; chars: KnownChar[]; items: ItemAgg[] };
+type NpcAgg = { npc: string; chars: KnownChar[]; items: ItemAgg[]; batch?: number };
+
+const snapAmt = (v: number, total: number, batch?: number) => {
+  if (!batch || batch <= 1) return Math.max(1, Math.min(v, total));
+  const maxB = Math.floor(total / batch) * batch;
+  return Math.max(0, Math.min(Math.floor(v / batch) * batch, maxB));
+};
 
 function Icon({ id, n, assets, iconSet }: { id: number; n: string; assets?: string; iconSet: Set<number> }) {
   return (
@@ -49,11 +65,12 @@ export default function StoreView() {
   const [amounts, setAmounts] = useState<Record<string, number>>({});
 
   const npcs = useMemo<NpcAgg[]>(() => {
-    const m = new Map<string, { chars: Set<KnownChar>; items: Map<number, ItemAgg> }>();
+    const m = new Map<string, { chars: Set<KnownChar>; items: Map<number, ItemAgg>; batch?: number }>();
     for (const c of online) {
       for (const z of c.storeZone ?? []) {
         let e = m.get(z.npc);
         if (!e) { e = { chars: new Set(), items: new Map() }; m.set(z.npc, e); }
+        if (z.batch && z.batch > 1) e.batch = z.batch;
         e.chars.add(c);
         for (const it of z.items) {
           let ia = e.items.get(it.id);
@@ -66,6 +83,7 @@ export default function StoreView() {
       npc,
       chars: [...e.chars],
       items: [...e.items.values()].sort((a, b) => a.id - b.id),
+      batch: e.batch,
     })).sort((a, b) => a.npc.localeCompare(b.npc));
   }, [online]);
 
@@ -75,10 +93,11 @@ export default function StoreView() {
     return [...s].sort((a, b) => a.name.localeCompare(b.name));
   }, [npcs]);
   const anyStoring = online.some((c) => c.store?.active);
+  const inWpZone = useMemo(() => online.some((c) => c.zone != null && WAYPOINT_ZONES.has(c.zone)), [online]);
 
   // Store up to `amount` of the item across the holders (fleet pool), capped per holder.
-  const storeAmount = (npc: string, ia: ItemAgg, amount: number) => {
-    let remaining = Math.max(0, Math.min(amount, ia.total));
+  const storeAmount = (npc: string, ia: ItemAgg, amount: number, batch?: number) => {
+    let remaining = snapAmt(amount, ia.total, batch);
     for (const h of ia.holders) {
       if (remaining <= 0) break;
       const n = Math.min(remaining, h.count);
@@ -86,8 +105,8 @@ export default function StoreView() {
       remaining -= n;
     }
   };
-  const amtOf = (ia: ItemAgg) => Math.max(1, Math.min(amounts[`${ia.id}`] ?? ia.total, ia.total));
-  const storeNpcAll = (n: NpcAgg) => { for (const ia of n.items) storeAmount(n.npc, ia, ia.total); };
+  const amtOf = (ia: ItemAgg, batch?: number) => snapAmt(amounts[`${ia.id}`] ?? ia.total, ia.total, batch);
+  const storeNpcAll = (n: NpcAgg) => { for (const ia of n.items) if (!isUse(ia.id)) storeAmount(n.npc, ia, ia.total, n.batch); };
   const stopAll = () => { for (const c of online) if (c.conn != null) storeStop(c.conn); };
 
   if (online.length === 0) {
@@ -118,6 +137,12 @@ export default function StoreView() {
             ))}
           </div>
         )}
+        {exp && inWpZone && (
+          <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[10px] text-amber-300 leading-snug">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" className="shrink-0 mt-px"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
+            <span><span className="font-semibold">Waypoint storage stays proximity-based.</span> There are several Waypoints/Proto-Waypoints per zone, so you must stand next to the one you want, even in experimental mode.</span>
+          </div>
+        )}
       </div>
 
       <div className="flex-1 min-h-0 overflow-y-auto">
@@ -126,7 +151,7 @@ export default function StoreView() {
             <div className="grid place-items-center py-16 text-center px-6">
               <div className="max-w-sm">
                 <div className="text-[13px] font-semibold text-fg-2 mb-1">{exp ? 'Not In A Storage Zone' : 'Not Near A Storage NPC'}</div>
-                <div className="text-[12px] text-fg-4 leading-relaxed">{exp ? 'Move a character into the zone of a storage NPC' : 'Stand a character next to a storage NPC'} (Monisette, Oboro, Paparoon, Oseem, or an Ephemeral Moogle). What each NPC accepts, and how much you hold, will appear here.</div>
+                <div className="text-[12px] text-fg-4 leading-relaxed">{exp ? 'Move a character into the zone of a storage NPC' : 'Stand a character next to a storage NPC'} (Monisette, Oboro, Paparoon, Oseem, an Ephemeral Moogle, or a Waypoint / Proto-Waypoint). What each NPC accepts, and how much you hold, will appear here.</div>
               </div>
             </div>
           ) : (
@@ -138,14 +163,17 @@ export default function StoreView() {
                 </span>
               }>
                 {n.items.map((ia) => {
-                  const has = ia.total > 0;
+                  const batch = n.batch;
+                  const maxStore = batch ? Math.floor(ia.total / batch) * batch : ia.total;
+                  const held = ia.total > 0;
+                  const has = maxStore > 0;
                   return (
                     <div key={ia.id} className={`flex items-center gap-2.5 px-3 py-2 ${has ? '' : 'opacity-45'}`}>
                       <Icon id={ia.id} n={ia.n} assets={assetsAny} iconSet={iconSet} />
                       <div className="min-w-0 flex-1">
-                        <div className="text-[12px] font-semibold text-fg-2 truncate">{ia.n}</div>
+                        <div className="text-[12px] font-semibold text-fg-2 truncate">{ia.n}{batch ? <span className="ml-1.5 text-[10px] font-semibold text-amber-300">batches of {fmt(batch)}</span> : isUse(ia.id) ? <span className="ml-1.5 text-[10px] font-semibold text-sky-300">Use · up to free space</span> : null}</div>
                         <div className="text-[10px] text-fg-4">
-                          {has ? (
+                          {held ? (
                             <span className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
                               {ia.holders.length > 1 && <span className="font-semibold text-fg-3">{fmt(ia.total)} total</span>}
                               {ia.holders.map((h, i) => (
@@ -155,14 +183,15 @@ export default function StoreView() {
                                   {h.c.store?.active && h.c.store.item === ia.id && <span className="text-accent"> storing…</span>}
                                 </span>
                               ))}
+                              {batch && !has && <span className="text-amber-300/80">need {fmt(batch)} for a batch</span>}
                             </span>
                           ) : 'none held'}
                         </div>
                       </div>
                       {has ? (
                         <>
-                          <Stepper value={amtOf(ia)} min={1} max={ia.total} onChange={(v) => setAmounts((a) => ({ ...a, [`${ia.id}`]: v }))} className="shrink-0" />
-                          <button onClick={() => storeAmount(n.npc, ia, amtOf(ia))} className="le-tap shrink-0 px-3 py-1.5 text-[11px] font-bold rounded-md bg-accent text-on-accent hover:bg-accent-hover transition-colors">Store</button>
+                          <Stepper value={amtOf(ia, batch)} min={batch ?? 1} max={maxStore} step={batch ?? 1} onChange={(v) => setAmounts((a) => ({ ...a, [`${ia.id}`]: v }))} className="shrink-0" />
+                          <button onClick={() => storeAmount(n.npc, ia, amtOf(ia, batch), batch)} className="le-tap shrink-0 px-3 py-1.5 text-[11px] font-bold rounded-md bg-accent text-on-accent hover:bg-accent-hover transition-colors">{isUse(ia.id) ? 'Use' : 'Store'}</button>
                         </>
                       ) : (
                         <span className="shrink-0 text-[10px] text-fg-4">none</span>

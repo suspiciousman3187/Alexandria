@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { getVersion } from '@tauri-apps/api/app';
 import { Tip } from './ui';
 
 const win = () => getCurrentWindow();
@@ -42,6 +43,8 @@ function PinButton() {
 }
 
 export default function TitleBar() {
+  const [version, setVersion] = useState('');
+  useEffect(() => { getVersion().then(setVersion).catch(() => {}); }, []);
   return (
     <header
       data-tauri-drag-region
@@ -51,7 +54,7 @@ export default function TitleBar() {
         <span className="w-[3px] h-3.5 rounded bg-accent" />
         <span className="text-[11px] font-extrabold tracking-[0.18em] text-accent">ALEXANDRIA</span>
         <span className="text-[9px] font-extrabold tracking-[0.12em] text-amber-300 border border-amber-400/50 bg-amber-400/10 rounded px-1 py-px leading-none">BETA</span>
-        <span className="text-[10px] text-fg-4 font-medium">v0.0.1</span>
+        {version && <span className="text-[10px] text-fg-4 font-medium">v{version}</span>}
       </div>
       <div className="ml-auto flex items-center">
         <PinButton />

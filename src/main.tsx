@@ -4,6 +4,16 @@ import { invoke } from '@tauri-apps/api/core';
 import { appLocalDataDir } from '@tauri-apps/api/path';
 import './styles.css';
 import App from './App';
+import PoolOverlay from './PoolOverlay';
+import GearsetWindow from './GearsetWindow';
+import { isPoolOverlay, isGearsetWindow } from './overlayWindow';
+
+const overlayMode = isPoolOverlay();
+const gearsetMode = isGearsetWindow();
+if (overlayMode) {
+  document.documentElement.style.background = 'transparent';
+  document.body.style.background = 'transparent';
+}
 
 let buffer = '';
 async function logErr(kind: string, msg: string) {
@@ -19,6 +29,6 @@ window.addEventListener('unhandledrejection', (e) => logErr('reject', String((e.
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <App />
+    {overlayMode ? <PoolOverlay /> : gearsetMode ? <GearsetWindow /> : <App />}
   </StrictMode>,
 );

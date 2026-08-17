@@ -4,6 +4,7 @@ import { convertFileSrc } from '@tauri-apps/api/core';
 import { useKnownCharacters, useAvailableIcons, slipStore, slipRetrieve, moveItem, inTauri, type Slip, type PorterProgress } from './bridge';
 import { useItemHover } from './ItemTooltip';
 import { CharacterSelect } from './ui';
+import { Collapse } from './overlay';
 import { useStickyChar } from './sticky';
 import { OpCard } from './OpCard';
 
@@ -53,10 +54,10 @@ function Icon({ id, n, assets, count, onClick, title, selected }: { id: number; 
 
 function SlipCard({ slip, assets, near, onStoreIds, onRetrieveIds, onGetSlip }: { slip: Slip; assets?: string; near: boolean; onStoreIds: (ids: number[]) => void; onRetrieveIds: (ids: number[]) => void; onGetSlip: () => void }) {
   const hasWork = slip.storable.length > 0 || slip.stored.length > 0;
+  const owned = slip.owned !== false; // false = we hold items for this slip but don't have the slip
   const showBanner = hasWork && !slip.ready;
-  const usable = slip.ready || slip.getable;
-  const canAct = near && usable;
-  const tip = !near ? 'Stand next to the Porter Moogle' : !usable ? 'You need this slip in your bags first' : undefined;
+  const canAct = near && slip.ready; // storing/retrieving needs the slip physically in inventory
+  const tip = !near ? 'Stand next to the Porter Moogle' : !slip.ready ? (slip.getable ? 'Get this slip into your inventory first' : 'You need this slip in your bags first') : undefined;
 
   const [selStore, setSelStore] = useState<Set<number>>(() => new Set());
   const [selRet, setSelRet] = useState<Set<number>>(() => new Set());
@@ -74,7 +75,7 @@ function SlipCard({ slip, assets, near, onStoreIds, onRetrieveIds, onGetSlip }: 
       <h2 className="flex items-center gap-2 px-1 mb-2">
         <span className="w-[3px] h-3.5 rounded-sm bg-accent" />
         <span className="text-[11px] font-bold tracking-[0.12em] text-fg">{slip.name}</span>
-        <span className="text-[10px] text-fg-4">{slip.stored.length} stored</span>
+        <span className="text-[10px] text-fg-4">{owned ? `${slip.stored.length} stored` : `${slip.storable.length} to store`}</span>
         <div className="ml-auto flex items-center gap-1.5">
           {slip.stored.length > 0 && (
             <button onClick={doRet} disabled={!canAct} title={tip} className="px-2.5 py-1 text-[11px] font-semibold rounded-md border border-line bg-field text-fg-2 enabled:hover:text-fg disabled:opacity-40 transition-colors">
@@ -88,7 +89,7 @@ function SlipCard({ slip, assets, near, onStoreIds, onRetrieveIds, onGetSlip }: 
           )}
         </div>
       </h2>
-      {showBanner && (
+      <Collapse open={showBanner}>
         <div className="mb-2 flex items-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-2.5 py-2">
           <svg viewBox="0 0 24 24" className="w-4 h-4 shrink-0 text-amber-300" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
           <span className="text-[11px] text-amber-100 flex-1 min-w-0">
@@ -96,18 +97,18 @@ function SlipCard({ slip, assets, near, onStoreIds, onRetrieveIds, onGetSlip }: 
               ? `The slip is in your ${slip.locname}. Bring it to your inventory to use it.`
               : slip.loc >= 0
                 ? `The slip is in your ${slip.locname}, which you can't reach here. Open your Mog House to get it.`
-                : `You don't have this slip in your bags.`}
+                : `You're holding ${slip.storable.length} item${slip.storable.length === 1 ? '' : 's'} for this slip but don't own it. Get the slip into your bags to store them.`}
           </span>
           {slip.getable && (
-            <button onClick={onGetSlip} className="shrink-0 px-2.5 py-1 text-[11px] font-bold rounded-md bg-accent text-on-accent hover:bg-accent-hover transition-colors">Get Slip</button>
+            <button onClick={onGetSlip} className="le-tap shrink-0 px-2.5 py-1 text-[11px] font-bold rounded-md bg-accent text-on-accent hover:bg-accent-hover transition-colors">Get Slip</button>
           )}
         </div>
-      )}
-      <div className="rounded-xl bg-surface border border-line p-3">
+      </Collapse>
+      <div className={`rounded-xl bg-surface border p-3 ${owned ? 'border-line' : 'border-line/60'}`}>
         {slip.storable.length > 0 && (
           <>
             <div className="flex items-center mb-1.5">
-              <span className="text-[10px] font-semibold text-fg-3">Storable now{canAct ? (pickStore.length ? ` — ${pickStore.length} picked` : ' — tap to pick, or Store all') : ''}</span>
+              <span className="text-[10px] font-semibold text-fg-3">{owned ? 'Storable now' : 'Items for this slip'}{canAct ? (pickStore.length ? ` — ${pickStore.length} picked` : ' — tap to pick, or Store all') : ''}</span>
               {canAct && slip.storable.length > 1 && (
                 <div className="ml-auto flex items-center gap-2 text-[10px] font-semibold">
                   <button onClick={() => setSelStore(new Set(slip.storable.map((it) => it.id)))} className="text-fg-4 hover:text-accent transition-colors">All</button>
@@ -120,21 +121,25 @@ function SlipCard({ slip, assets, near, onStoreIds, onRetrieveIds, onGetSlip }: 
             </div>
           </>
         )}
-        <div className="flex items-center mb-1.5">
-          <span className="text-[10px] font-semibold text-fg-4">Stored ({slip.stored.length}){slip.stored.length > 0 && canAct ? (pickRet.length ? ` — ${pickRet.length} picked` : ' — tap to pick, or Retrieve all') : ''}</span>
-          {canAct && slip.stored.length > 1 && (
-            <div className="ml-auto flex items-center gap-2 text-[10px] font-semibold">
-              <button onClick={() => setSelRet(new Set(slip.stored.map((it) => it.id)))} className="text-fg-4 hover:text-accent transition-colors">All</button>
-              {pickRet.length > 0 && <button onClick={() => setSelRet(new Set())} className="text-fg-4 hover:text-accent transition-colors">Clear</button>}
+        {owned && (
+          <>
+            <div className="flex items-center mb-1.5">
+              <span className="text-[10px] font-semibold text-fg-4">Stored ({slip.stored.length}){slip.stored.length > 0 && canAct ? (pickRet.length ? ` — ${pickRet.length} picked` : ' — tap to pick, or Retrieve all') : ''}</span>
+              {canAct && slip.stored.length > 1 && (
+                <div className="ml-auto flex items-center gap-2 text-[10px] font-semibold">
+                  <button onClick={() => setSelRet(new Set(slip.stored.map((it) => it.id)))} className="text-fg-4 hover:text-accent transition-colors">All</button>
+                  {pickRet.length > 0 && <button onClick={() => setSelRet(new Set())} className="text-fg-4 hover:text-accent transition-colors">Clear</button>}
+                </div>
+              )}
             </div>
-          )}
-        </div>
-        {slip.stored.length === 0 ? (
-          <div className="text-[11px] text-fg-4">Nothing stored on this slip.</div>
-        ) : (
-          <div className="flex flex-wrap gap-1.5">
-            {slip.stored.map((it) => <Icon key={`d${it.id}`} id={it.id} n={it.n} assets={assets} selected={selRet.has(it.id)} onClick={canAct ? () => toggle(setSelRet)(it.id) : undefined} title={it.n} />)}
-          </div>
+            {slip.stored.length === 0 ? (
+              <div className="text-[11px] text-fg-4">Nothing stored on this slip.</div>
+            ) : (
+              <div className="flex flex-wrap gap-1.5">
+                {slip.stored.map((it) => <Icon key={`d${it.id}`} id={it.id} n={it.n} assets={assets} selected={selRet.has(it.id)} onClick={canAct ? () => toggle(setSelRet)(it.id) : undefined} title={it.n} />)}
+              </div>
+            )}
+          </>
         )}
       </div>
     </section>
@@ -203,7 +208,7 @@ export default function SlipsView() {
         {slips.length === 0 ? (
           <div className="text-[12px] text-fg-4 text-center py-8">No slips to show. Hold a storage slip or items that can be stored on one.</div>
         ) : (
-          slips.map((s) => (
+          [...slips].sort((a, b) => Number(a.owned === false) - Number(b.owned === false)).map((s) => (
             <SlipCard
               key={s.sid}
               slip={s}

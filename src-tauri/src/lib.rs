@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Emitter};
 
+mod ahsearch;
+
 const BOX_PORT: u16 = 24233;
 static CONN_SEQ: AtomicU64 = AtomicU64::new(1);
 static IPC_BOUND: AtomicBool = AtomicBool::new(false);
@@ -154,10 +156,23 @@ fn install_addon_update(
         }
         let mut buf: Vec<u8> = Vec::with_capacity(entry.size() as usize);
         entry.read_to_end(&mut buf).map_err(|e| format!("read {}: {}", rel, e))?;
+        if let Ok(existing) = fs::read(&out_path) {
+            if existing == buf {
+                files_skipped += 1;
+                continue;
+            }
+        }
         let tmp_path = out_path.with_extension("tmp_update");
         fs::write(&tmp_path, &buf).map_err(|e| format!("write tmp {}: {}", tmp_path.display(), e))?;
-        if out_path.exists() {
-            let _ = fs::remove_file(&out_path);
+        if out_path.exists() && fs::remove_file(&out_path).is_err() {
+            let aside = out_path.with_extension("old_update");
+            let _ = fs::remove_file(&aside);
+            fs::rename(&out_path, &aside).map_err(|_| {
+                format!(
+                    "{} is in use and could not be replaced. Unload the addon in Windower (//lua unload Alexandria), install the update, then reload it.",
+                    out_path.display()
+                )
+            })?;
         }
         fs::rename(&tmp_path, &out_path)
             .map_err(|e| format!("rename {} -> {}: {}", tmp_path.display(), out_path.display(), e))?;
@@ -498,6 +513,8 @@ pub fn run() {
             read_installed_addon_version,
             install_addon_update,
             http_get,
+            ahsearch::ah_history,
+            ahsearch::ah_category,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

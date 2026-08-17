@@ -43,13 +43,19 @@ export function useShopSell(): ShopSellConfig {
 }
 
 function resolveIds(names: string[]): number[] {
-  const byLower = new Map(getItemNames().map((it) => [it.n.toLowerCase(), it.id]));
+  const byLower = new Map<string, number[]>();
+  for (const it of getItemNames()) {
+    const k = it.n.toLowerCase();
+    const arr = byLower.get(k);
+    if (arr) arr.push(it.id); else byLower.set(k, [it.id]);
+  }
   const ids: number[] = [];
   for (const n of names) {
-    const id = byLower.get(n.toLowerCase()) ?? resolveItemName(n)?.id;
-    if (id != null) ids.push(id);
+    const arr = byLower.get(n.trim().toLowerCase());
+    if (arr) ids.push(...arr);
+    else { const r = resolveItemName(n); if (r) ids.push(r.id); }
   }
-  return ids;
+  return [...new Set(ids)];
 }
 
 export function useShopSellSync() {

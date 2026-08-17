@@ -17,5 +17,7 @@ tools/
 
 scripts/
 
+# External addons that live in this folder but are not part of Alexandria
 devlog.txt
 Auctioneer-main
+SortieMeds/

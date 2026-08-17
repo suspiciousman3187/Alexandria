@@ -1,14 +1,14 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { useKnownCharacters, useAvailableIcons, useItemDescription, augCape, augCapeSeq, augGear, augStop, augKeep, augReroll, augStopAll, type InvBag, type AugState, type KnownChar, type CapeSeqStep } from './bridge';
-import { useItemNames } from './itemNames';
+import { useItemNames, itemNameMatches } from './itemNames';
 import { IconInner } from './atlasIcon';
 import { Group, Row, RowStacked, Segmented, Select, Slider, CharacterSelect, Stepper, SectionTabs, SearchInput } from './ui';
 import { OpGlyph } from './OpCard';
 import { Crossfade, Modal } from './overlay';
 import { useStickyChar, useStickyPersisted } from './sticky';
 import { JOBS, JOB_TO_CAPE, MATERIALS, AUG_PATHS, CAPE_MAX, STYLES, AUG_STATS, TRADE_TYPES, VIEW_TRADE_TYPES, augPathLabel } from './augData';
-import { gearInstancesFor, augKey, readGearCfg, cfgReady, wantedSummary, buildGearArg, resolveSel } from './augConfig';
+import { gearInstancesFor, augKey, readGearCfg, cfgReady, wantedSummary, buildGearArg, resolveSel, instKey, nameFromSelKey } from './augConfig';
 import { useNowTick } from './reltime';
 import { useSettings } from './settings';
 import { bagColor } from './bagColors';
@@ -225,19 +225,17 @@ function AmbuscadePanel({ conn, assets, inv, zone, fixedNear, experimental }: { 
   }, []);
   const instances = useMemo(() => {
     const out: Inst[] = [];
-    const seen = new Set<string>();
     for (const bag of inv ?? []) for (const it of bag.items) {
       if (!it.n || !capeToJob.has(it.n.toLowerCase())) continue;
-      if (seen.has(it.n)) continue;
-      seen.add(it.n);
-      out.push({ key: it.n, name: it.n, bagId: bag.id, bagName: bag.b, slot: it.s, aug: it.aug ?? [] });
+      out.push({ key: instKey(it.n, bag.id, it.s), name: it.n, bagId: bag.id, bagName: bag.b, slot: it.s, aug: it.aug ?? [] });
     }
-    return out.sort((a, b) => a.name.localeCompare(b.name));
+    return out.sort((a, b) => a.name.localeCompare(b.name) || a.bagId - b.bagId || a.slot - b.slot);
   }, [inv, capeToJob]);
 
   const [selKey, setSelKey] = useStickyPersisted('aug.amb.sel', '');
-  const sel = instances.find((i) => i.key === selKey);
-  const job = capeToJob.get((sel?.name ?? (selKey.includes(':') ? '' : selKey)).toLowerCase());
+  const sel = resolveSel(selKey, instances, inv);
+  useEffect(() => { if (sel && sel.key !== selKey) setSelKey(sel.key); }, [sel?.key, selKey]);
+  const job = capeToJob.get((sel?.name ?? nameFromSelKey(selKey)).toLowerCase());
 
   const [material, setMaterial] = useStickyPersisted<string>('aug.amb.mat', 'Dust');
   const paths = AUG_PATHS[material] ?? [];
@@ -436,8 +434,8 @@ function EquipList({ items, selected, onSelect, res, assets }: {
   const [filter, setFilter] = useState('');
   const shown = useMemo(() => {
     const q = filter.trim().toLowerCase();
-    return q ? items.filter((i) => i.name.toLowerCase().includes(q)) : items;
-  }, [items, filter]);
+    return q ? items.filter((i) => { const id = res.idOf(i.name); return id != null ? itemNameMatches(id, i.name, q) : i.name.toLowerCase().includes(q); }) : items;
+  }, [items, filter, res]);
   if (items.length === 0) return <div className="text-[12px] text-fg-4 text-center py-6">None of these are in your bags.</div>;
   return (
     <div className="flex flex-col gap-2.5">
@@ -453,7 +451,10 @@ function EquipList({ items, selected, onSelect, res, assets }: {
             return (
               <button key={it.key} onClick={() => onSelect(it.key)} className={`flex items-start gap-2.5 w-full px-3 py-2 text-left transition-colors ${sel ? 'bg-accent/15' : 'hover:bg-field'}`}>
                 <div className="flex-1 min-w-0"><CapeRow name={it.name} augs={it.aug} id={id} assets={assets} hasBmp={res.has(id)} /></div>
-                <span className="shrink-0 self-center text-[13px] font-semibold text-accent whitespace-nowrap pl-3">{it.bagName}</span>
+                <div className="shrink-0 self-center text-right whitespace-nowrap pl-3">
+                  <div className="text-[13px] font-semibold text-accent">{it.bagName}</div>
+                  <div className="text-[10px] text-fg-4 tabular-nums">slot {it.slot}</div>
+                </div>
                 {sel && <svg viewBox="0 0 24 24" className="shrink-0 w-4 h-4 text-accent self-center" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><path d="m5 12 5 5L20 6" /></svg>}
               </button>
             );
@@ -477,7 +478,7 @@ function GearPanel({ conn, charName, view, assets, inv, zone, fixedNear, experim
 
   const [selKey, setSelKey] = useStickyPersisted(k('sel'), '');
   const sel = resolveSel(selKey, instances, inv);
-  const item = sel?.name ?? (selKey.includes(':') ? '' : selKey);
+  const item = sel?.name ?? nameFromSelKey(selKey);
   // Migrate a legacy bag:slot selection to the item name so it persists by identity.
   useEffect(() => { if (sel && sel.key !== selKey) setSelKey(sel.key); }, [sel?.key, selKey]);
   const selType = item ? TRADE_TYPES[gearToType.get(item.toLowerCase()) ?? ''] : undefined;
@@ -487,8 +488,11 @@ function GearPanel({ conn, charName, view, assets, inv, zone, fixedNear, experim
   const [a2, setA2] = useStickyPersisted(k('a2'), '(any)'); const [v2, setV2] = useStickyPersisted(k('v2'), 0);
   const [a3, setA3] = useStickyPersisted(k('a3'), '(any)'); const [v3, setV3] = useStickyPersisted(k('v3'), 0);
   const [augMode, setAugMode] = useStickyPersisted<'and' | 'or'>(k('amode'), 'and');
-  const [delay, setDelay] = useStickyPersisted(k('delay'), 2);
+  // Delay is a global preference (shared across all characters), not a per-character key.
+  const [delay, setDelay] = useStickyPersisted('aug.delay', 2);
   const [maxAttempts, setMaxAttempts] = useStickyPersisted(k('max'), 50);
+  const [dm, setDm] = useStickyPersisted(k('dm'), 1);
+  const [dmAll, setDmAll] = useStickyPersisted(k('dmall'), false);
 
   useEffect(() => {
     if (!item) return;
@@ -525,10 +529,12 @@ function GearPanel({ conn, charName, view, assets, inv, zone, fixedNear, experim
       augment_1: clean(a1), augment_2: clean(a2), augment_3: clean(a3),
       watch_1: v1, watch_2: v2, watch_3: v3,
       augment_mode: augMode, delay, max: maxAttempts, manual,
+      ...(material === 'Dark Matter' ? { dm, dm_all: dmAll } : {}),
     });
   };
 
   const locOk = !!selType && augLocOk(selType.mode, zone, fixedNear, experimental);
+  const dmHave = materialLocations(inv, 'Dark Matter').total;
   const npcName = selType ? AUG_NPC[selType.mode]?.name : undefined;
   const baseReady = !!selType && item !== '' && material !== '' && locOk;
   const readyAuto = baseReady && (clean(a1) !== '' || clean(a2) !== '' || clean(a3) !== '');
@@ -569,6 +575,14 @@ function GearPanel({ conn, charName, view, assets, inv, zone, fixedNear, experim
       <Group title="Limits">
         <RowStacked label="Delay" desc="Seconds between each reroll trade"><Slider value={delay} min={0} max={6} step={1} suffix="s" onChange={setDelay} /></RowStacked>
         <RowStacked label="Max Attempts" desc="Stops after this many rerolls if no match is found"><Slider value={maxAttempts} min={1} max={300} step={1} onChange={setMaxAttempts} /></RowStacked>
+        {material === 'Dark Matter' && (
+          <RowStacked label="Dark Matter To Use" desc="Free daily rolls run first; after those, one Dark Matter is traded per roll">
+            <div className="flex items-center gap-3">
+              <div className="flex-1 min-w-0"><Slider value={dmAll ? Math.max(1, dmHave) : Math.min(dm, Math.max(1, dmHave))} min={1} max={Math.max(1, dmHave)} step={1} onChange={(v) => { setDm(v); setDmAll(false); }} /></div>
+              <button onClick={() => setDmAll((a) => !a)} className={`shrink-0 px-2.5 py-1 text-[11px] font-semibold rounded-md border transition-colors ${dmAll ? 'bg-accent/15 border-accent/40 text-accent' : 'bg-field border-line text-fg-3 hover:text-fg-2'}`}>All{dmHave ? ` · ${dmHave}` : ''}</button>
+            </div>
+          </RowStacked>
+        )}
       </Group>
       <div className="px-1 flex gap-2">
         <button

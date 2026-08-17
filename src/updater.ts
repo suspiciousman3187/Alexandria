@@ -25,6 +25,8 @@ export async function installUpdate(update: Update, onProgress?: (pct: number) =
       onProgress?.(100);
     }
   });
+  // Stash the release notes so the freshly-installed version can show them on launch.
+  try { localStorage.setItem('alex_whatsnew', JSON.stringify({ version: update.version, body: update.body ?? '' })); } catch { /* ignore */ }
   await relaunch();
 }
 

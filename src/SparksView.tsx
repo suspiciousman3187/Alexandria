@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useKnownCharacters, currencyConvert, currencyConvertOn, currencyFarmStop, bulkConvertStop, broadcastCurrency, requestCurrency, type KnownChar, type ConvertProgress } from './bridge';
 import { useShopSell, setShopSell } from './shop';
-import { useSettings } from './settings';
+import { useSettings, setSettings } from './settings';
 import { useStickyChar } from './sticky';
-import { CharacterSelect, Group, Row } from './ui';
+import { CharacterSelect, Group, Row, RowStacked, Slider } from './ui';
+import { Collapse } from './overlay';
 import { useAnon } from './anonymize';
 import { OpCard } from './OpCard';
 
@@ -11,6 +12,7 @@ const SPARKS_COST = 2755;
 const POWDER_COST = 10;
 const ACHERON_NAME = 'Acheron Shield';
 const POWDER_NAME = 'Prize Powder';
+const STAGGER_MS = 400;
 
 const fmt = (v: number) => v.toLocaleString();
 
@@ -114,7 +116,9 @@ function BulkCharRow({ c }: { c: KnownChar }) {
 export default function SparksView() {
   const known = useKnownCharacters();
   const sell = useShopSell();
-  const exp = useSettings().experimentalFeatures;
+  const settings = useSettings();
+  const exp = settings.experimentalFeatures;
+  const delay = settings.sparksDelaySec;
   const online = useMemo(() => known.filter((k) => k.online && k.conn != null), [known]);
   const [name, setName] = useStickyChar();
   const active = online.find((k) => k.name === name) ?? online[0];
@@ -144,18 +148,20 @@ export default function SparksView() {
   const convert = (shop: 'sparks' | 'unity', sellName: string) => {
     if (conn == null) return;
     seedSell(sellName);
-    currencyConvert(conn, shop);
+    currencyConvert(conn, shop, delay);
   };
   const stop = () => { if (conn != null) currencyFarmStop(conn); };
   const bulkStart = () => {
     seedSell(ACHERON_NAME, POWDER_NAME);
-    for (const c of online) {
-      if (c.conn == null) continue;
-      const e = eligibleShops(c);
-      if (e.sparks && e.unity) currencyConvertOn(c.conn);
-      else if (e.sparks) currencyConvertOn(c.conn, 'sparks');
-      else if (e.unity) currencyConvertOn(c.conn, 'unity');
-    }
+    bulkEligible.forEach((c, i) => {
+      window.setTimeout(() => {
+        if (c.conn == null) return;
+        const e = eligibleShops(c);
+        if (e.sparks && e.unity) currencyConvertOn(c.conn, undefined, delay);
+        else if (e.sparks) currencyConvertOn(c.conn, 'sparks', delay);
+        else if (e.unity) currencyConvertOn(c.conn, 'unity', delay);
+      }, i * STAGGER_MS);
+    });
   };
   const bulkStop = () => { void bulkConvertStop(); };
 
@@ -204,11 +210,11 @@ export default function SparksView() {
           </Row>
           <Row label="Convert Sparks → Gil">
             <div className="flex items-center gap-2">
-              <button onClick={() => convert('sparks', ACHERON_NAME)} disabled={conn == null || vendorNear?.sparks === false} className="le-tap shrink-0 px-4 py-1.5 text-[12px] font-bold rounded-md bg-accent text-on-accent enabled:hover:bg-accent-hover disabled:opacity-40 transition-colors">Start</button>
+              <button onClick={() => convert('sparks', ACHERON_NAME)} disabled={conn == null || vendorNear?.sparks === false || acheron <= 0} className="le-tap shrink-0 px-4 py-1.5 text-[12px] font-bold rounded-md bg-accent text-on-accent enabled:hover:bg-accent-hover disabled:opacity-40 transition-colors">Start</button>
               <button onClick={stop} disabled={conn == null} className="le-tap shrink-0 px-3 py-1.5 text-[11px] font-semibold rounded-md border border-line bg-surface text-fg-3 hover:text-fg disabled:opacity-40 transition-colors">Stop</button>
             </div>
           </Row>
-          {showConv('sparks') && <ConvertBar conv={showConv('sparks')!} />}
+          <Collapse open={!!showConv('sparks')}>{showConv('sparks') && <ConvertBar conv={showConv('sparks')!} />}</Collapse>
         </Group>
 
         <Group title="Convert Unity Accolades" right={<NpcPill kind="Unity" near={vendorNear?.unity} />}>
@@ -220,11 +226,17 @@ export default function SparksView() {
           </Row>
           <Row label="Convert Accolades → Gil">
             <div className="flex items-center gap-2">
-              <button onClick={() => convert('unity', POWDER_NAME)} disabled={conn == null || vendorNear?.unity === false} className="le-tap shrink-0 px-4 py-1.5 text-[12px] font-bold rounded-md bg-accent text-on-accent enabled:hover:bg-accent-hover disabled:opacity-40 transition-colors">Start</button>
+              <button onClick={() => convert('unity', POWDER_NAME)} disabled={conn == null || vendorNear?.unity === false || powder <= 0} className="le-tap shrink-0 px-4 py-1.5 text-[12px] font-bold rounded-md bg-accent text-on-accent enabled:hover:bg-accent-hover disabled:opacity-40 transition-colors">Start</button>
               <button onClick={stop} disabled={conn == null} className="le-tap shrink-0 px-3 py-1.5 text-[11px] font-semibold rounded-md border border-line bg-surface text-fg-3 hover:text-fg disabled:opacity-40 transition-colors">Stop</button>
             </div>
           </Row>
-          {showConv('unity') && <ConvertBar conv={showConv('unity')!} />}
+          <Collapse open={!!showConv('unity')}>{showConv('unity') && <ConvertBar conv={showConv('unity')!} />}</Collapse>
+        </Group>
+
+        <Group title="Conversion Delay">
+          <RowStacked label="Delay Before Opening Shop">
+            <Slider value={delay} min={0} max={10} step={0.5} format={(v) => (v <= 0 ? 'No delay' : `${v}s`)} onChange={(v) => setSettings({ ...settings, sparksDelaySec: v })} />
+          </RowStacked>
         </Group>
 
       </div>

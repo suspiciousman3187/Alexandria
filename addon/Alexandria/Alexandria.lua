@@ -1,6 +1,6 @@
 _addon.name = 'Alexandria'
 _addon.author = 'Noirblanc'
-_addon.version = '0.0.1'
+_addon.version = '0.0.20'
 _addon.commands = {'alexandria', 'alex', 'ax'}
 
 local socket = require('socket')
@@ -11,11 +11,11 @@ require('lists')
 require('pack')
 require('chat')
 
-local compat_defaults = { compat = { find = true, item = true, ah = true, native = true } }
+local compat_defaults = { compat = { find = true, item = true, ah = true, native = true }, auto_sort_on_move = true }
 settings = config.load(compat_defaults)
 
-local HOST = '127.0.0.1'
-local PORT = 24233
+HOST = '127.0.0.1'
+PORT = 24233
 local SEND_INTERVAL = 4.0
 local RETRY_INTERVAL = 5.0
 local INV_DEBOUNCE = 0.6
@@ -31,9 +31,18 @@ local RETRY_MAX = 15.0
 local CONN_TIMEOUT = 3.0
 local rx = ''
 local txbuf = ''
+mem_log_on = false
+mem_sample_t = 0
+mem_log_interval = 600
 local inv_dirty = false
 local inv_dirty_at = 0
+-- Last player id announced to the desktop via 'self'/'hello'. Global (not a main-chunk
+-- local) to stay clear of Lua's 200-local limit. Drives an instant identity re-announce
+-- the instant a shared client swaps characters, before the incoming inventory streams.
+last_self_id = nil
 local inv_first_dirty = 0
+local autosort_bags = {}
+local autosort_sig = {}
 local ki_dirty = false
 local ki_dirty_at = 0
 local ki_last = ''
@@ -48,9 +57,14 @@ use_left = 0
 use_delay = 0
 use_next = 0
 use_pending = nil
+use_total = 0
+use_done = 0
+use_move_at = 0
 
 currency_cur1 = nil
 currency_cur2 = nil
+currency_cur1_id = nil  -- character id each currency page was received under, so a page left over
+currency_cur2_id = nil  -- from a previous character on a shared client is never reported as ours
 currency_dirty = false
 currency_req_t = 0
 
@@ -80,6 +94,7 @@ shop_session = false
 shop_sold = {}
 shop_pending_sell = nil
 drop_pending = nil
+drop_move_q = {}
 
 -- Town/city zones (safe NPC hubs) where "Auto-Sell In Towns" is allowed to fire without
 -- an open shop. Curated from Windower res/zones.lua (no town flag exists there): the three
@@ -105,6 +120,25 @@ resupply_run = nil
 resupply_cd = 0
 resupply_cd_npc = nil
 CURIO_NAME = 'Curio Vendor Moogle'
+-- Proximity Buy/Sell vendors. FFXI exposes no shop-detection, so this is a curated map of
+-- NPC name -> the item ids it sells. The run drives them with the same packet engine as
+-- Curio (poke -> 0x03C shop list -> 0x083 buy), never keypresses. Grow this table freely.
+PVENDOR_SHOPS = {
+    ['Preterig']      = { 5944 },   -- Frontier Soda
+    ['Bernegeois']    = { 5944 },   -- Frontier Soda
+    ['Hagakoff']      = { 18259 },  -- Angon
+    ['Wata Khamazom'] = { 18258 },  -- Thr. Tomahawk
+    ['Jajaroon']      = { 5870 },   -- Trump Card Case
+}
+pvendor_on = false
+pvendor_min = {}            -- item id -> target count
+pvendor_run = nil
+pvendor_cd = 0
+pvendor_cd_npc = nil
+pvendor_near = nil          -- { name, id, index } of the nearest cataloged vendor
+pvendor_near_dirty = false
+pvendor_progress = nil
+pvendor_dirty = false
 npc_menu = nil
 npc_near = nil
 npc_near_dirty = false
@@ -113,6 +147,7 @@ npc_near_seen = 0
 npc_watch = {}
 experimental_features = false
 nomad_near = false
+last_open_zone = 0
 fixed_near = {}
 fixed_near_key = ''
 fixed_near_dirty = false
@@ -180,12 +215,13 @@ local icon_drain_t = 0
 icon_bulk = false
 icon_bulk_total = 0
 icon_bulk_t = 0
+icon_passive = false
 if icon_ok and windower.dir_exists and not windower.dir_exists(icon_dir) then
     windower.create_dir(icon_dir)
 end
 
 local function queue_icon(id)
-    if not icon_ok or not id or id == 0 then return end
+    if not icon_ok or not icon_passive or not id or id == 0 then return end
     if icon_queue[id] then return end
     if windower.file_exists and windower.file_exists(icon_prefix .. id .. '.bmp') then return end
     icon_queue[id] = true
@@ -209,15 +245,38 @@ do
         if rok and lib then memhelp_ok = true; memhelp = lib end
     end
 end
-local act_queue = {}
+local act_queue = {}   -- packet-based actions (trades, delivery, bazaar, seqack): throttled
+local move_queue = {}  -- plain item moves + stack merges: throttleless, drained in bursts
 local act_t = 0
+
+move_dirty_bags = {}
+function mark_move_dirty(to_bag)
+    if not settings.auto_sort_on_move then return end
+    if type(to_bag) ~= 'number' or to_bag < 0 then return end
+    move_dirty_bags[to_bag] = true
+end
 local ACT_DELAY = 0.5
+local MOVE_BURST = 24 -- item moves drained per frame from move_queue; the rest carry to the next
+-- Item moves go in their own lane so they never wait behind a throttled packet action.
+local function enqueue_fast(fn) move_queue[#move_queue + 1] = fn end
+
+-- Organize moves must be PACED, not bursted. FFXI applies an inventory move via a
+-- request/ack round-trip and silently drops a move fired before the prior one acks.
+-- Bursting a whole plan made the game land only the FIRST move while the addon still
+-- counted them all as moved (report said "8 moved", one really landed, the other 7
+-- reappeared next run). One org move per ORG_MOVE_DELAY fixes it. Bump the delay if
+-- the verify log still shows drops.
+ORG_MOVE_DELAY = 0.25
+org_move_queue = {}
+org_move_t = 0
+function enqueue_org(fn) org_move_queue[#org_move_queue + 1] = fn end
 
 drop_q = {}
 local drop_t = 0
 drop_delay = 0
 local INSTANT_CAP = 40
 local drop_done = 0
+drop_report = {}
 pool_q = {}
 pool_queued = {}
 local org_active = false
@@ -226,6 +285,8 @@ local org_stream_t = 0
 local org_total = 0
 local org_done = 0
 local org_moved = 0
+org_debug = false
+org_verify = nil  -- on a real run: { steps, moved, total, done_at }, verified after a settle delay
 
 local slips_ok, slips_lib = pcall(require, 'slips')
 local pool = {}
@@ -233,6 +294,7 @@ local pool_dirty = false
 local pool_dirty_at = 0
 local pool_rules = { lot = {}, pass = {}, drop = {} }
 pool_pass_on_lot = false
+pool_autolot_on = true -- master switch for acting on the lot list; toggled by desktop or //ax autolot
 my_lotted = {}
 local slips_dirty = false
 local slips_dirty_at = 0
@@ -280,7 +342,14 @@ AX_BAG_COLOR = {
 function ax_bag_color(bag)
     return AX_BAG_COLOR[bag:lower()] or ALEX_BODY
 end
+AX_ECHO_COLOR = { price = 200, stock = 210, rate = 213 }
 function ax_colorize(text)
+    if text:find('{%w+|') then
+        return (text:gsub('{(%w+)|([^}]*)}', function(tag, s)
+            local n = AX_ECHO_COLOR[tag:lower()] or tonumber(tag)
+            return n and ax_col(s, n) or s
+        end))
+    end
     local nm, bag, item = text:match('^([^/]+)/([^:]+): (.+)$')
     if not nm then return text end
     return nm .. '/' .. ax_col(bag, ax_bag_color(bag)) .. ': ' .. item
@@ -297,8 +366,9 @@ function build_keyitems()
     return '{"t":"keyitems","items":[' .. table.concat(parts, ',') .. ']}\n'
 end
 
+local TXBUF_MAX = 524288
 local function queue_send(data)
-    if data then txbuf = txbuf .. data end
+    if data and #txbuf < TXBUF_MAX then txbuf = txbuf .. data end
 end
 
 function ah_extract_all_icons()
@@ -327,7 +397,11 @@ local function build_self(kind)
     if not p then return nil end
     local info = windower.ffxi.get_info()
     local zone_id = (info and info.zone) or 0
+    if info and not info.mog_house and zone_id ~= 0 then last_open_zone = zone_id end
     local zone_name = res.zones[zone_id] and res.zones[zone_id].en or ''
+    local me = windower.ffxi.get_mob_by_id(p.id)
+    local px = (me and me.x) or 0
+    local py = (me and me.y) or 0
     local server_name = (info and info.server and res.servers[info.server] and res.servers[info.server].en) or ''
     local gil = 0
     local ok_g, gitems = pcall(windower.ffxi.get_items)
@@ -342,10 +416,12 @@ local function build_self(kind)
         '"sub_lvl":' .. tostring(p.sub_job_level or 0),
         '"zone":' .. tostring(zone_id),
         '"zone_name":"' .. esc(zone_name) .. '"',
+        '"px":' .. string.format('%.2f', px),
+        '"py":' .. string.format('%.2f', py),
         '"assets":"' .. esc(icon_dir) .. '"',
         '"apath":"' .. esc(windower.addon_path) .. '"',
         '"av":"' .. esc(_addon.version) .. '"',
-        '"atah":' .. (ah_at_ah(zone_id) and 'true' or 'false'),
+        '"atah":' .. ((ah_at_ah(zone_id) or (info and info.mog_house and ah_at_ah(last_open_zone))) and 'true' or 'false'),
         '"in_town":' .. (TOWN_ZONES[zone_id] and 'true' or 'false'),
         '"server":"' .. esc(server_name) .. '"',
         '"gil":' .. tostring(gil),
@@ -390,12 +466,48 @@ local function decode_item_augments(it)
     return (#out > 0) and out or nil
 end
 
+inv_sig_last = nil
+function inv_signature()
+    local h = 5381
+    for bag_id in pairs(res.bags) do
+        local items = windower.ffxi.get_items(bag_id)
+        if type(items) == 'table' then
+            for s = 1, (items.max or 0) do
+                local it = items[s]
+                if it and it.id and it.id ~= 0 then
+                    local c = it.count or 0
+                    h = (h * 131 + bag_id * 97 + s * 7 + it.id + c) % 2147483647
+                    local ext = it.extdata
+                    if ext and c <= 1 then
+                        for i = 1, #ext do h = (h * 131 + ext:byte(i)) % 2147483647 end
+                    end
+                end
+            end
+        end
+    end
+    return h
+end
+
 local function build_inventory()
+    -- Stamp the report with the owning character's id so the desktop can reject one that
+    -- raced ahead of the identity feed on a shared-client swap. No player (mid login/logout)
+    -- means nothing trustworthy to report -- skip it so a partial unload never overwrites a
+    -- good snapshot.
+    local p = windower.ffxi.get_player()
+    if not p then return nil end
+    local pid = p.id or 0
     local bag_parts = {}
     for bag_id, bag in pairs(res.bags) do
         local items = windower.ffxi.get_items(bag_id)
-        local nomad_bag = (bag_id == 1 or bag_id == 4 or bag_id == 9)
-        if type(items) == 'table' and (items.enabled or bag_id == 17 or (nomad_bag and (items.count or 0) > 0)) then
+        -- Like findAll: show a storage bag whenever it holds items -- do NOT gate on
+        -- `enabled`. The Mog House bags -- Safe (1), Storage (2), Locker (4), Safe 2
+        -- (9) -- and Temporary (3) report enabled=false whenever you aren't standing
+        -- at a Mog House / Nomad Moogle, yet their cached contents are still readable.
+        -- Gating on `enabled` hid Storage AND the Locker for anyone in the field (the
+        -- 0.0.17 bug). Satchel/Sack/Case/Wardrobes are enabled everywhere, so they
+        -- keep the enabled check.
+        local fallback_bag = (bag_id == 1 or bag_id == 2 or bag_id == 3 or bag_id == 4 or bag_id == 9)
+        if type(items) == 'table' and (items.enabled or bag_id == 17 or (fallback_bag and (items.count or 0) > 0)) then
             local slot_parts = {}
             local maxn = items.max or 0
             for s = 1, maxn do
@@ -415,8 +527,9 @@ local function build_inventory()
                         for _, a in ipairs(augs) do ap[#ap + 1] = '"' .. esc(a) .. '"' end
                         augpart = ',"aug":[' .. table.concat(ap, ',') .. ']'
                     end
+                    local bzpart = (it.bazaar and it.bazaar > 0) and (',"bz":' .. it.bazaar) or ''  -- a nonzero bazaar price means it's listed on your bazaar
                     slot_parts[#slot_parts + 1] =
-                        '{"s":' .. s .. ',"id":' .. it.id .. ',"c":' .. (it.count or 1) .. ',"n":"' .. esc(name) .. '"' .. usable .. fpart .. mspart .. augpart .. '}'
+                        '{"s":' .. s .. ',"id":' .. it.id .. ',"c":' .. (it.count or 1) .. ',"n":"' .. esc(name) .. '"' .. usable .. fpart .. mspart .. augpart .. bzpart .. '}'
                 end
             end
             local bname = bag.en or bag.english or bag.command or tostring(bag_id)
@@ -425,7 +538,7 @@ local function build_inventory()
                 ',"used":' .. #slot_parts .. ',"items":[' .. table.concat(slot_parts, ',') .. ']}'
         end
     end
-    return '{"t":"inv","bags":[' .. table.concat(bag_parts, ',') .. ']}\n'
+    return '{"t":"inv","id":' .. pid .. ',"bags":[' .. table.concat(bag_parts, ',') .. ']}\n'
 end
 
 local function build_pool()
@@ -455,9 +568,11 @@ function build_party()
     local party = windower.ffxi.get_party()
     local names = {}
     if party then
-        for i = 0, 5 do
-            local m = party['p' .. i]
-            if type(m) == 'table' and m.name and m.name ~= '' then names[#names + 1] = m.name end
+        for _, pre in ipairs({ 'p', 'a1', 'a2' }) do
+            for i = 0, 5 do
+                local m = party[pre .. i]
+                if type(m) == 'table' and m.name and m.name ~= '' then names[#names + 1] = m.name end
+            end
         end
     end
     table.sort(names)
@@ -542,9 +657,21 @@ local function build_slips()
     for _, sid in ipairs(slips_lib.storages) do
         local bag = slip_bag[sid]
         local cache = slip_cache[sid]
-        local live = stored[sid]
+        -- Only report a slip this character genuinely owns: either its physical slip
+        -- item is in a readable (per-character) bag right now (slip_bag, gated on
+        -- enabled), or we cached it from such a bag before. slips_lib.get_player_items
+        -- also reads Mog Safe/Storage/Locker, whose buffer on a shared POL client can
+        -- still hold the MAIN's slip items -- reading those leaked the main's slip
+        -- contents onto the mule. slip_bag/cache never hold leaked slips (per-character bags).
+        local trusted = (bag ~= nil) or (cache ~= nil)
+        local live = trusted and stored[sid] or nil
         local show = (live and #live > 0) and live or (cache and cache.stored) or {}
         local sa = storable[sid]
+        -- Show a slip when this character owns it (trusted -> may show stored contents), OR when
+        -- the character is merely holding items that belong on it (sa) even without owning the
+        -- slip. The storable list (sa) is built only from enabled per-character bags, so an
+        -- unowned slip never leaks another character's stored contents (show is empty when not
+        -- trusted); it just tells you "you have items for this, go grab the slip".
         if #show > 0 or sa then
             local num = slips_lib.get_slip_number_by_id(sid) or 0
             local name = res.items[sid] and res.items[sid].en or ('Slip ' .. num)
@@ -552,6 +679,7 @@ local function build_slips()
             local locname = (loc >= 0 and res.bags[loc] and res.bags[loc].en) or ''
             local ready = bag == 0
             local getable = bag ~= nil and bag ~= 0
+            local owned = trusted
             local sp = {}
             for _, iid in ipairs(show) do
                 local nm = res.items[iid] and res.items[iid].en or ('Item ' .. iid)
@@ -567,6 +695,7 @@ local function build_slips()
             parts[#parts + 1] = '{"sid":' .. sid .. ',"num":' .. num .. ',"name":"' .. esc(name) ..
                 '","ready":' .. (ready and 'true' or 'false') ..
                 ',"getable":' .. (getable and 'true' or 'false') ..
+                ',"owned":' .. (owned and 'true' or 'false') ..
                 ',"loc":' .. loc .. ',"locname":"' .. esc(locname) .. '"' ..
                 ',"stored":[' .. table.concat(sp, ',') .. '],"storable":[' .. table.concat(ap, ',') .. ']}'
         end
@@ -876,6 +1005,8 @@ local function pool_check(index, id)
     if (r.drop[id] or r.pass[id]) and not r.lot[id] then
         enqueue_pool(index, 'pass')
     elseif r.lot[id] then
+        if not pool_autolot_on then return end
+        if resupply_is_rare(id) and resupply_count(id) >= 1 then return end
         local inv = windower.ffxi.get_bag_info(0)
         if inv and (inv.max - inv.count) > 1 then
             enqueue_pool(index, 'lot')
@@ -905,7 +1036,9 @@ local function find_in_bag(bag_id, item_id, limit)
     local maxn = items.max or 0
     for s = 1, maxn do
         local it = items[s]
-        if it and it.id == item_id and it.id ~= 0 then
+        -- Skip locked slots (equipped = 5, on bazaar = 25); the game refuses to
+        -- move them, so returning one just makes the caller spin on it.
+        if it and it.id == item_id and it.id ~= 0 and (it.status == nil or it.status == 0) then
             local take = it.count or 1
             if limit and take > limit then take = limit end
             return { slot = it.slot or s, count = take }
@@ -915,19 +1048,37 @@ local function find_in_bag(bag_id, item_id, limit)
 end
 
 local function enqueue_move(id, from_bag, to_bag, remaining)
-    act_queue[#act_queue + 1] = function()
-        local di = windower.ffxi.get_bag_info(to_bag)
-        if di and (di.max - di.count) <= 0 then return end
-        local m = find_in_bag(from_bag, id, remaining)
-        if not m then return end
-        windower.ffxi.move_item(from_bag, to_bag, m.slot, m.count)
-        local left = remaining - m.count
-        if left > 0 then enqueue_move(id, from_bag, to_bag, left) end
+    mark_move_dirty(to_bag)
+    -- Resolve every source slot from ONE snapshot and queue a distinct move per slot.
+    -- The old recursive re-read was unsafe on the fast burst: a move takes a frame or
+    -- two to reflect, so re-reading get_items mid burst saw the same slot still full
+    -- and moved it again, colliding on one slot and burning down `remaining` without
+    -- moving the rest (only ~1 stack actually landed). Mirrors enqueue_org_move.
+    local items = windower.ffxi.get_items(from_bag)
+    if type(items) ~= 'table' then return end
+    local di = windower.ffxi.get_bag_info(to_bag)
+    local free = di and (di.max - di.count) or 999
+    local moves = {}
+    for s = 1, (items.max or 0) do
+        if remaining <= 0 or free <= 0 then break end
+        local it = items[s]
+        -- Skip locked slots (equipped = 5, on bazaar = 25); the game refuses them.
+        if it and it.id == id and it.id ~= 0 and (it.status == nil or it.status == 0) then
+            local take = math.min(it.count or 1, remaining)
+            moves[#moves + 1] = { slot = it.slot or s, count = take }
+            remaining = remaining - take
+            free = free - 1 -- worst case each stack claims a fresh dest slot; merges only free more
+        end
+    end
+    for _, mv in ipairs(moves) do
+        local fb, tb, slot, count = from_bag, to_bag, mv.slot, mv.count
+        enqueue_fast(function() windower.ffxi.move_item(fb, tb, slot, count) end)
     end
 end
 
 local function enqueue_move_exact(id, from_bag, to_bag, slot, count)
-    act_queue[#act_queue + 1] = function()
+    mark_move_dirty(to_bag)
+    enqueue_fast(function()
         local di = windower.ffxi.get_bag_info(to_bag)
         if di and (di.max - di.count) <= 0 then return end
         local items = windower.ffxi.get_items(from_bag)
@@ -936,19 +1087,23 @@ local function enqueue_move_exact(id, from_bag, to_bag, slot, count)
             alex_chat(207, '[Alexandria] item no longer in that slot; move skipped', 'error')
             return
         end
+        if (it.status or 0) ~= 0 then  -- bazaared (25) / equipped items can't be moved
+            alex_chat(207, '[Alexandria] item is bazaared or equipped; move skipped', 'error')
+            return
+        end
         windower.ffxi.move_item(from_bag, to_bag, it.slot or slot, math.min(count or (it.count or 1), it.count or 1))
-    end
+    end)
 end
 
 local function enqueue_stack(bag)
     if bag then
-        act_queue[#act_queue + 1] = function() windower.ffxi.stack_items(bag) end
+        enqueue_fast(function() windower.ffxi.stack_items(bag) end)
     else
         for _, b in pairs(res.bags) do
             local info = windower.ffxi.get_bag_info(b.id)
             if info and info.enabled then
                 local bid = b.id
-                act_queue[#act_queue + 1] = function() windower.ffxi.stack_items(bid) end
+                enqueue_fast(function() windower.ffxi.stack_items(bid) end)
             end
         end
     end
@@ -959,6 +1114,7 @@ local function build_name_index()
     if name_to_id_cache then return name_to_id_cache end
     name_to_id_cache = {}
     for id, item in pairs(res.items) do
+        if item.enl then name_to_id_cache[item.enl:lower()] = id end
         if item.en then name_to_id_cache[item.en:lower()] = id end
     end
     return name_to_id_cache
@@ -977,18 +1133,34 @@ TREASURE_GROUPS = {
     papers = { 9544, 9545, 9546, 9547, 9548, 9549, 9550, 9551, 9552, 9553, 9554, 9555, 9556, 9557, 9558, 9559, 9560, 9561, 9562, 9563, 9564, 9565, 9566, 9567, 9568, 9569, 9570, 9571, 9572, 9573, 9574, 9575, 9576, 9577, 9578, 9579, 9580, 9581, 9582, 9583, 9584, 9585, 9586, 9587, 9588, 9589, 9590, 9591, 9592, 9593, 9594, 9595, 9596, 9597, 9598, 9599, 9600, 9601, 9602, 9603, 9604, 9605, 9606, 9607, 9608, 9609, 9610, 9611, 9612, 9613, 9614, 9615, 9616, 9617, 9618, 9619, 9620, 9621, 9622, 9623, 9624, 9625, 9626, 9627, 9628, 9629, 9630, 9631, 9632, 9633, 9634, 9635, 9636, 9637, 9638, 9639, 9640, 9641, 9642, 9643, 9644, 9645, 9646, 9647, 9648, 9649, 9650, 9651, 9652, 9653, 9654, 9655, 9656, 9657, 9658, 9659, 9660, 9661, 9662, 9663, 9664, 9665, 9666, 9667, 9668, 9669, 9670, 9671, 9672, 9673, 9674, 9675, 9676, 9677, 9678, 9679, 9680, 9681, 9682, 9683, 9684, 9685, 9686, 9687, 9688, 9689, 9690, 9691, 9692, 9693, 9694, 9695, 9696, 9697, 9698, 9699, 9700, 9701, 9702, 9703, 9704, 9705, 9706, 9707, 9708, 9709, 9710, 9711, 9712, 9713, 9714, 9715, 9716, 9717, 9718, 9719, 9720, 9721, 9722, 9723, 9724, 9725, 9726, 9727, 9728, 9729, 9730, 9731, 9732, 9733, 9734, 9735, 9736, 9737, 9738, 9739, 9740, 9741, 9742, 9743, 9744, 9745, 9746, 9747, 9748, 9749, 9750, 9751, 9752, 9753, 9754, 9755, 9756, 9757, 9758, 9759, 9760, 9761, 9762, 9763 },
 }
 
+local function name_glob_to_pattern(g)
+    local p = tostring(g):lower():gsub('[%^%$%(%)%%%.%[%]%+%-%?]', '%%%0'):gsub('%*', '.*')
+    return '^' .. p .. '$'
+end
+
+-- Resolve one name entry to item ids. A '*' makes it a wildcard that matches
+-- every item whose English name fits, e.g. 'Toolbag (*' or 'Frayed Sack*'.
+local function ids_for_name_entry(nm)
+    local low = tostring(nm):lower()
+    if not low:find('*', 1, true) then
+        local grp = TREASURE_GROUPS[low]
+        if grp then return grp end
+        local id = build_name_index()[low]
+        return id and { id } or {}
+    end
+    local pat = name_glob_to_pattern(low)
+    local out = {}
+    for id, item in pairs(res.items) do
+        local n = item.en and item.en:lower()
+        if n and n:match(pat) then out[#out + 1] = id end
+    end
+    return out
+end
+
 local function ids_for_names(names)
-    local idx = build_name_index()
     local set = {}
     for _, nm in ipairs(names or {}) do
-        local low = tostring(nm):lower()
-        local grp = TREASURE_GROUPS[low]
-        if grp then
-            for _, id in ipairs(grp) do set[id] = true end
-        else
-            local id = idx[low]
-            if id then set[id] = true end
-        end
+        for _, id in ipairs(ids_for_name_entry(nm)) do set[id] = true end
     end
     return set
 end
@@ -1020,22 +1192,28 @@ end
 
 function drop_request(slot, id, from_bag, count)
     if not from_bag or from_bag == 0 then enqueue_drop(slot, id) return end
+    drop_move_q[#drop_move_q + 1] = { bag = from_bag, slot = slot, id = id, count = count }
+end
+
+function pump_drop_moves()
+    if drop_pending or #drop_move_q == 0 then return end
+    local req = table.remove(drop_move_q, 1)
+    local from_bag, slot, id, count = req.bag, req.slot, req.id, req.count
     local items = windower.ffxi.get_items(from_bag)
     local it = slot and type(items) == 'table' and items[slot]
     if not (type(it) == 'table' and it.id == id and it.id ~= 0) then
-        if slot then alex_chat(207, '[Alexandria] item no longer in that slot; drop skipped', 'error') return end
         local m = find_in_bag(from_bag, id, nil)
-        if not m then alex_chat(207, '[Alexandria] item not found in that bag', 'error') return end
+        if not m then alex_chat(207, '[Alexandria] item not found in that bag; drop skipped', 'error') return end
         slot = m.slot
         it = type(items) == 'table' and items[slot]
     end
     local di = windower.ffxi.get_bag_info(0)
-    if di and (di.max - di.count) <= 0 then alex_chat(207, '[Alexandria] inventory full; cannot move that item to drop', 'error') return end
+    if di and (di.max - di.count) <= 0 then drop_move_q = {} alex_chat(207, '[Alexandria] inventory full; cannot move items to drop', 'error') return end
     local cap = (type(it) == 'table' and it.count) or 1
     local mv = math.min((count and count > 0 and count) or cap, cap)
     local before = shop_count_inv(id)
     windower.ffxi.move_item(from_bag, 0, slot, mv)
-    drop_pending = { id = id, qty = mv, before = before, t = os.clock() }
+    drop_pending = { id = id, qty = mv, before = before, t = os.clock(), phase = 'arrive' }
 end
 
 function enqueue_pool(index, action)
@@ -1069,6 +1247,7 @@ local function fire_drop(inv, d)
             windower.ffxi.drop_item(d.slot, it.count)
         end
         drop_done = drop_done + 1
+        drop_report[d.id] = (drop_report[d.id] or 0) + 1
         return true
     end
     return false
@@ -1090,8 +1269,15 @@ function drain_drops(now)
         fire_drop(inv, table.remove(drop_q, 1))
     end
     if #drop_q == 0 and drop_done > 0 then
-        alex_chat(123, '[Alexandria] dropped ' .. drop_done .. ' item' .. (drop_done == 1 and '' or 's'), 'action')
+        local parts = {}
+        for id, cnt in pairs(drop_report) do
+            local nm = (res.items[id] and res.items[id].en) or ('item ' .. id)
+            parts[#parts + 1] = nm .. (cnt > 1 and (' x' .. cnt) or '')
+        end
+        local list = #parts > 0 and (': ' .. table.concat(parts, ', ')) or ''
+        alex_chat(123, '[Alexandria] dropped ' .. drop_done .. ' item' .. (drop_done == 1 and '' or 's') .. list, 'action')
         drop_done = 0
+        drop_report = {}
         if not inv_dirty then inv_first_dirty = now end
         inv_dirty = true
         inv_dirty_at = now
@@ -1103,12 +1289,15 @@ function scan_drops(names)
     if not next(names) then return end
     local inv = windower.ffxi.get_items(0)
     if not inv then return end
+    local selling = ((shop_session and shop_autosell) or (sell_anywhere and in_town())) and next(shop_sell_list) ~= nil
     for slot = 1, (inv.max or 80) do
         local it = inv[slot]
         if type(it) == 'table' and it.id and it.id > 0 then
             local r = res.items[it.id]
             if r and r.en and names[r.en:lower()] then
-                enqueue_drop(slot, it.id)
+                if not (selling and shop_sell_list[it.id] and not shop_no_sale(it.id)) then
+                    enqueue_drop(slot, it.id)
+                end
             end
         end
     end
@@ -1139,38 +1328,78 @@ function do_drop_clean(names)
     scan_drops(set)
 end
 
-function start_use(id, all)
+-- Temporary (3) is included: its items are used in place with /item and can't be
+-- moved into inventory, so the use tick fires /item directly when the item is there.
+USE_BAGS = { 0, 3, 5, 6, 7 }
+USE_CARRY_BAGS = { 5, 6, 7 }
+
+function emit_use(active)
+    queue_send(('{"t":"use","active":%s,"id":%d,"name":"%s","done":%d,"total":%d}\n'):format(active and 'true' or 'false', use_id or 0, esc(use_name or ''), use_done or 0, use_total or 0))
+end
+
+function use_pull_stack(id)
+    local di = windower.ffxi.get_bag_info(0)
+    if not di or (di.max - di.count) <= 0 then return false end
+    for _, bid in ipairs(USE_CARRY_BAGS) do
+        local bag = windower.ffxi.get_items(bid)
+        if type(bag) == 'table' then
+            for s = 1, (bag.max or 80) do
+                local it = bag[s]
+                if type(it) == 'table' and it.id == id and it.id ~= 0 and it.status == 0 then
+                    windower.ffxi.move_item(bid, 0, s, it.count or 1)
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+function start_use(id, all, count)
     local r = res.items[id]
     if not r or not (r.targets and r.targets.Self) then
         alex_chat(207, '[Alexandria] that item cannot be used', 'error')
         return
     end
-    local inv = windower.ffxi.get_items(0)
-    local count = 0
-    if inv then
-        for s = 1, (inv.max or 80) do
-            local it = inv[s]
-            if type(it) == 'table' and it.id == id and it.status == 0 then count = count + (it.count or 0) end
+    local total = 0
+    for _, bid in ipairs(USE_BAGS) do
+        local bag = windower.ffxi.get_items(bid)
+        if type(bag) == 'table' then
+            for s = 1, (bag.max or 80) do
+                local it = bag[s]
+                if type(it) == 'table' and it.id == id and (it.status or 0) == 0 then total = total + (it.count or 0) end
+            end
         end
     end
-    if count <= 0 then
+    if total <= 0 then
         alex_chat(207, '[Alexandria] none of that item in inventory', 'error')
         return
     end
     use_id = id
     use_name = r.en
-    use_left = all and count or 1
+    if count and count > 0 then use_total = math.min(count, total)
+    elseif all then use_total = total
+    else use_total = 1 end
+    use_done = 0
+    use_left = use_total
     use_delay = (r.cast_time or 0) + 2
     use_next = os.clock()
+    use_move_at = 0
+    emit_use(true)
 end
 
-function start_use_request(id, all, from_bag, slot)
+function start_use_request(id, all, from_bag, slot, count)
     local r = res.items[id]
     if not r or not (r.targets and r.targets.Self) then
         alex_chat(207, '[Alexandria] that item cannot be used', 'error')
         return
     end
-    if not from_bag or from_bag == 0 then start_use(id, all) return end
+    -- A specific count uses the same all-style loop (which pulls stacks from the
+    -- carry bags as needed) but capped, so from_bag/slot don't apply.
+    if count and count > 1 then start_use(id, false, count) return end
+    if all then start_use(id, true) return end
+    -- Temporary bag (3) items are used in place -- never try to move them into inventory.
+    if not from_bag or from_bag == 0 or from_bag == 3 then start_use(id, false) return end
     local di = windower.ffxi.get_bag_info(0)
     if di and (di.max - di.count) <= 0 then alex_chat(207, '[Alexandria] inventory full; cannot move that item to use', 'error') return end
     local items = windower.ffxi.get_items(from_bag)
@@ -1182,10 +1411,9 @@ function start_use_request(id, all, from_bag, slot)
         slot = m.slot
         it = type(items) == 'table' and items[slot]
     end
-    local mv = (all and type(it) == 'table' and it.count) or 1
     local before = shop_count_inv(id)
-    windower.ffxi.move_item(from_bag, 0, slot, mv)
-    use_pending = { id = id, all = all and true or false, qty = mv, before = before, t = os.clock() }
+    windower.ffxi.move_item(from_bag, 0, slot, 1)
+    use_pending = { id = id, all = false, qty = 1, before = before, t = os.clock() }
 end
 
 function apply_droprules(names, autodrop, delay)
@@ -1235,7 +1463,7 @@ function do_retrieve(names)
                 local it = items[s]
                 if type(it) == 'table' and it.id and it.id > 0 and want[it.id] then
                     local from, slot, cnt = bid, s, (it.count or 1)
-                    act_queue[#act_queue + 1] = function() windower.ffxi.move_item(from, 0, slot, cnt) end
+                    enqueue_fast(function() windower.ffxi.move_item(from, 0, slot, cnt) end)
                     moved = moved + 1
                 end
             end
@@ -1442,10 +1670,15 @@ function build_currency()
     local gil = 0
     local ok, items = pcall(windower.ffxi.get_items)
     if ok and items and items.gil then gil = items.gil end
+    -- Only report a currency page that belongs to the CURRENT character. A page whose owner id
+    -- doesn't match is left over from a previous character on a shared client (e.g. a no-progress
+    -- mule that never receives its own 0x118), and must not be broadcast as this character's.
+    local pid = (windower.ffxi.get_player() or {}).id
     local parts = {}
     for _, e in ipairs(CURRENCY_FIELDS) do
-        local pkt = (e[1] == 0x113) and currency_cur1 or currency_cur2
-        local v = pkt and pkt[e[2]]
+        local pkt, owner = currency_cur2, currency_cur2_id
+        if e[1] == 0x113 then pkt, owner = currency_cur1, currency_cur1_id end
+        local v = (pkt and owner and owner == pid) and pkt[e[2]]
         if type(v) == 'number' then
             parts[#parts + 1] = '{"n":"' .. esc(e[3]) .. '","v":' .. v .. '}'
         end
@@ -1470,6 +1703,13 @@ function ah_at_ah(zone)
     end
     local name = z and res.zones[z] and res.zones[z].en
     return name ~= nil and AH_ZONES[name] == true
+end
+
+function ah_usable()
+    if ah_at_ah() then return true end
+    local info = windower.ffxi.get_info()
+    if info and info.mog_house and ah_at_ah(last_open_zone) then return true end
+    return false
 end
 
 function dbox_allowed()
@@ -2016,9 +2256,33 @@ local function trade_offer(id, index) pcall(windower.packets.inject_outgoing, 0x
 local function trade_item(count, itemid, slot, tidx) pcall(windower.packets.inject_outgoing, 0x34, string.char(0x34, 0x06, 0, 0) .. le4(count) .. le2(itemid) .. string.char(slot, tidx)) end
 local function trade_kind(kind) pcall(windower.packets.inject_outgoing, 0x33, string.char(0x33, 0x06, 0, 0) .. le4(kind) .. le2(trade_counter) .. le2(0)) end
 
+-- FFXI player names are a single capitalized word, so an exact get_mob_by_name is
+-- case-sensitive. Resolve a user-typed name to the nearby PC case-insensitively,
+-- with a prefix fallback so shorthand ("bay" -> "Bayld") also works.
+function resolve_pc_mob(name)
+    if type(name) ~= 'string' or name == '' then return nil end
+    local norm = name:sub(1, 1):upper() .. name:sub(2):lower()
+    local mob = windower.ffxi.get_mob_by_name(norm)
+    if mob and mob.id and not mob.is_npc then return mob end
+    local lc = name:lower()
+    local me = windower.ffxi.get_player()
+    local myid = me and me.id
+    local best, bestd
+    for _, m in pairs(windower.ffxi.get_mob_array()) do
+        if m and m.name and not m.is_npc and m.id ~= myid then
+            local mn = m.name:lower()
+            if mn == lc or mn:sub(1, #lc) == lc then
+                local d = m.distance or math.huge
+                if not bestd or d < bestd then best, bestd = m, d end
+            end
+        end
+    end
+    return best
+end
+
 function trade_begin(name, items, gil)
     if not packets_ok or trade_tx then return end
-    local mob = windower.ffxi.get_mob_by_name(name)
+    local mob = resolve_pc_mob(name)
     if not mob or not mob.id then alex_chat(207, '[Alexandria] trade: ' .. tostring(name) .. ' not nearby', 'error') return end
     if not mob.distance or math.sqrt(mob.distance) > 6 then alex_chat(207, '[Alexandria] trade: target out of range', 'error') return end
     local entries = trade_expand(items or {})
@@ -2029,7 +2293,7 @@ function trade_begin(name, items, gil)
     end
     if #entries == 0 and gil <= 0 then alex_chat(207, '[Alexandria] trade: nothing tradeable in inventory', 'error') return end
     trade_counter = 0
-    trade_tx = { name = name, id = mob.id, index = mob.index, entries = entries, gil = gil, gil_sent = (gil <= 0), idx = 0, tidx = 1, stage = 'offer', t = os.clock(), last = 0 }
+    trade_tx = { name = mob.name, id = mob.id, index = mob.index, entries = entries, gil = gil, gil_sent = (gil <= 0), idx = 0, tidx = 1, stage = 'offer', t = os.clock(), last = 0 }
     trade_result = nil
     trade_status_dirty = true
     if trade_debug then trade_log(('TX trade_begin target=%s id=%s entries=%s gil=%s'):format(tostring(name), tostring(mob.id), tostring(#entries), tostring(gil))) end
@@ -2073,7 +2337,7 @@ local function trade_trusted(rid, rmob)
     if trade_wl_ids[rid] then return true end
     if rmob and trade_wl[rmob.name] then return true end
     if trade_armed and (os.clock() - trade_armed.t) < TRADE_ARM_WINDOW
-        and ((trade_armed.id and trade_armed.id == rid) or (rmob and trade_armed.name == rmob.name)) then return true end
+        and ((trade_armed.id and trade_armed.id == rid) or (rmob and trade_armed.name == rmob.name) or not rmob) then return true end
     return false
 end
 
@@ -2090,7 +2354,7 @@ local function trade_on_incoming(id, data, injected)
         if trade_debug then trade_log(('RX 0x021 rid=%s mob=%s trusted=%s st=%s'):format(tostring(rid), rmob and tostring(rmob.name) or 'nil', tostring(ok), tostring(st))) end
         if not ok then return end
         if st < 2 or st > 4 then
-            trade_rx = { id = rid }
+            trade_rx = { id = rid, opened = false, tried = false }
             trade_rx_t = os.clock()
             trade_counter = 0
         end
@@ -2108,21 +2372,19 @@ local function trade_on_incoming(id, data, injected)
                 if (trade_rx and trade_rx.id == who) or trade_trusted(who, rmob) then trade_kind(2) end
             else
                 trade_counter = 0
+                if kind == 0 and trade_rx then trade_rx.opened = true end
             end
         end
         if kind == 9 or kind == 1 or kind >= 4 then
             if trade_tx then trade_result = (kind == 9) and 'done' or (kind == 1) and 'cancelled' or 'failed'; trade_status_dirty = true end
             trade_tx = nil
             trade_rx = nil
-            trade_armed = nil
+            if not (trade_armed and trade_armed.id and trade_armed.id ~= who) then trade_armed = nil end
         end
     end
 end
 
-local function shop_no_sale(id)
-    local r = res.items[id]
-    if not r or type(r.flags) ~= 'table' then return false end
-    for nm in pairs(r.flags) do if nm == 'No NPC Sale' then return true end end
+function shop_no_sale(id)
     return false
 end
 
@@ -2136,9 +2398,45 @@ local function shop_do_sell(id, slot, qty)
     pcall(windower.packets.inject_outgoing, 0x85, string.char(0x85, 0x04, 0, 0, 1, 0, 0, 0))
 end
 
+function shop_stack_for_idx(idx)
+    local it = shop.items[idx]
+    local stack = (it and res.items[it.id] and res.items[it.id].stack) or 1
+    if stack < 1 then stack = 1 end
+    return stack
+end
+
 function shop_buy(idx, qty)
     if not packets_ok then return false end
+    qty = math.min(math.max(1, tonumber(qty) or 1), shop_stack_for_idx(idx))
     pcall(windower.packets.inject_outgoing, 0x83, shop_buy_packet(idx, qty))
+    return true
+end
+
+function shop_buy_qty(idx, total)
+    if not packets_ok or not shop.items[idx] then return false end
+    local id = shop.items[idx].id
+    local stack = shop_stack_for_idx(idx)
+    total = math.max(1, tonumber(total) or 1)
+    local function buy_next(remaining)
+        if remaining <= 0 or not shop.items[idx] then return end
+        local q = math.min(remaining, stack)
+        local before = shop_count_inv(id)
+        shop_buy(idx, q)
+        local t0 = os.clock()
+        local function check()
+            if not shop.items[idx] then return end
+            local got = shop_count_inv(id) - before
+            if got > 0 then
+                coroutine.schedule(function() buy_next(remaining - got) end, 0.3)
+            elseif os.clock() - t0 > 4 then
+                return
+            else
+                coroutine.schedule(check, 0.3)
+            end
+        end
+        coroutine.schedule(check, 0.4)
+    end
+    buy_next(total)
     return true
 end
 
@@ -2217,13 +2515,20 @@ end
 -- ===== Store Materials (MassTrade-style zone-wide NPC trade) ==========================
 -- Trades up to 8 inventory slots per 0x036 packet, sent from anywhere in the NPC's zone
 -- (no proximity / targeting). Loops for >8 slots and auto-pulls from carry bags first.
+-- All 8 crystals + 8 clusters. Shared by every NPC that accepts the full elemental set.
+STORE_CRYSTAL_CLUSTERS = { 'Fire Crystal', 'Ice Crystal', 'Wind Crystal', 'Earth Crystal', 'Lightning Crystal', 'Water Crystal', 'Light Crystal', 'Dark Crystal', 'Fire Cluster', 'Ice Cluster', 'Wind Cluster', 'Earth Cluster', 'Lightning Cluster', 'Water Cluster', 'Light Cluster', 'Dark Cluster' }
 STORE_CATALOG = {
     { npc = 'Monisette',        items = { "Rem's Tale Ch.1", "Rem's Tale Ch.2", "Rem's Tale Ch.3", "Rem's Tale Ch.4", "Rem's Tale Ch.5", "Rem's Tale Ch.6", "Rem's Tale Ch.7", "Rem's Tale Ch.8", "Rem's Tale Ch.9", "Rem's Tale Ch.10" } },
     { npc = 'Oboro',            items = { 'Pluton', 'Beitetsu', 'Riftborn Boulder' } },
     { npc = 'Paparoon',         items = { 'Alexandrite' } },
     { npc = 'Shami',            items = { "Beastmen's Seal", "Kindred's Seal", "Kindred's Crest", 'H. Kindred Crest', 'S. Kindred Crest' } },
     { npc = 'Oseem',            items = { 'Pellucid Stone', 'Fern Stone', 'Taupe Stone' } },
-    { npc = 'Ephemeral Moogle', items = { 'Fire Crystal', 'Ice Crystal', 'Wind Crystal', 'Earth Crystal', 'Lightning Crystal', 'Water Crystal', 'Light Crystal', 'Dark Crystal', 'Fire Cluster', 'Ice Cluster', 'Wind Cluster', 'Earth Cluster', 'Lightning Cluster', 'Water Cluster', 'Light Cluster', 'Dark Cluster' } },
+    { npc = 'Ephemeral Moogle', items = STORE_CRYSTAL_CLUSTERS },
+    -- Waypoint / Proto-Waypoint accept the same crystals/clusters. They come in MULTIPLE
+    -- per zone, so store_find_npc resolves them to the NEAREST in range (STORE_NEAREST_NAMES),
+    -- never zone-gate/cache, so a trade always targets the one you're standing at.
+    { npc = 'Waypoint',         items = STORE_CRYSTAL_CLUSTERS },
+    { npc = 'Proto-Waypoint',   items = STORE_CRYSTAL_CLUSTERS },
 }
 STORE_CARRY_BAGS = { 0, 5, 6, 7 }
 function store_bags()
@@ -2243,8 +2548,14 @@ store_dirty = false
 store_id_cache = nil
 store_last_zone = -1
 store_npc_cache = {}
+store_wp_near_key = ''
 store_close_until = 0
 store_released = false
+
+-- NPCs that appear MANY times per zone (Waypoints): resolved to the NEAREST in-range
+-- instance in both modes, never by the fixed zone-gate / name-cache path (which assumes
+-- one NPC per name and would pin an arbitrary, possibly-distant one).
+STORE_NEAREST_NAMES = { ['Waypoint'] = true, ['Proto-Waypoint'] = true }
 
 STORE_FIXED_NPCS = {
     ['Monisette'] = { zone = 246, id = 17784989, index = 157 },
@@ -2256,6 +2567,187 @@ STORE_FIXED_NPCS = {
     ['Divainy-Gamainy'] = { zone = 256, id = 17826144, index = 352 },
     ['Gorpa-Masorpa']   = { zone = 249, id = 17797274, index = 154 },
 }
+
+store_discovered = {}
+
+-- Every "* Coffer Key" (the AF dungeon coffer keys), from Windower res.items. Shared by
+-- the Gobbie Mystery Box NPCs below, which all accept the full set.
+STORE_COFFER_KEYS = { 1042, 1043, 1044, 1045, 1046, 1047, 1048, 1049, 1050, 1051, 1052, 1053, 1054, 1057, 1058, 1059, 1060, 1063 }
+-- SP Gobbie Key is USED at the same Gobbie Mystery Box goblins (not stored). Listing it here
+-- makes it appear in those goblins' Store sections; store_enqueue routes it to the box-menu
+-- flow (gobbie_*) instead of a plain trade.
+SPKEY_ID = 8973
+STORE_COFFER_KEYS[#STORE_COFFER_KEYS + 1] = SPKEY_ID
+
+STORE_DEFAULTS = {
+    ['Isakoth']    = { zone = 235, id = 17739953, index = 177, items = { 8711 } },
+    ['Aurix']      = { zone = 243, id = 17772865, index = 321, items = { 9538, 9540, 9542 }, batch = 100 },  -- Rusted I. Card, Black. I. Card, Old I. Card (Ru'Lude Gardens; NPC also appears as "???")
+    ['Greyson']    = { zone = 245, id = 17781000, index = 264, items = { 9277 } },
+    ['Haggleblix'] = { zone = 147, id = 17379846, index = 518, items = { 1455 }, batch = 100 },
+    ['Divainy-Gamainy'] = { zone = 256, id = 17826144, index = 352, items = { 3951, 3952, 3953, 3954, 3955, 3956, 4033, 4034, 4035, 8930, 8931, 8932, 8939, 8940, 8941, 8948, 8949, 8950, 8957, 8958, 8959, 8933, 8934, 8935, 8942, 8943, 8944, 8951, 8952, 8953, 8960, 8961, 8962, 8936, 8937, 8938, 8945, 8946, 8947, 8954, 8955, 8956, 8963, 8964, 8965 } },  -- Skirmish stones: Ghastly/Wailing/Verdigris + Snow/Leaf/Dusk (slit/tip/dim/orb), each base/+1/+2
+    ['Eternal Flame']   = { zone = 256, id = 17826104, index = 312, items = { 8711 } },  -- Copper Voucher
+    ['Fhelm Jobeizat']  = { zone = 241, id = 17764603, index = 251, items = { 8711 } },  -- Copper Voucher
+    ['Lola']            = { zone = 257, id = 17830190, index = 302, items = { 4036, 3950 } },  -- Lebondopt Wing, Pulchridopt Wing (Mellidopt Wing goes to the ??? at Yorcia, not Lola)
+    ['Rolandienne']     = { zone = 230, id = 17719638, index = 342, items = { 8711 } },  -- Copper Voucher
+    ['Antiqix']         = { zone = 151, id = 17396217, index = 505, items = { 1449 }, batch = 100 },  -- T. Whiteshell (Castle Oztroja)
+    ['Lootblox']        = { zone = 149, id = 17388036, index = 516, items = { 1452 }, batch = 100 },  -- O. Bronzepiece -> M. Silverpiece (Davoi)
+    ['??? (Yorcia)']    = { zone = 263, id = 17855118, index = 654, items = { 9050 } },  -- Mellidopt Wing (nameless NPC in Yorcia Weald; normal trade amounts, not batched; distinct key so it never merges with Aurix's "???")
+    -- Gobbie Mystery Box NPCs (one per city) accept every coffer key. Enumerated from the
+    -- entity DATs; ids derive from zone+index. All share STORE_COFFER_KEYS.
+    ['Habitox']    = { zone = 232, id = 17727634, index = 146, items = STORE_COFFER_KEYS },  -- Port San d'Oria
+    ['Mystrix']    = { zone = 230, id = 17719641, index = 345, items = STORE_COFFER_KEYS },  -- Southern San d'Oria
+    ['Bountibox']  = { zone = 234, id = 17735872, index = 192, items = STORE_COFFER_KEYS },  -- Bastok Mines
+    ['Specilox']   = { zone = 235, id = 17739956, index = 180, items = STORE_COFFER_KEYS },  -- Bastok Markets
+    ['Arbitrix']   = { zone = 239, id = 17756351, index = 191, items = STORE_COFFER_KEYS },  -- Windurst Walls
+    ['Funtrox']    = { zone = 241, id = 17764606, index = 254, items = STORE_COFFER_KEYS },  -- Windurst Woods
+    ['Sweepstox']  = { zone = 245, id = 17780998, index = 262, items = STORE_COFFER_KEYS },  -- Lower Jeuno
+    ['Priztrix']   = { zone = 244, id = 17776886, index = 246, items = STORE_COFFER_KEYS },  -- Upper Jeuno
+    ['Wondrix']    = { zone = 50,  id = 16982640, index = 624, items = STORE_COFFER_KEYS },  -- Aht Urhgan Whitegate
+    ['Rewardox']   = { zone = 256, id = 17826177, index = 385, items = STORE_COFFER_KEYS },  -- Western Adoulin
+    ['Winrix']     = { zone = 257, id = 17830187, index = 299, items = STORE_COFFER_KEYS },  -- Eastern Adoulin
+    ['Anomaly Expert'] = { zone = 257, id = 17830191, index = 303, items = { 3960, 3961, 3962, 8755, 8756, 8757 } },  -- Yggrete stones: Celadon, Zaffre, Alizarin, Phlox, Russet, Aster (Eastern Adoulin)
+}
+
+function store_merge_entry(name, e)
+    if type(e) ~= 'table' then return end
+    local me = store_discovered[name]
+    if type(me) ~= 'table' then me = { items = {} }; store_discovered[name] = me end
+    me.items = me.items or {}
+    local have = {}
+    for _, x in ipairs(me.items) do have[x] = true end
+    for _, x in ipairs(e.items or {}) do if not have[x] then me.items[#me.items + 1] = x; have[x] = true end end
+    if me.batch == nil then me.batch = e.batch end
+    me.zone = me.zone or e.zone
+    me.id = me.id or e.id
+    me.index = me.index or e.index
+    if me.id and me.index and me.zone then
+        if not STORE_FIXED_NPCS[name] then
+            STORE_FIXED_NPCS[name] = { zone = me.zone, id = me.id, index = me.index, batch = me.batch }
+        elseif me.batch and not STORE_FIXED_NPCS[name].batch then
+            STORE_FIXED_NPCS[name].batch = me.batch
+        end
+    end
+end
+
+function store_save_discovered()
+    if not json_ok then return end
+    local rf = io.open(windower.addon_path .. 'data/store_discovered.json', 'r')
+    if rf then
+        local raw = rf:read('*a'); rf:close()
+        if raw and #raw > 0 then
+            local dok, disk = pcall(json.decode, raw)
+            if dok and type(disk) == 'table' then
+                for name, de in pairs(disk) do store_merge_entry(name, de) end
+            end
+        end
+    end
+    local ok, enc = pcall(json.encode, store_discovered, { indent = true })
+    if ok and enc then
+        local wf = io.open(windower.addon_path .. 'data/store_discovered.json', 'w')
+        if wf then wf:write(enc); wf:close() end
+    end
+end
+
+-- Fold a finished capture into store_discovered + STORE_FIXED_NPCS. Shared by the dev
+-- `capture stop` and the user-facing `learn done`. Returns a summary table.
+function store_capture_commit(c)
+    local npcname = c.label or c.tname
+    if not npcname and c.npc.id then local m = windower.ffxi.get_mob_by_id(c.npc.id); npcname = m and m.name end
+    npcname = npcname or 'UnknownNPC'
+    local eid = c.tid or c.npc.id
+    local eidx = c.tindex or c.npc.index
+    -- Many FFXI NPCs share the name "???"; keying by name alone merges two different
+    -- ??? NPCs (different index) into one entry. Qualify nameless captures by zone/index
+    -- so they stay distinct. An explicit //ax capture <label> still takes precedence.
+    if not c.label and (npcname == '???' or npcname == '') and eidx then
+        npcname = ('??? (z%d i%d)'):format(c.zone or 0, eidx)
+    end
+    local item_ids = {}
+    for iid in pairs(c.items) do item_ids[#item_ids + 1] = iid end
+    local item_names = {}
+    for _, iid in ipairs(item_ids) do item_names[#item_names + 1] = (res.items[iid] and res.items[iid].en) or ('item ' .. iid) end
+    local saved, added = false, 0
+    if eid and eidx and #item_ids > 0 then
+        local d = store_discovered[npcname]
+        if type(d) ~= 'table' then d = { items = {} }; store_discovered[npcname] = d end
+        d.zone, d.id, d.index = c.zone, eid, eidx
+        if c.batch and c.batch > 1 then d.batch = c.batch end
+        d.items = d.items or {}
+        local have = {}
+        for _, x in ipairs(d.items) do have[x] = true end
+        for _, iid in ipairs(item_ids) do if not have[iid] then d.items[#d.items + 1] = iid; have[iid] = true; added = added + 1 end end
+        if not STORE_FIXED_NPCS[npcname] then STORE_FIXED_NPCS[npcname] = { zone = c.zone, id = eid, index = eidx } end
+        STORE_FIXED_NPCS[npcname].batch = d.batch
+        store_save_discovered()
+        store_dirty = true
+        saved = true
+        -- Propagate the newly learned NPC to every other connected character so the whole
+        -- fleet can store to it immediately. The desktop rebroadcasts this as `storeadd`.
+        if type(c.zone) == 'number' then
+            local iparts = {}
+            for _, iid in ipairs(d.items) do iparts[#iparts + 1] = tostring(iid) end
+            queue_send('{"t":"storelearn","npc":"' .. esc(npcname) .. '","zone":' .. c.zone .. ',"id":' .. eid .. ',"index":' .. eidx .. ',"items":[' .. table.concat(iparts, ',') .. ']' .. (d.batch and (',"batch":' .. d.batch) or '') .. '}\n')
+        end
+    end
+    return { npcname = npcname, eid = eid, eidx = eidx, item_names = item_names, primary = item_names[1] or 'no-item', saved = saved, added = added }
+end
+
+-- Write every user-discovered (non-builtin) storage NPC to one clean, shareable file.
+-- Returns count and the full path, or 0/nil if there is nothing new to share.
+function store_share_write()
+    local lines, n = {}, 0
+    for name, e in pairs(store_discovered) do
+        if type(e) == 'table' and e.id and e.index and e.zone then
+            -- Share NPCs the dev has no built-in for, AND built-ins the user taught NEW items for
+            -- (so additions to a built-in like extra stones make it back to the dev instead of being
+            -- silently dropped). newnames = the items this NPC has beyond its built-in default.
+            local def = STORE_DEFAULTS[name]
+            local defhave = {}
+            if type(def) == 'table' then for _, iid in ipairs(def.items or {}) do defhave[iid] = true end end
+            local newnames = {}
+            for _, iid in ipairs(e.items or {}) do if not defhave[iid] then newnames[#newnames + 1] = (res.items[iid] and res.items[iid].en) or ('item ' .. iid) end end
+            if not def or #newnames > 0 then
+                local ids, names = {}, {}
+                for _, iid in ipairs(e.items or {}) do
+                    ids[#ids + 1] = tostring(iid)
+                    names[#names + 1] = (res.items[iid] and res.items[iid].en) or ('item ' .. iid)
+                end
+                local bpart = e.batch and (', batch = ' .. e.batch) or ''
+                local note = def and (' -- built-in + new: ' .. table.concat(newnames, ', ')) or ('  -- ' .. table.concat(names, ', '))
+                lines[#lines + 1] = ("    ['%s'] = { zone = %d, id = %d, index = %d, items = { %s }%s },%s"):format(
+                    name, e.zone, e.id, e.index, table.concat(ids, ', '), bpart, note)
+                n = n + 1
+            end
+        end
+    end
+    if n == 0 then return 0, nil end
+    table.sort(lines)
+    local path = windower.addon_path .. 'data/storage_npcs_to_share.txt'
+    local f = io.open(path, 'w')
+    if f then
+        f:write('-- Alexandria storage NPCs you discovered. Send this whole file to the developer.\n\n')
+        f:write(table.concat(lines, '\n') .. '\n')
+        f:close()
+    end
+    return n, path
+end
+
+function store_load_discovered()
+    store_discovered = {}
+    local disk = {}
+    local f = io.open(windower.addon_path .. 'data/store_discovered.json', 'r')
+    if f then
+        local raw = f:read('*a'); f:close()
+        if json_ok and raw and #raw > 0 then
+            local ok, d = pcall(json.decode, raw)
+            if ok and type(d) == 'table' then disk = d end
+        end
+    end
+    for name, e in pairs(disk) do store_merge_entry(name, e) end
+    for name, e in pairs(STORE_DEFAULTS) do store_merge_entry(name, e) end
+end
+store_load_discovered()
+
 store_debug = false
 function store_dbg(msg)
     if store_debug then alex_chat(160, '[store] ' .. msg, 'action') end
@@ -2273,7 +2765,10 @@ function store_item_id(name)
     if not store_id_cache then
         store_id_cache = {}
         for id, r in pairs(res.items) do
-            if type(r) == 'table' and r.en then store_id_cache[r.en:lower()] = id end
+            if type(r) == 'table' then
+                if r.enl then store_id_cache[r.enl:lower()] = id end
+                if r.en then store_id_cache[r.en:lower()] = id end
+            end
         end
     end
     return store_id_cache[name:lower()]
@@ -2283,6 +2778,21 @@ end
 -- never touch the mob array, so they never flicker as the client culls distant entities.
 -- Location-variable NPCs (Ephemeral Moogle) fall back to a name scan cached per zone.
 function store_find_npc(name)
+    -- Multi-instance NPCs (several Waypoints per zone): always target the closest one
+    -- within trade range from the live mob array, in both modes. Bypasses the zone-gate /
+    -- name-cache below so we never pin (and trade to) a far instance.
+    if STORE_NEAREST_NAMES[name] then
+        local arr = windower.ffxi.get_mob_array()
+        if not arr then return nil end
+        local best_id, best_idx, best_d
+        for _, v in pairs(arr) do
+            if type(v) == 'table' and v.name == name and v.id and v.id > 0 and v.index and v.distance then
+                local d = math.sqrt(v.distance)
+                if d <= 6 and (not best_d or d < best_d) then best_id, best_idx, best_d = v.id, v.index, d end
+            end
+        end
+        return best_id, best_idx
+    end
     local fx = STORE_FIXED_NPCS[name]
     if fx then
         if experimental_features then
@@ -2404,11 +2914,56 @@ function store_menu_close()
     store_dbg(('store close menu=%d tgt=%d idx=%d'):format(m.menu or -1, m.id or -1, m.index or -1))
 end
 
+capture = nil
+CAPTURE_IDS = { [0x016] = 1, [0x01A] = 1, [0x032] = 1, [0x033] = 1, [0x034] = 1, [0x036] = 1, [0x04B] = 1, [0x052] = 1, [0x05B] = 1, [0x05C] = 1 }
+
+function capture_record(dir, id, data)
+    if not capture or not CAPTURE_IDS[id] then return end
+    if not capture.tname then
+        local tgt = windower.ffxi.get_mob_by_target('t')
+        if tgt and tgt.name and tgt.name ~= '' then capture.tname = tgt.name; capture.tid = tgt.id; capture.tindex = tgt.index end
+    end
+    local note = ''
+    if dir == 'in' and packets_ok and (id == 0x032 or id == 0x033 or id == 0x034) then
+        local ok, p = pcall(packets.parse, 'incoming', data)
+        if ok and p and p['Menu ID'] and p['NPC'] then
+            capture.npc = { id = p['NPC'], index = p['NPC Index'], zone = p['Zone'] or capture.zone, menu = p['Menu ID'] }
+            note = ('menu=%s npc=%s index=%s zone=%s'):format(tostring(p['Menu ID']), tostring(p['NPC']), tostring(p['NPC Index']), tostring(p['Zone']))
+        end
+    elseif dir == 'out' and id == 0x036 then
+        local nid = rd_u32(data, 5)
+        note = ('trade to npc_id=%s'):format(tostring(nid))
+        if not capture.npc.id then capture.npc.id = nid end
+        local inv = windower.ffxi.get_items(0)
+        local names = {}
+        for i = 0, 9 do
+            local slot = data:byte(49 + i)
+            if slot and slot > 0 and type(inv) == 'table' and type(inv[slot]) == 'table' and inv[slot].id and inv[slot].id ~= 0 then
+                capture.items[inv[slot].id] = true
+                local r = res.items[inv[slot].id]
+                names[#names + 1] = (r and r.en) or ('item ' .. inv[slot].id)
+            end
+        end
+        if #names > 0 then note = note .. '  items=' .. table.concat(names, ', ') end
+    elseif dir == 'out' and packets_ok and (id == 0x05B or id == 0x05C) then
+        local ok, p = pcall(packets.parse, 'outgoing', data)
+        if ok and p then note = ('option=%s menu=%s target_index=%s'):format(tostring(p['Option Index']), tostring(p['Menu ID']), tostring(p['Target Index'])) end
+    end
+    capture.events[#capture.events + 1] = { dir = dir, id = id, t = os.clock() - capture.t0, len = #data, hex = dbox_hex(data), note = note }
+    if #capture.events > 500 then table.remove(capture.events, 1) end
+end
+
 function store_begin(npc, id, want)
     if store_run then return end
     if not packets_ok then alex_chat(207, '[Alexandria] packets unavailable', 'error') return end
     local nid, nidx = store_find_npc(npc)
     if not nid then alex_chat(207, '[Alexandria] ' .. npc .. ' is not in this zone', 'error') return end
+    local entry = STORE_FIXED_NPCS[npc]
+    local batch = entry and tonumber(entry.batch)
+    if batch and batch > 1 then
+        want = math.floor(want / batch) * batch
+        if want < batch then alex_chat(207, ('[Alexandria] %s only accepts batches of %d'):format(npc, batch), 'error') return end
+    end
     local r = res.items[id]
     local zinfo = windower.ffxi.get_info()
     local lid, lidx, ldist = store_live_npc(npc)
@@ -2423,12 +2978,14 @@ function store_begin(npc, id, want)
     store_dbg(('inv count=%d  noninv count=%d  packets_ok=%s'):format(
         store_count(id, { 0 }), store_count(id, store_noninv_bags()), tostring(packets_ok)))
     store_run = { npc = npc, npc_id = nid, npc_index = nidx, id = id, name = (r and r.en) or ('item ' .. id),
-        want = want, done = 0, phase = 'trade', t = os.clock(), start = os.clock() }
+        want = want, done = 0, phase = 'trade', t = os.clock(), start = os.clock(),
+        batch_req = (batch and batch > 1) and batch or nil }
     alex_chat(207, ('[Alexandria] Storing %s -> %s...'):format(store_run.name, npc), 'action')
     emit_store(true, id, 0, want, 'storing')
 end
 
 function store_enqueue(npc, id, want)
+    if id == SPKEY_ID then gobbie_enqueue(npc, want) return end
     if store_run and store_run.npc == npc and store_run.id == id then return end
     for _, q in ipairs(store_q) do
         if q.npc == npc and q.id == id then q.want = math.max(q.want, want) return end
@@ -2464,10 +3021,20 @@ function store_tick(now)
         end
         local remaining = math.max(0, r.want - r.done)
         if remaining == 0 then store_dbg('trade: remaining=0 -> finish'); store_finish() return end
-        local slots = store_inv_slots(r.id, 8, remaining)
+        local want_now = remaining
+        if r.batch_req then
+            if inv_n < r.batch_req then
+                local total = inv_n + store_count(r.id, store_noninv_bags())
+                if total < r.batch_req then store_dbg(('batch: %d < %d, cannot complete a batch -> finish'):format(total, r.batch_req)); store_finish() return end
+                store_dbg(('batch: inv=%d < %d -> pull'):format(inv_n, r.batch_req)); r.phase = 'pull'; r.t = now; return
+            end
+            want_now = r.batch_req
+        end
+        local slots = store_inv_slots(r.id, r.batch_req and 10 or 8, want_now)
         if #slots == 0 then store_dbg('trade: 0 slots -> finish'); store_finish() return end
         local batch = 0
         for _, s in ipairs(slots) do batch = batch + s.count end
+        if r.batch_req and batch < r.batch_req then store_dbg(('batch: gathered %d < %d -> finish'):format(batch, r.batch_req)); store_finish() return end
         r.before = inv_n
         r.batch = batch
         local sd = {}
@@ -2519,20 +3086,215 @@ end
 function build_storezone()
     local parts = {}
     local bags = store_bags()
-    for _, cat in ipairs(STORE_CATALOG) do
-        if store_find_npc(cat.npc) then
-            local items = {}
-            for _, nm in ipairs(cat.items) do
-                local id = store_item_id(nm)
-                if id then
-                    items[#items + 1] = '{"id":' .. id .. ',"n":"' .. esc(res.items[id].en) .. '","c":' .. store_count(id, bags) .. '}'
-                end
+    local seen = {}
+    local function emit(npc, ids)
+        if seen[npc] or not store_find_npc(npc) then return end
+        seen[npc] = true
+        local items = {}
+        for _, id in ipairs(ids) do
+            if id and res.items[id] then
+                items[#items + 1] = '{"id":' .. id .. ',"n":"' .. esc(res.items[id].en) .. '","c":' .. store_count(id, bags) .. '}'
             end
-            parts[#parts + 1] = '{"npc":"' .. esc(cat.npc) .. '","items":[' .. table.concat(items, ',') .. ']}'
         end
+        local e = STORE_FIXED_NPCS[npc]
+        local b = (e and tonumber(e.batch)) or 0
+        parts[#parts + 1] = '{"npc":"' .. esc(npc) .. '","batch":' .. b .. ',"items":[' .. table.concat(items, ',') .. ']}'
+    end
+    for _, cat in ipairs(STORE_CATALOG) do
+        local ids = {}
+        for _, nm in ipairs(cat.items) do local id = store_item_id(nm); if id then ids[#ids + 1] = id end end
+        emit(cat.npc, ids)
+    end
+    for name, d in pairs(store_discovered) do
+        if type(d) == 'table' and type(d.items) == 'table' then emit(name, d.items) end
     end
     if store_debug then store_dbg(('build_storezone zone=%s npcs=%d'):format(tostring((windower.ffxi.get_info() or {}).zone), #parts)) end
     return '{"t":"storezone","npcs":[' .. table.concat(parts, ',') .. ']}\n'
+end
+
+-- ===== SP Gobbie Key (Gobbie Mystery Box menu use) ===================================
+-- The Mystery Box goblins (the same NPCs that store coffer keys) take SP Gobbie Keys through a
+-- MENU dialogue, not a plain trade: trade one key (0x036) -> box menu opens (0x032/0x034) ->
+-- pick option 1 (0x05B) -> sub-menu (0x05C) -> confirm option 2 (0x05B) -> the key is consumed
+-- and a reward drops into a free slot. Modeled on the Augment feature's menu handling and the
+-- FFXIKeys addon. We drive (and swallow) the menu chunks, and confirm each use by the key count
+-- dropping, so "Use All" is capped by free inventory space. Runs per character.
+gobbie_run = nil
+
+function gobbie_free_slots()
+    local inv = windower.ffxi.get_items(0)
+    if type(inv) ~= 'table' then return 0 end
+    return math.max(0, (inv.max or 0) - (inv.count or 0))
+end
+
+function gobbie_key_slot()
+    local inv = windower.ffxi.get_items(0)
+    if type(inv) ~= 'table' then return nil, 0 end
+    local slot, total = nil, 0
+    for s = 1, (inv.max or 0) do
+        local it = inv[s]
+        if type(it) == 'table' and it.id == SPKEY_ID and (it.count or 0) > 0 then
+            if not slot then slot = s end
+            total = total + it.count
+        end
+    end
+    return slot, total
+end
+
+-- The box goblin is the same NPC we store coffer keys to. Prefer the LIVE mob (ground-truth
+-- id/index, and it confirms we are standing at it) matched by the store's known id or its name;
+-- fall back to the hardcoded store resolution. Sidesteps any hardcoded-id drift between addons.
+function gobbie_resolve(npc)
+    local sid = select(1, store_find_npc(npc))
+    local arr = windower.ffxi.get_mob_array()
+    if arr then
+        local best_id, best_idx, best_d
+        for _, v in pairs(arr) do
+            if type(v) == 'table' and v.id and v.id > 0 and v.index and v.distance and (v.id == sid or v.name == npc) then
+                local d = math.sqrt(v.distance)
+                if d <= 6 and (not best_d or d < best_d) then best_id, best_idx, best_d = v.id, v.index, d end
+            end
+        end
+        if best_id then return best_id, best_idx end
+    end
+    return store_find_npc(npc)
+end
+
+function gobbie_finish()
+    local r = gobbie_run
+    gobbie_run = nil
+    if r then
+        alex_chat(207, ('[Alexandria] Used %d SP Gobbie Key%s'):format(r.done or 0, (r.done == 1) and '' or 's'), 'action')
+        emit_store(false, SPKEY_ID, r.done or 0, r.want or 0, 'done')
+    end
+    store_dirty = true
+end
+
+function gobbie_begin(npc, want)
+    if store_run or gobbie_run then return end
+    if not packets_ok then alex_chat(207, '[Alexandria] packets unavailable', 'error') return end
+    local nid, nidx = gobbie_resolve(npc)
+    if not nid then alex_chat(207, '[Alexandria] ' .. npc .. ' is not in range', 'error') return end
+    local _, held = gobbie_key_slot()
+    local free = gobbie_free_slots()
+    want = math.min(tonumber(want) or 0, held, free)
+    if want <= 0 then
+        alex_chat(207, (held <= 0) and '[Alexandria] no SP Gobbie Keys held' or '[Alexandria] no free inventory space for box rewards', 'error')
+        return
+    end
+    local zinfo = windower.ffxi.get_info()
+    gobbie_lastpkt = {}  -- fresh de-dup state for this run
+    gobbie_run = { npc = npc, npc_id = nid, npc_index = nidx, zone = (zinfo and zinfo.zone) or store_last_zone,
+        want = want, done = 0, phase = 'trade', menu = nil, queue = {}, t = os.clock(), start = os.clock() }
+    alex_chat(207, ('[Alexandria] Using %d SP Gobbie Key%s at %s...'):format(want, (want == 1) and '' or 's', npc), 'action')
+    emit_store(true, SPKEY_ID, 0, want, 'using')
+end
+
+function gobbie_enqueue(npc, want)
+    if gobbie_run then if gobbie_run.npc == npc then gobbie_run.want = gobbie_run.want + (tonumber(want) or 0) end return end
+    gobbie_begin(npc, want)
+end
+
+function gobbie_trade()
+    if not gobbie_run then return end
+    local slot = gobbie_key_slot()
+    if not slot then gobbie_finish() return end
+    pcall(function() packets.inject(packets.new('outgoing', 0x036, {
+        ['Target'] = gobbie_run.npc_id, ['Target Index'] = gobbie_run.npc_index,
+        ['Item Count 1'] = 1, ['Item Index 1'] = slot, ['Number of Items'] = 1,
+    })) end)
+    gobbie_run.phase = 'menu'
+    gobbie_run.t = os.clock()
+end
+
+function gobbie_choice(option, automated)
+    if not gobbie_run then return end
+    store_dbg(('gobbie choice opt=%d auto=%s menu=%s'):format(option, tostring(automated), tostring(gobbie_run.menu)))
+    pcall(function() packets.inject(packets.new('outgoing', 0x05B, {
+        ['Target'] = gobbie_run.npc_id, ['Target Index'] = gobbie_run.npc_index,
+        ['Option Index'] = option, ['_unknown1'] = 0, ['Automated Message'] = automated and true or false,
+        ['Zone'] = gobbie_run.zone, ['Menu ID'] = gobbie_run.menu or 0,
+    })) end)
+end
+
+-- Mirrors FFXIKeys util/packets.is_duplicate: the game resends these packets, and processing a
+-- resend double-advances the dialogue and breaks the run. Key off the first 4 bytes (header + sync)
+-- so a retransmit of the same packet is ignored. Reset per run in gobbie_begin.
+GOBBIE_DUP = { [0x034] = true, [0x032] = true, [0x05C] = true, [0x052] = true, [0x02A] = true }
+gobbie_lastpkt = {}
+function gobbie_is_dupe(id, data)
+    local b1, b2, b3, b4 = data:byte(1, 4)
+    local pid = (b1 or 0) + (b2 or 0) * 0x100 + (b3 or 0) * 0x10000 + (b4 or 0) * 0x1000000
+    if gobbie_lastpkt[id] == pid then return true end
+    gobbie_lastpkt[id] = pid
+    return false
+end
+
+-- Runs before the generic NPC-menu handler so we drive (and hide) the box dialogue ourselves.
+-- Faithful to the FFXIKeys Use dialogue: 0x036 trade -> box menu 0x034/0x032 (send option 1) ->
+-- then EACH sub-menu 0x05C queues one confirm (option 2) that is fired on the NEXT 0x052 ack; the
+-- run completes on the first 0x052 with nothing left to confirm. The box's box-open dialogue is
+-- multiple confirms deep (option 1, then several option 2s incl. one AFTER the reward), so driving
+-- it generically -- not a fixed two steps -- is what lets each use close cleanly and the loop go on.
+-- Includes FFXIKeys' packet de-dup so resends don't double-drive it.
+function gobbie_incoming(id, data)
+    if not gobbie_run then return nil end
+    if GOBBIE_DUP[id] and gobbie_is_dupe(id, data) then return nil end
+    local r = gobbie_run
+    if store_debug and (id == 0x032 or id == 0x034 or id == 0x05C or id == 0x052 or id == 0x02A or id == 0x037) then
+        store_dbg(('gobbie in 0x%03X ph=%s q=%d done=%d/%d'):format(id, tostring(r.phase), r.queue and #r.queue or 0, r.done, r.want))
+    end
+    if id == 0x032 or id == 0x034 then
+        local ok, p = pcall(packets.parse, 'incoming', data)
+        if ok and p and p['Menu ID'] and p['Menu ID'] ~= 0 then r.menu = p['Menu ID'] end
+        if r.phase == 'menu' then
+            -- Trade opened the box menu. Fire the first confirm (the box's initial UseMenu -> option
+            -- 1, automated) and start driving the dialogue.
+            r.queue = {}; r.last_type = 'use'
+            r.phase = 'dialogue'; r.t = os.clock()
+            gobbie_choice(1, true)
+        end
+        return true
+    elseif id == 0x05C then
+        -- Each sub-menu queues one confirm (option 2), fired on the following 0x052. Automated only
+        -- for the one that directly follows the initial UseMenu (matches FFXIKeys' ExtraMenu).
+        if r.phase == 'dialogue' then
+            r.queue[#r.queue + 1] = { option = 2, automated = (r.last_type == 'use') }
+            r.last_type = 'simple'; r.t = os.clock()
+        end
+        return true
+    elseif id == 0x052 then
+        if r.phase == 'dialogue' then
+            if #r.queue > 0 then
+                local c = table.remove(r.queue, 1)
+                r.t = os.clock()
+                gobbie_choice(c.option, c.automated)
+            else
+                -- Nothing left to confirm: this use is complete. Count it and loop (~0 delay).
+                r.done = r.done + 1
+                emit_store(true, SPKEY_ID, r.done, r.want, 'using')
+                if r.done >= r.want then gobbie_finish() else r.phase = 'trade'; r.t = os.clock() end
+            end
+        end
+        return true  -- block, like FFXIKeys; the client never opened this menu
+    elseif id == 0x037 then
+        return true
+    end
+    return nil
+end
+
+function gobbie_tick(now)
+    local r = gobbie_run
+    if not r then return end
+    if now - r.start > 300 then gobbie_finish() return end
+    if r.phase == 'trade' then
+        local slot, held = gobbie_key_slot()
+        if r.done >= r.want or not slot or held <= 0 or gobbie_free_slots() <= 0 then gobbie_finish() return end
+        gobbie_trade()  -- sends 0x036 and moves to 'menu'
+    elseif r.phase == 'menu' or r.phase == 'dialogue' then
+        -- The dialogue is packet-driven (gobbie_incoming). This only guards against a stall.
+        if now - r.t > 8 then store_dbg('gobbie: ' .. r.phase .. ' timeout'); gobbie_finish() end
+    end
 end
 
 function build_store()
@@ -2626,7 +3388,9 @@ function npc_scan(now)
     local nn = false
     local eph = false
     local fn = {}
+    local wpn = {}
     local best, bestd = nil, nil
+    local pvbest, pvbestd = nil, nil
     for _, v in pairs(arr) do
         if v and v.name and v.x then
             local dx, dy = v.x - me.x, v.y - me.y
@@ -2635,9 +3399,11 @@ function npc_scan(now)
             if SPARKS_NPCS[v.name] and d < 36 then sn = true end
             if UNITY_NPCS[v.name] and d < 36 then un = true end
             if v.name == CURIO_NAME and d < 36 then cn = true end
+            if PVENDOR_SHOPS[v.name] and d < 36 and (not pvbestd or d < pvbestd) then pvbest = v; pvbestd = d end
             if v.name == 'Nomad Moogle' and d < 36 then nn = true end
             if v.name == 'Ephemeral Moogle' and d < 36 then eph = true end
             if STORE_FIXED_NPCS[v.name] and d < 36 then fn[#fn + 1] = v.name end
+            if STORE_NEAREST_NAMES[v.name] and d < 36 then wpn[#wpn + 1] = v.name end
             if watching and npc_watch[v.name] and d < 144 and (not bestd or d < bestd) then best = v; bestd = d end
         end
     end
@@ -2648,6 +3414,12 @@ function npc_scan(now)
     table.sort(fn)
     local fkey = table.concat(fn, '|')
     if fkey ~= fixed_near_key then fixed_near_key = fkey; fixed_near = fn; fixed_near_dirty = true; store_dirty = true end
+    -- Proximity-based storage NPCs (Waypoints) are not in STORE_FIXED_NPCS, so track them
+    -- separately: walking into/out of range must refresh the store panel, since build_storezone
+    -- only re-runs when store_dirty flips (it never re-evaluated on movement before this).
+    table.sort(wpn)
+    local wpkey = table.concat(wpn, '|')
+    if wpkey ~= store_wp_near_key then store_wp_near_key = wpkey; store_dirty = true end
     if best then
         npc_near_seen = now
         if not npc_near or npc_near.id ~= best.id then
@@ -2657,6 +3429,15 @@ function npc_scan(now)
     elseif npc_near and (now - npc_near_seen) > 2 then
         npc_near = nil
         npc_near_dirty = true
+    end
+    if pvbest then
+        if not pvendor_near or pvendor_near.id ~= pvbest.id then
+            pvendor_near = { name = pvbest.name, id = pvbest.id, index = pvbest.index }
+            pvendor_near_dirty = true
+        end
+    elseif pvendor_near then
+        pvendor_near = nil
+        pvendor_near_dirty = true
     end
 end
 
@@ -2734,15 +3515,15 @@ function resupply_is_rare(id)
     return item_flag(id, 'Rare', 32768)
 end
 
--- Bags a character carries an item in (inventory + satchel/sack/case + wardrobes, which
--- include equipped gear). Rare items can only be possessed once across all of these, so
--- we count them everywhere; normal supplies are only counted in the main inventory.
+-- Bags a character carries an item in (inventory + satchel/sack/case + wardrobes). Counted
+-- for every resupply stock check, not just inventory: surplus a character keeps in its
+-- Sack/Satchel/etc. (e.g. via Organize) is real stock, so Curio must not re-buy it. Deep
+-- storage (Safe/Storage/Locker) is excluded on purpose since it isn't field-reachable.
 RESUPPLY_CARRY_BAGS = { 0, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16 }
 
 function resupply_count(id)
-    local bags = resupply_is_rare(id) and RESUPPLY_CARRY_BAGS or { 0 }
     local n = 0
-    for _, bag in ipairs(bags) do
+    for _, bag in ipairs(RESUPPLY_CARRY_BAGS) do
         local inv = windower.ffxi.get_items(bag)
         if inv then
             for s = 1, (inv.max or 80) do
@@ -2787,6 +3568,7 @@ end
 
 function resupply_finish(now)
     local n = resupply_run and resupply_run.bought_n or 0
+    local curio_id = resupply_run and resupply_run.npc_id
     resupply_cd_npc = npc_near and npc_near.id or nil
     resupply_cd = now + 30
     resupply_run = nil
@@ -2795,6 +3577,11 @@ function resupply_finish(now)
         alex_chat(207, ('[Alexandria] Curio Moogle restock complete. Restocked %d item%s.'):format(n, n == 1 and '' or 's'), 'action')
     else
         alex_chat(207, '[Alexandria] Curio Moogle restock complete.', 'action')
+    end
+    if curio_id then
+        for _, t in ipairs({ 1.2, 2.5, 4.0 }) do
+            coroutine.schedule(function() if not resupply_run and npc_menu and npc_menu.id == curio_id then resupply_sel(0, 0) end end, t)
+        end
     end
 end
 
@@ -2822,6 +3609,7 @@ end
 function resupply_open_cat(r, opt)
     if not packets_ok then return end
     r.cur_opt = opt
+    r.drained = false
     r.state = 'shop'
     r.t = os.clock()
     npc_pending = { option = opt, id = r.npc_id, t = os.clock() }
@@ -2841,7 +3629,7 @@ end
 -- (e.g. a Rare you can't hold). Used to re-sweep so streaming shop lists don't drop items.
 function resupply_still_needed(r)
     for id, target in pairs(resupply_min) do
-        if not r.attempted[id] and resupply_count(id) < target then return true end
+        if r.seen and r.seen[id] and not r.attempted[id] and resupply_count(id) < target then return true end
     end
     return false
 end
@@ -2872,6 +3660,10 @@ end
 -- In the open shop: buy the next item that's short, or move on to the next category.
 function resupply_buy_step(r)
     if resupply_run ~= r or r.state ~= 'buy' then return end
+    r.seen = r.seen or {}
+    for _, it in pairs(shop.items) do
+        if type(it) == 'table' and it.id and resupply_min[it.id] then r.seen[it.id] = true end
+    end
     local b = resupply_pick(r)
     if not b then
         -- The shop list streams in over several 0x03C packets; before declaring the
@@ -2893,9 +3685,12 @@ function resupply_buy_step(r)
     r.buy = { id = b.id, idx = b.idx, target = b.target, before = resupply_count(b.id) }
     r.state = 'buyack'
     r.t = os.clock()
-    rs_log(('buy id=%d slot=%d x%d (have %d/%d)'):format(b.id, b.idx, math.min(b.target - r.buy.before, 99), r.buy.before, b.target))
+    local r_item = res.items[b.id]
+    local stack = (r_item and r_item.stack) or 1
+    local qty = math.min(b.target - r.buy.before, stack)
+    rs_log(('buy id=%d slot=%d x%d (have %d/%d)'):format(b.id, b.idx, qty, r.buy.before, b.target))
     emit_resupply(true, b.id, r.buy.before, b.target, 'buying')
-    shop_buy(b.idx, math.min(b.target - r.buy.before, 99))
+    shop_buy(b.idx, qty)
 end
 
 -- After a buy: confirm it landed in inventory before doing anything else. Driven by the
@@ -2907,7 +3702,8 @@ function resupply_buy_check(r)
     local have = resupply_count(b.id)
     if have >= b.target or have > b.before then
         rs_log(('confirmed id=%d now %d/%d'):format(b.id, have, b.target))
-        if not b.announced then b.announced = true; r.bought_n = (r.bought_n or 0) + 1 end
+        r.counted = r.counted or {}
+        if not r.counted[b.id] then r.counted[b.id] = true; r.bought_n = (r.bought_n or 0) + 1 end
         alex_chat(207, ('[Alexandria] Restocked %s (%d/%d)'):format(rs_item_name(b.id), have, b.target), 'progress')
         emit_resupply(true, b.id, have, b.target, 'buying')
         r.state = 'paced'               -- it arrived; small gap before the next buy
@@ -2930,6 +3726,7 @@ function resupply_incoming(id)
         rs_log('shop opened (0x03C) state=' .. r.state)
         if r.state == 'shop' then
             r.state = 'buy'
+            r.retries = 0
             r.t = os.clock()
             coroutine.schedule(function() resupply_buy_step(r) end, 1.0)
         end
@@ -2937,6 +3734,149 @@ function resupply_incoming(id)
         if r.state == 'buyack' then resupply_buy_check(r) end
     end
 end
+
+-- ===== Proximity Buy/Sell vendors =====================================================
+-- Same packet engine as Curio (poke -> shop list -> 0x083 buy), minus the category menu.
+-- npc_scan sets pvendor_near to the nearest cataloged vendor; a run pokes it, waits for its
+-- 0x03C shop list, then buys each configured item to target -- resupply_count() supplies the
+-- owned-stock count (so organized surplus reads as stock) and shop_buy() caps to the stack.
+function emit_pvendor(active, item, have, target, phase)
+    pvendor_progress = { active = active and true or false, item = item or 0, have = have or 0, target = target or 0, phase = phase or '' }
+    pvendor_dirty = true
+end
+
+function build_pvendor()
+    local p = pvendor_progress
+    if not p then return nil end
+    return '{"t":"pvendor","active":' .. (p.active and 'true' or 'false')
+        .. ',"item":' .. p.item .. ',"have":' .. p.have .. ',"target":' .. p.target
+        .. ',"phase":"' .. esc(p.phase) .. '"}\n'
+end
+
+function build_pvendornear()
+    if not pvendor_near then return '{"t":"pvendornear","name":null}\n' end
+    return '{"t":"pvendornear","name":"' .. esc(pvendor_near.name) .. '"}\n'
+end
+
+function pvendor_item_name(id)
+    return (res.items[id] and res.items[id].en) or ('Item ' .. id)
+end
+
+-- Does this vendor sell anything still below its configured target?
+function pvendor_needed_at(name)
+    local ids = PVENDOR_SHOPS[name]
+    if not ids then return false end
+    for _, id in ipairs(ids) do
+        local target = pvendor_min[id]
+        if target and target > 0 and resupply_count(id) < target then return true end
+    end
+    return false
+end
+
+-- Has this vendor's shop list (0x03C) arrived with one of its items yet?
+function pvendor_shop_ready(r)
+    for _, it in pairs(shop.items) do
+        if type(it) == 'table' and it.id then
+            for _, id in ipairs(r.ids) do if it.id == id then return true end end
+        end
+    end
+    return false
+end
+
+-- Next shop entry for a configured item that's still short and not yet given up on.
+function pvendor_pick(r)
+    for _, it in pairs(shop.items) do
+        if type(it) == 'table' and it.id and pvendor_min[it.id] and not r.attempted[it.id] then
+            if resupply_count(it.id) < pvendor_min[it.id] then
+                return { id = it.id, idx = it.idx, target = pvendor_min[it.id] }
+            end
+        end
+    end
+    return nil
+end
+
+function pvendor_finish(now)
+    local r = pvendor_run
+    pvendor_cd_npc = (r and r.npc_id) or (pvendor_near and pvendor_near.id) or nil
+    pvendor_cd = now + 30
+    pvendor_run = nil
+    npc_driving = nil
+    store_menu_close()            -- release the vendor / close the shop window
+    emit_pvendor(false, 0, 0, 0, 'done')
+    local n = r and r.bought_n or 0
+    local who = (r and r.name) or 'Vendor'
+    if n > 0 then
+        alex_chat(207, ('[Alexandria] %s restock complete. Bought %d time%s.'):format(who, n, n == 1 and '' or 's'), 'action')
+    else
+        alex_chat(207, ('[Alexandria] %s restock complete.'):format(who), 'action')
+    end
+end
+
+-- Buy the next short item, then re-check after it settles. Stop an item when it reaches
+-- target OR when a buy makes no progress (sold out / out of gil), so single-buy items with
+-- big targets loop but a dead buy never spins forever.
+function pvendor_buy_step(r, now)
+    if pvendor_run ~= r or r.state ~= 'buy' then return end
+    local b = pvendor_pick(r)
+    if not b then pvendor_finish(now or os.clock()); return end
+    local have = resupply_count(b.id)
+    emit_pvendor(true, b.id, have, b.target, 'buy')
+    shop_buy(b.idx, b.target - have)        -- shop_buy caps qty to the item's stack per packet
+    r.bought_n = r.bought_n + 1
+    r.t = os.clock()
+    coroutine.schedule(function()
+        if pvendor_run ~= r then return end
+        local nowhave = resupply_count(b.id)
+        if nowhave >= b.target then
+            r.attempted[b.id] = true
+        elseif nowhave <= have then
+            r.attempted[b.id] = true
+            alex_chat(207, ('[Alexandria] Could not buy enough %s (%d/%d)'):format(pvendor_item_name(b.id), nowhave, b.target), 'error')
+        end
+        r.state = 'buy'; r.t = os.clock()
+        pvendor_buy_step(r, os.clock())
+    end, 1.2)
+end
+
+function pvendor_tick(now)
+    if not pvendor_run then
+        if not pvendor_on or not pvendor_near then return end
+        local ids = PVENDOR_SHOPS[pvendor_near.name]
+        if not ids then return end
+        if pvendor_cd_npc == pvendor_near.id and now < pvendor_cd then return end
+        if not pvendor_needed_at(pvendor_near.name) then pvendor_cd_npc = pvendor_near.id; pvendor_cd = now + 30; return end
+        pvendor_run = { state = 'open', start = now, t = now, npc_id = pvendor_near.id, npc_index = pvendor_near.index, name = pvendor_near.name, ids = ids, attempted = {}, bought_n = 0 }
+        shop.items = {}                         -- drop any stale list so we detect THIS shop's
+        npc_driving = { id = pvendor_run.npc_id, t = now }
+        alex_chat(207, '[Alexandria] Buying from ' .. pvendor_near.name .. '...', 'action')
+        emit_pvendor(true, 0, 0, 0, 'start')
+        npc_poke(pvendor_run.npc_id, pvendor_run.npc_index)
+        return
+    end
+
+    local r = pvendor_run
+    if now - r.start > 45 then pvendor_finish(now); return end
+
+    if r.state == 'open' then
+        if pvendor_shop_ready(r) then
+            r.state = 'buy'; r.t = now
+            pvendor_buy_step(r, now)
+        elseif now - r.t > 3 then
+            -- Poke alone did not open the shop; some vendors gate behind a Buy/Sell menu.
+            -- Answer the captured menu's first option once, then keep waiting for 0x03C.
+            if not r.nudged and npc_menu and npc_menu.id == r.npc_id then
+                r.nudged = true; r.t = now
+                npc_send_select(npc_menu, 0)
+            elseif now - r.t > 6 then
+                alex_chat(207, '[Alexandria] ' .. r.name .. ': shop did not open. Try again at the vendor.', 'error')
+                pvendor_finish(now)
+            end
+        end
+    elseif r.state == 'buy' and now - r.t > 4 then
+        pvendor_buy_step(r, now)                -- watchdog: the buy coroutine never fired
+    end
+end
+-- ===== end proximity vendors ==========================================================
 
 function resupply_tick(now)
     if not resupply_run then
@@ -2957,10 +3897,19 @@ function resupply_tick(now)
     if now - r.start > 60 then rs_log('overall timeout; leave'); resupply_sel(0, 0); resupply_finish(now); return end
 
     -- Watchdogs: only act if a state has clearly stalled (the expected packet never came).
-    if r.state == 'shop' and now - r.t > 10 then
-        rs_log('shop never opened for opt=' .. tostring(r.cur_opt) .. '; give up')
-        r.cat_done[r.cur_opt] = true
-        resupply_advance(r)
+    if r.state == 'shop' and now - r.t > 4 then
+        resupply_sel(0, 0)
+        r.t = os.clock()
+        if (r.retries or 0) < 2 then
+            r.retries = (r.retries or 0) + 1
+            rs_log('shop stalled opt=' .. tostring(r.cur_opt) .. '; close+retry ' .. r.retries)
+            coroutine.schedule(function() if resupply_run == r then resupply_open_cat(r, r.cur_opt) end end, 1.2)
+        else
+            rs_log('shop never opened opt=' .. tostring(r.cur_opt) .. '; give up')
+            r.cat_done[r.cur_opt] = true
+            r.retries = 0
+            coroutine.schedule(function() if resupply_run == r then resupply_advance(r) end end, 1.2)
+        end
     elseif r.state == 'buy' and now - r.t > 4 then
         resupply_buy_step(r)                    -- buy coroutine never fired
     elseif r.state == 'draining' and now - r.t > 3 then
@@ -3309,10 +4258,11 @@ function cfarm_sell(id)
 end
 
 -- Advance a chained farm to its next queued job (currency dump), or stop.
-function cfarm_next(queue)
+function cfarm_next(queue, delay)
     if queue and #queue > 0 then
         local n = table.remove(queue, 1)
-        return { shop = n.shop, item = n.item, remaining = n.want, total = n.want, bought = 0, phase = 'startbuy', t = 0, sold = {}, queue = queue }
+        delay = math.max(0, tonumber(delay) or 0)
+        return { shop = n.shop, item = n.item, remaining = n.want, total = n.want, bought = 0, phase = delay > 0 and 'wait' or 'startbuy', t = 0, sold = {}, queue = queue, delay = delay, wait_t = os.clock() }
     end
     return nil
 end
@@ -3320,6 +4270,10 @@ end
 function cfarm_tick(now)
     if not cfarm or cbuy then return end
     local f = cfarm
+    if f.phase == 'wait' then
+        if now - (f.wait_t or now) >= (f.delay or 0) then f.phase = 'startbuy'; f.t = 0 end
+        return
+    end
     if now - f.t < 0.4 then return end
     f.t = now
     if f.phase == 'startbuy' then
@@ -3331,7 +4285,7 @@ function cfarm_tick(now)
         f.sold = {}
         cbuy_last_bought = 0
         cbuy_start(f.shop, f.item, batch, true)
-        if not cbuy then alex_chat(207, '[Alexandria] Conversion: ' .. (f.shop == 'sparks' and 'Sparks' or 'Unity') .. ' vendor not nearby', 'error'); cfarm = cfarm_next(f.queue); if not cfarm then emit_convert_off() end; return end
+        if not cbuy then alex_chat(207, '[Alexandria] Conversion: ' .. (f.shop == 'sparks' and 'Sparks' or 'Unity') .. ' vendor not nearby', 'error'); cfarm = cfarm_next(f.queue, f.delay); if not cfarm then emit_convert_off() end; return end
         f.phase = 'buying'
         emit_convert(true, f.shop, f.item, f.bought or 0, f.total or 0, 'buying')
     elseif f.phase == 'buying' then
@@ -3354,7 +4308,7 @@ function cfarm_tick(now)
         end
     elseif f.phase == 'finish' then
         alex_chat(207, '[Alexandria] Conversion Done: Sold ' .. (f.bought or 0) .. ' ' .. cbuy_name(f.item), 'action')
-        cfarm = cfarm_next(f.queue)
+        cfarm = cfarm_next(f.queue, f.delay)
         if not cfarm then emit_convert(false, f.shop, f.item, f.bought or 0, f.total or 0, 'done') end
     end
 end
@@ -3369,7 +4323,7 @@ end
 -- Currency dump: read the live balance and convert it to gil. `only` limits to one
 -- shop ('sparks' or 'unity'); nil does both. The affordable amount is computed here
 -- from the live currency, so the caller never has to know the balance.
-function cfarm_start_all(only)
+function cfarm_start_all(only, delay)
     if cfarm or cbuy then return end
     if not packets_ok then alex_chat(207, '[Alexandria] packets unavailable', 'error') return end
     currency_request()
@@ -3382,7 +4336,8 @@ function cfarm_start_all(only)
     if (not only or only == 'unity') and powder > 0 then queue[#queue + 1] = { shop = 'unity', item = 5945, want = powder } end
     if #queue == 0 then alex_chat(207, '[Alexandria] Conversion: Not enough currency to convert', 'error'); return end
     local first = table.remove(queue, 1)
-    cfarm = { shop = first.shop, item = first.item, remaining = first.want, total = first.want, bought = 0, phase = 'startbuy', t = 0, sold = {}, queue = queue }
+    delay = math.max(0, tonumber(delay) or 0)
+    cfarm = { shop = first.shop, item = first.item, remaining = first.want, total = first.want, bought = 0, phase = delay > 0 and 'wait' or 'startbuy', t = 0, sold = {}, queue = queue, delay = delay, wait_t = os.clock() }
     emit_convert(true, first.shop, first.item, 0, first.want, 'buying')
 end
 
@@ -3620,26 +4575,28 @@ function build_ah()
             end
         end
     end
-    return '{"t":"ah","atah":' .. (ah_at_ah() and 'true' or 'false') .. ',"init":' .. (ah_initialized and 'true' or 'false')
+    return '{"t":"ah","atah":' .. (ah_usable() and 'true' or 'false') .. ',"init":' .. (ah_initialized and 'true' or 'false')
         .. ',"qn":' .. #ah_queue .. ',"slots":[' .. table.concat(parts, ',') .. ']}\n'
 end
 
 -- Material-holding bags we scan + consolidate across (inventory + the common
 -- storages). Wardrobes/temporary are excluded: they hold equipment, not mats.
 local ORGANIZE_SCAN = { 0, 1, 9, 2, 4, 5, 6, 7 }
+local ORG_PORTABLE_ORDER = { 5, 6, 7 }
+local ORG_DEEP_ORDER = { 1, 9, 2, 4 }
 
 local function build_orgstatus()
     return '{"t":"orgstatus","active":' .. (org_active and 'true' or 'false') ..
         ',"total":' .. org_total .. ',"done":' .. org_done .. '}\n'
 end
 
-local function build_orgplan(plan)
+local function build_orgplan(plan, tname)
     local parts = {}
     for _, st in ipairs(plan) do
         parts[#parts + 1] = '{"i":' .. st.i .. ',"id":' .. st.id .. ',"n":"' .. esc(st.n) ..
             '","c":' .. st.c .. ',"from":"' .. esc(st.from) .. '","to":"' .. esc(st.to) .. '"}'
     end
-    return '{"t":"orgplan","steps":[' .. table.concat(parts, ',') .. ']}\n'
+    return '{"t":"' .. (tname or 'orgplan') .. '","steps":[' .. table.concat(parts, ',') .. ']}\n'
 end
 
 local function org_step_done(i, ok)
@@ -3648,25 +4605,94 @@ local function org_step_done(i, ok)
     queue_send('{"t":"orgstep","i":' .. i .. ',"ok":' .. (ok and 'true' or 'false') .. '}\n')
 end
 
-local function enqueue_org_move(step_i, id, from_bag, to_bag, remaining)
-    act_queue[#act_queue + 1] = function()
-        local di = windower.ffxi.get_bag_info(to_bag)
-        if di and (di.max - di.count) <= 0 then org_step_done(step_i, false) return end
-        local m = find_in_bag(from_bag, id, remaining)
-        if not m then org_step_done(step_i, false) return end
-        windower.ffxi.move_item(from_bag, to_bag, m.slot, m.count)
-        local left = remaining - m.count
-        if left > 0 then enqueue_org_move(step_i, id, from_bag, to_bag, left)
-        else org_step_done(step_i, true) end
+-- Append a block of lines to debug/organize.log (only while org_debug is on). Used
+-- to record each run's plan and, after a settle delay, verify what ACTUALLY landed.
+function org_log_write(lines)
+    if not org_debug or type(lines) ~= 'table' or #lines == 0 then return end
+    local base = windower.addon_path .. 'debug'
+    if windower.dir_exists and not windower.dir_exists(base) then windower.create_dir(base) end
+    local f = io.open(base .. '/organize.log', 'a')
+    if f then f:write(table.concat(lines, '\n') .. '\n\n'); f:close() end
+end
+
+-- Resolve one planned step into concrete per-slot moves against `snap` (a shared,
+-- consumed-slot-tracked inventory snapshot) and queue them on the fast lane. No
+-- live inventory reads at run time: the planner already guaranteed the dest has
+-- room (merge-aware slot projection) and the server applies moves in send order,
+-- so a bag vacated earlier in the plan has space by the time a later move lands.
+-- This is what makes the fast burst safe; re-reading get_bag_info/get_items mid
+-- burst would see stale state (each move takes a frame or two to reflect).
+local function enqueue_org_move(step_i, id, from_bag, to_bag, remaining, snap, used_slot)
+    if not snap[from_bag] then snap[from_bag] = windower.ffxi.get_items(from_bag) end
+    used_slot[from_bag] = used_slot[from_bag] or {}
+    local items = snap[from_bag]
+    local moves = {}
+    if type(items) == 'table' then
+        for s = 1, (items.max or 0) do
+            if remaining <= 0 then break end
+            local it = items[s]
+            if it and it.id == id and it.id ~= 0 and (it.status == nil or it.status == 0) then
+                -- Track consumed COUNT per slot, not the whole slot: the planner can
+                -- split one source slot across two destinations (two steps), and the
+                -- server applies the moves in order, so slot 5 -50 then slot 5 -30
+                -- both land. Marking the whole slot used would drop the second move.
+                local avail = (it.count or 1) - (used_slot[from_bag][s] or 0)
+                if avail > 0 then
+                    local take = math.min(avail, remaining)
+                    moves[#moves + 1] = { slot = it.slot or s, count = take }
+                    used_slot[from_bag][s] = (used_slot[from_bag][s] or 0) + take
+                    remaining = remaining - take
+                end
+            end
+        end
+    end
+    if #moves == 0 then
+        enqueue_org(function() org_step_done(step_i, false) end)
+        return
+    end
+    for mi, mv in ipairs(moves) do
+        local fb, tb, slot, count, last = from_bag, to_bag, mv.slot, mv.count, (mi == #moves)
+        enqueue_org(function()
+            windower.ffxi.move_item(fb, tb, slot, count)
+            if last then org_step_done(step_i, true) end
+        end)
     end
 end
 
-local function do_organize(rules)
+local function do_organize(rules, preview)
     local keep = ids_for_names(rules.keep)
     local keepsingle = ids_for_names(rules.keepSingle)
     local always = ids_for_names(rules.alwaysBring)
     local store_usable = rules.storeUsable ~= false
     local reserve = tonumber(rules.reserve) or 3
+    local strict_inventory = rules.strictInventory == true
+
+    local keepqty = {}
+    if type(rules.keepQty) == 'table' then
+        for _, ent in ipairs(rules.keepQty) do
+            if type(ent) == 'table' and type(ent.item) == 'string' then
+                local q = tonumber(ent.qty)
+                if q and q > 0 then
+                    for _, qid in ipairs(ids_for_name_entry(ent.item)) do
+                        keepqty[qid] = ent.stacks and (q * ((res.items[qid] and res.items[qid].stack) or 1)) or q
+                    end
+                end
+            end
+        end
+    end
+
+    local layout_map = {}
+    if type(rules.layout) == 'table' then
+        for _, ent in ipairs(rules.layout) do
+            if type(ent) == 'table' and type(ent.item) == 'string' and type(ent.bags) == 'table' then
+                local lbags = {}
+                for _, b in ipairs(ent.bags) do local bid = tonumber(b); if bid then lbags[#lbags + 1] = bid end end
+                if #lbags > 0 then
+                    for _, lid in ipairs(ids_for_name_entry(ent.item)) do layout_map[lid] = lbags end
+                end
+            end
+        end
+    end
 
     -- Storable destinations + projected free-slot tracking. bag_free is updated
     -- live as we PLAN moves, so the planner can vacate a bag (by moving other
@@ -3696,9 +4722,11 @@ local function do_organize(rules)
         if type(items) == 'table' and items.enabled then
             for s = 1, (items.max or 0) do
                 local it = items[s]
-                if it and it.id and it.id ~= 0 then
+                -- Only count movable stacks; leave bazaar (status 25) and equipped
+                -- (status 5) slots out of the plan entirely.
+                if it and it.id and it.id ~= 0 and (it.status == nil or it.status == 0) then
                     local item = res.items[it.id]
-                    if item and (item.stack or 1) > 1 then
+                    if item and ((item.stack or 1) > 1 or layout_map[it.id]) then
                         by_bag[it.id] = by_bag[it.id] or {}
                         by_bag[it.id][bid] = (by_bag[it.id][bid] or 0) + (it.count or 1)
                         if bid == 0 then inv_have[it.id] = (inv_have[it.id] or 0) + (it.count or 1) end
@@ -3706,6 +4734,17 @@ local function do_organize(rules)
                 end
             end
         end
+    end
+
+    -- Projected per-bag item counts, so destination slot math is merge-aware:
+    -- items moved into a bag that already holds a partial stack fill it (the
+    -- end-of-run stack_items realizes the merge) instead of each move claiming a
+    -- fresh slot. Without this the planner over-counts destination slots when
+    -- partial stacks are present and defers items that actually fit, which is
+    -- why large organizes needed several runs to finish.
+    local proj = {}
+    for iid, bmap in pairs(by_bag) do
+        for b, c in pairs(bmap) do proj[b] = proj[b] or {}; proj[b][iid] = c end
     end
 
     local plan = {}
@@ -3716,27 +4755,40 @@ local function do_organize(rules)
         queue_icon(id)
     end
 
-    local function slots_of(id, cnt)
-        local stack = (res.items[id] and res.items[id].stack) or 1
-        return math.max(1, math.ceil(cnt / stack))
-    end
-
-    -- Record a move and update projected space (source frees slots, dest uses them).
+    -- Record a move and update projected space. Source frees the slots its stacks
+    -- vacate; destination only claims the NEW slots left after the incoming count
+    -- merges into any partial stack already there.
     local function do_move(id, from, to, cnt)
         add_step(id, from, to, cnt)
-        local sl = slots_of(id, cnt)
-        bag_free[from] = (bag_free[from] or 0) + sl
-        bag_free[to] = (bag_free[to] or 0) - sl
+        local stack = (res.items[id] and res.items[id].stack) or 1
+        local pf = (proj[from] and proj[from][id]) or 0
+        local pt = (proj[to] and proj[to][id]) or 0
+        local freed = math.ceil(pf / stack) - math.ceil(math.max(0, pf - cnt) / stack)
+        local used = math.ceil((pt + cnt) / stack) - math.ceil(pt / stack)
+        bag_free[from] = (bag_free[from] or 0) + freed
+        bag_free[to] = (bag_free[to] or 0) - used
+        proj[from] = proj[from] or {}; proj[from][id] = pf - cnt
+        proj[to] = proj[to] or {}; proj[to][id] = pt + cnt
         touched[to] = true
     end
 
-    -- A storable bag with room, preferring the one already holding the most.
+    -- A storable bag with room. Consumables and AH-sellables prefer portable
+    -- bags (Satchel/Sack/Case); EX / bulk / non-sellable prefer deep storage
+    -- (Safe/Safe2/Storage/Locker). Within the preferred zone, the bag already
+    -- holding the most copies wins so split stacks consolidate.
     local function storable_home(id)
+        local info = res.items[id]
+        local sellable = info and ((info.category == 'Usable') or ((tonumber(info.ah) or 0) > 0))
+        local first = sellable and ORG_PORTABLE_ORDER or ORG_DEEP_ORDER
+        local second = sellable and ORG_DEEP_ORDER or ORG_PORTABLE_ORDER
+        local order = {}
+        for _, b in ipairs(first) do if is_storable_set[b] then order[#order + 1] = b end end
+        for _, b in ipairs(second) do if is_storable_set[b] then order[#order + 1] = b end end
         local best, bestc = nil, -1
-        for _, sid in ipairs(storable) do
-            if (bag_free[sid] or 0) > 0 then
-                local c = by_bag[id][sid] or 0
-                if c > bestc then best = sid; bestc = c end
+        for _, b in ipairs(order) do
+            if (bag_free[b] or 0) > 0 then
+                local c = (by_bag[id] and by_bag[id][b]) or 0
+                if c > bestc then best = b; bestc = c end
             end
         end
         return best
@@ -3750,6 +4802,77 @@ local function do_organize(rules)
         if not item then return true end
         local usable_block = (item.category == 'Usable') and not store_usable
         local stack = item.stack or 1
+
+        if keepqty[id] then
+            local target = keepqty[id]
+            -- Excess above the keep target must go to real storage, never Inventory. A tag
+            -- routed to Inventory (bag 0) would otherwise make the excess-store loop attempt
+            -- an inventory->inventory move, so drop bag 0 from the home list here. The
+            -- explicit keep-N Rule wins over routing-to-Inventory for the same item.
+            local home_list = storable
+            if layout_map[id] then
+                local filtered = {}
+                for _, b in ipairs(layout_map[id]) do if b ~= 0 then filtered[#filtered + 1] = b end end
+                if #filtered > 0 then home_list = filtered end
+            end
+            local is_home = {}
+            for _, b in ipairs(home_list) do is_home[b] = true end
+            local inv_now = inv_have[id] or 0
+            if inv_now > target then
+                local excess = inv_now - target
+                for _, t in ipairs(home_list) do
+                    if excess <= 0 then break end
+                    local free = bag_free[t] or 0
+                    if free > 0 then
+                        local take = math.min(excess, free * stack)
+                        if take > 0 then do_move(id, 0, t, take); excess = excess - take end
+                    end
+                end
+                inv_now = target + excess
+            end
+            for bid, cnt in pairs(bags) do
+                if bid ~= 0 then
+                    local remaining = cnt
+                    if inv_now < target and (bag_free[0] or 0) > reserve then
+                        local take = math.min(remaining, target - inv_now)
+                        if take > 0 then do_move(id, bid, 0, take); remaining = remaining - take; inv_now = inv_now + take end
+                    end
+                    if remaining > 0 and not is_home[bid] then
+                        for _, t in ipairs(home_list) do
+                            if remaining <= 0 then break end
+                            local free = bag_free[t] or 0
+                            if free > 0 then
+                                local take = math.min(remaining, free * stack)
+                                if take > 0 then do_move(id, bid, t, take); remaining = remaining - take end
+                            end
+                        end
+                    end
+                end
+            end
+            touched[0] = true
+            return true
+        end
+
+        if layout_map[id] then
+            local targets = layout_map[id]
+            local is_target = {}
+            for _, t in ipairs(targets) do is_target[t] = true end
+            for bid, cnt in pairs(bags) do
+                if not is_target[bid] then
+                    local remaining = cnt
+                    for _, t in ipairs(targets) do
+                        if remaining <= 0 then break end
+                        local free = bag_free[t] or 0
+                        if free > 0 then
+                            local take = math.min(remaining, free * stack)
+                            if take > 0 then do_move(id, bid, t, take); remaining = remaining - take end
+                        end
+                    end
+                end
+            end
+            touched[targets[1]] = true
+            return true
+        end
 
         if always[id] then
             for bid, cnt in pairs(bags) do
@@ -3791,8 +4914,19 @@ local function do_organize(rules)
                 if not home_id then return false end
             end
             if nbags == 1 and home_id == bulk_bag then return true end
+            local order = { home_id }
+            for _, sid in ipairs(storable) do if sid ~= home_id then order[#order + 1] = sid end end
             for bid, cnt in pairs(bags) do
-                if bid ~= home_id then do_move(id, bid, home_id, cnt) end
+                if bid ~= home_id then
+                    local remaining = cnt
+                    for _, t in ipairs(order) do
+                        if remaining <= 0 then break end
+                        if t ~= bid and (bag_free[t] or 0) > 0 then
+                            local take = math.min(remaining, (bag_free[t] or 0) * stack)
+                            if take > 0 then do_move(id, bid, t, take); remaining = remaining - take end
+                        end
+                    end
+                end
             end
             return true
         end
@@ -3815,14 +4949,66 @@ local function do_organize(rules)
         if not progress then break end
     end
 
-    for _, st in ipairs(plan) do
-        enqueue_org_move(st.i, st.id, st._from, st._to, st.c)
+    -- Organize all items: sweep any non-stackable, unprotected item out of the
+    -- main bag to its classified home, gear included. Equipped/bazaar items
+    -- and anything on the keep/keepQty/alwaysBring/preset lists stay put.
+    if strict_inventory then
+        local inv = windower.ffxi.get_items(0)
+        if type(inv) == 'table' then
+            for s = 1, (inv.max or 80) do
+                local it = inv[s]
+                if it and it.id and it.id ~= 0 and (it.status == nil or it.status == 0) then
+                    local id = it.id
+                    local info = res.items[id]
+                    if info and (info.stack or 1) <= 1
+                        and not keep[id] and not keepqty[id] and not always[id] and not layout_map[id]
+                        and not ((info.category == 'Usable') and not store_usable) then
+                        local h = storable_home(id)
+                        if h and (bag_free[h] or 0) > 0 then do_move(id, 0, h, it.count or 1) end
+                    end
+                end
+            end
+        end
     end
 
-    -- Merge the gathered partial stacks in every bag we moved into.
+    if org_debug then
+        local dbg = {}
+        local info = windower.ffxi.get_info()
+        dbg[#dbg + 1] = ('==== ORGANIZE %s | %s | mog=%s ===='):format(os.date('%Y-%m-%d %H:%M:%S'), preview and 'PREVIEW' or 'RUN', tostring(info and info.mog_house))
+        local sb = {}
+        for _, b in ipairs(rules.storableBags or {}) do sb[#sb + 1] = tostring(b) end
+        local nkq, nlm = 0, 0
+        for _ in pairs(keepqty) do nkq = nkq + 1 end
+        for _ in pairs(layout_map) do nlm = nlm + 1 end
+        dbg[#dbg + 1] = ('rules: storableBags={%s} keepQty=%d layout=%d storeUsable=%s reserve=%d strict=%s'):format(table.concat(sb, ','), nkq, nlm, tostring(store_usable), reserve, tostring(strict_inventory))
+        local bf = {}
+        for _, bid in ipairs(ORGANIZE_SCAN) do bf[#bf + 1] = ('[%d]=%s'):format(bid, tostring(bag_free[bid])) end
+        dbg[#dbg + 1] = 'bag_free: ' .. table.concat(bf, ' ')
+        dbg[#dbg + 1] = ('PLAN (%d steps):'):format(#plan)
+        for _, st in ipairs(plan) do
+            dbg[#dbg + 1] = ('  #%d %s x%d  %s(%d)->%s(%d)'):format(st.i, st.n, st.c, st.from, st._from, st.to, st._to)
+        end
+        org_log_write(dbg)
+    end
+
+    -- Preview / dry-run: report the computed plan and bail before enqueuing any
+    -- real moves. Uses a distinct feed so the desktop shows it in the Organize
+    -- preview instead of driving the live-progress UI.
+    if preview then
+        queue_send(build_orgplan(plan, 'orgpreview'))
+        return
+    end
+
+    local snap, used_slot = {}, {}
+    for _, st in ipairs(plan) do
+        enqueue_org_move(st.i, st.id, st._from, st._to, st.c, snap, used_slot)
+    end
+
+    -- Merge the gathered partial stacks in every bag we moved into. On the paced
+    -- lane so the stack runs AFTER the moves into that bag land, not before.
     for bid in pairs(touched) do
         local b = bid
-        act_queue[#act_queue + 1] = function() windower.ffxi.stack_items(b) end
+        enqueue_org(function() windower.ffxi.stack_items(b) end)
     end
 
     if #plan > 0 then
@@ -3832,12 +5018,153 @@ local function do_organize(rules)
         org_moved = 0
         org_report_t = os.clock()
         org_stream_t = os.clock()
+        if org_debug then
+            org_verify = { ts = os.date('%H:%M:%S'), done_at = nil, moved = 0, total = #plan, steps = {} }
+            for _, st in ipairs(plan) do
+                org_verify.steps[#org_verify.steps + 1] = { id = st.id, n = st.n, from = st._from, to = st._to, want = st.c, src_before = (by_bag[st.id] and by_bag[st.id][st._from]) or 0 }
+            end
+        end
         queue_send(build_orgplan(plan))
         queue_send(build_orgstatus())
         alex_chat(207, '[Alexandria] auto-organize: ' .. #plan .. ' move(s) planned...', 'progress')
     else
         alex_chat(207, '[Alexandria] auto-organize: nothing to consolidate', 'progress')
     end
+end
+
+function do_local_consolidate(target_bags)
+    local allowed = nil
+    if type(target_bags) == 'table' and #target_bags > 0 then
+        allowed = {}
+        for _, b in ipairs(target_bags) do local n = tonumber(b); if n then allowed[n] = true end end
+    end
+    local avail = {}
+    local bag_free = {}
+    for _, bid in ipairs(store_bags()) do
+        local info = windower.ffxi.get_bag_info(bid)
+        if info and info.enabled then
+            avail[#avail + 1] = bid
+            bag_free[bid] = (info.max or 80) - (info.count or 0)
+        end
+    end
+    local by_bag = {}
+    for _, bid in ipairs(avail) do
+        local items = windower.ffxi.get_items(bid)
+        if type(items) == 'table' then
+            for s = 1, (items.max or 0) do
+                local it = items[s]
+                if it and it.id and it.id ~= 0 then
+                    local r = res.items[it.id]
+                    if r and (r.stack or 1) > 1 then
+                        by_bag[it.id] = by_bag[it.id] or {}
+                        by_bag[it.id][bid] = (by_bag[it.id][bid] or 0) + (it.count or 1)
+                    end
+                end
+            end
+        end
+    end
+    local moves = 0
+    for id, bags in pairs(by_bag) do
+        local home, homec, nbags = nil, -1, 0
+        for bid, cnt in pairs(bags) do
+            nbags = nbags + 1
+            if (bag_free[bid] or 0) > 0 and (not allowed or allowed[bid]) and cnt > homec then home = bid; homec = cnt end
+        end
+        if not home and allowed then
+            for _, bid in ipairs(avail) do
+                if allowed[bid] and (bag_free[bid] or 0) > 0 then home = bid; break end
+            end
+        end
+        if nbags > 1 and home then
+            local stack = (res.items[id] and res.items[id].stack) or 1
+            for bid, cnt in pairs(bags) do
+                local need = math.ceil(cnt / stack)
+                if bid ~= home and (bag_free[home] or 0) >= need then
+                    local fb, tb, iid = bid, home, id
+                    enqueue_fast(function()
+                        local src = windower.ffxi.get_items(fb)
+                        if type(src) == 'table' then
+                            for s = 1, (src.max or 0) do
+                                local it = src[s]
+                                if it and it.id == iid and it.id ~= 0 then
+                                    windower.ffxi.move_item(fb, tb, s, it.count or 1)
+                                end
+                            end
+                        end
+                    end)
+                    bag_free[home] = bag_free[home] - need
+                    moves = moves + 1
+                end
+            end
+        end
+    end
+    for _, bid in ipairs(avail) do
+        local b = bid
+        enqueue_fast(function() windower.ffxi.stack_items(b) end)
+    end
+    alex_chat(123, '[Alexandria] local consolidate: ' .. moves .. ' move(s) queued', 'action')
+end
+
+-- Fire FFXI's own Sort (client packet 0x03A, GP_CLI_COMMAND_ITEM_STACK). Its
+-- Category field is the container, so this sorts ANY accessible bag, not just
+-- inventory. Mog House bags are only enabled while parked at a moogle, so the
+-- get_bag_info gate lets those pass through only when reachable.
+function sort_bag(bag)
+    if not packets_ok then return end
+    bag = tonumber(bag)
+    if not bag then return end
+    local info = windower.ffxi.get_bag_info(bag)
+    if not (info and info.enabled) then return end
+    pcall(windower.packets.inject_outgoing, 0x3A, string.char(0x3A, 0x04, 0, 0) .. le4(bag))
+end
+
+-- Space the sort packets out rather than firing them all in one frame, so a
+-- "sort everything" never machine-guns the server with 0x03A packets at once.
+local function sort_bags_staggered(bags, gap)
+    gap = gap or 0.5
+    local n = 0
+    for _, b in ipairs(bags) do
+        local bag = tonumber(b)
+        if bag then
+            coroutine.schedule(function() sort_bag(bag) end, n * gap)
+            n = n + 1
+        end
+    end
+end
+
+-- Content signature per bag: sum over distinct item ids of (id, total count).
+-- Order- and stack-independent, so a sort (which reorders and merges) never
+-- changes it; only a genuine add/remove does. That stops a sort from retriggering
+-- itself while still catching new loot.
+local function bag_content_sig(bag)
+    local items = windower.ffxi.get_items(bag)
+    local totals = {}
+    if type(items) == 'table' then
+        for s = 1, (items.max or 0) do
+            local it = items[s]
+            if it and it.id and it.id ~= 0 then
+                totals[it.id] = (totals[it.id] or 0) + (it.count or 1)
+            end
+        end
+    end
+    local sig = 0
+    for id, cnt in pairs(totals) do sig = (sig + id * 131 + cnt) % 2147483647 end
+    return sig
+end
+
+local function autosort_check()
+    local todo = {}
+    for bag in pairs(autosort_bags) do
+        local info = windower.ffxi.get_bag_info(bag)
+        if info and info.enabled then
+            local s = bag_content_sig(bag)
+            if autosort_sig[bag] ~= s then
+                autosort_sig[bag] = s
+                todo[#todo + 1] = bag
+            end
+        end
+    end
+    if #todo > 0 then sort_bags_staggered(todo) end
 end
 
 local function resolve_item_id(msg)
@@ -3905,7 +5232,7 @@ local function do_trade_pc_offer(target_name, items)
     act_queue[#act_queue + 1] = function()
         local t
         if target_name and target_name ~= '' then
-            t = windower.ffxi.get_mob_by_name(target_name)
+            t = resolve_pc_mob(target_name)
         else
             t = windower.ffxi.get_mob_by_target('t')
         end
@@ -3952,6 +5279,35 @@ local function dispatch(line)
         else
             do_organize(msg)
         end
+    elseif msg.cmd == 'organizepreview' then
+        -- Dry-run only: compute + report the plan, never move anything. A distinct
+        -- command (not an 'organize' flag) so an out-of-date addon simply ignores it
+        -- instead of running a real organize.
+        do_organize(msg, true)
+    elseif msg.cmd == 'localconsolidate' then
+        do_local_consolidate(msg.bags)
+    elseif msg.cmd == 'autosort' then
+        autosort_bags = {}
+        autosort_sig = {}
+        if type(msg.bags) == 'table' then
+            for _, b in ipairs(msg.bags) do local n = tonumber(b); if n then autosort_bags[n] = true end end
+        end
+    elseif msg.cmd == 'sortbag' then
+        local list = {}
+        if msg.bag ~= nil then list[1] = msg.bag
+        elseif type(msg.bags) == 'table' then list = msg.bags end
+        local n = 0
+        for _, b in ipairs(list) do
+            local bag = tonumber(b)
+            local info = bag and windower.ffxi.get_bag_info(bag)
+            if info and info.enabled then n = n + 1 end
+        end
+        if n > 0 then
+            alex_chat(207, '[Alexandria] sorting ' .. n .. ' bag' .. (n == 1 and '' or 's') .. '...', 'action')
+            sort_bags_staggered(list)
+        else
+            alex_chat(207, '[Alexandria] sort: no reachable bags (stand at a Mog House for storage bags)', 'progress')
+        end
     elseif msg.cmd == 'lot' and msg.index ~= nil then
         enqueue_pool(tonumber(msg.index), 'lot')
     elseif msg.cmd == 'pass' and msg.index ~= nil then
@@ -3983,6 +5339,8 @@ local function dispatch(line)
         pool_rules.pass = ids_for_names(msg.pass)
         pool_rules.drop = ids_for_names(msg.drop)
         pool_pass_on_lot = msg.passOnLot and true or false
+        pool_autolot_on = msg.autoLot ~= false
+        for idx, it in pairs(pool) do if it and it.id then pool_check(idx, it.id) end end
     elseif msg.cmd == 'tradenpc' then
         local id = resolve_item_id(msg)
         if id then
@@ -4048,9 +5406,18 @@ local function dispatch(line)
     elseif msg.cmd == 'dropone' and msg.slot and msg.id then
         drop_request(tonumber(msg.slot), tonumber(msg.id), tonumber(msg.bag) or 0, msg.count and tonumber(msg.count) or nil)
     elseif msg.cmd == 'use' and msg.id then
-        start_use_request(tonumber(msg.id), msg.all and true or false, tonumber(msg.bag) or 0, msg.slot and tonumber(msg.slot) or nil)
+        start_use_request(tonumber(msg.id), msg.all and true or false, tonumber(msg.bag) or 0, msg.slot and tonumber(msg.slot) or nil, msg.count and tonumber(msg.count) or nil)
+    elseif msg.cmd == 'usestop' then
+        if use_id then emit_use(false) end
+        use_id = nil; use_left = 0; use_pending = nil
     elseif msg.cmd == 'store' and msg.npc and msg.id then
         store_enqueue(tostring(msg.npc), tonumber(msg.id), math.max(1, tonumber(msg.want) or 1))
+    elseif msg.cmd == 'storeadd' and msg.npc and type(msg.zone) == 'number' and msg.id and msg.index ~= nil then
+        -- A store NPC learned on another character; register it here too (fleet sync).
+        local items = {}
+        if type(msg.items) == 'table' then for _, iid in ipairs(msg.items) do local n = tonumber(iid); if n then items[#items + 1] = n end end end
+        store_merge_entry(tostring(msg.npc), { zone = tonumber(msg.zone), id = tonumber(msg.id), index = tonumber(msg.index), items = items, batch = msg.batch and tonumber(msg.batch) or nil })
+        store_dirty = true
     elseif msg.cmd == 'storestop' then
         store_q = {}
         store_finish()
@@ -4094,7 +5461,7 @@ local function dispatch(line)
     elseif msg.cmd == 'dboxcancel' then
         dbox_clear_queue()
     elseif msg.cmd == 'shopbuy' and msg.idx ~= nil then
-        shop_buy(tonumber(msg.idx), math.max(1, tonumber(msg.qty) or 1))
+        shop_buy_qty(tonumber(msg.idx), tonumber(msg.qty) or 1)
     elseif msg.cmd == 'shopsell' and msg.id then
         shop_sell_request(tonumber(msg.id), math.max(1, tonumber(msg.qty) or 1), tonumber(msg.bag) or 0, msg.slot and tonumber(msg.slot) or nil)
     elseif msg.cmd == 'shopsell_set' and type(msg.ids) == 'table' then
@@ -4117,12 +5484,17 @@ local function dispatch(line)
         if trade_debug then trade_log(('RX tradearm from=%s id=%s'):format(tostring(msg.from), tostring(msg.fromId))) end
     elseif msg.cmd == 'axecho' and msg.text then
         alex_chat(207, '[Alexandria] ' .. ax_colorize(tostring(msg.text)))
+    elseif msg.cmd == 'memlog' then
+        mem_log_on = msg.on and true or false
+        local iv = tonumber(msg.interval)
+        if iv and iv >= 30 then mem_log_interval = iv end
+        if mem_log_on then mem_sample_t = 0 end
     elseif msg.cmd == 'currencybuy' and msg.shop and msg.item then
         cbuy_start(tostring(msg.shop), tonumber(msg.item), math.max(1, tonumber(msg.count) or 1))
     elseif msg.cmd == 'currencyfarm' and msg.shop and msg.item then
         cfarm_start(tostring(msg.shop), tonumber(msg.item), math.max(0, tonumber(msg.want) or 0))
     elseif msg.cmd == 'currencyfarmall' then
-        cfarm_start_all(msg.shop and tostring(msg.shop) or nil)
+        cfarm_start_all(msg.shop and tostring(msg.shop) or nil, tonumber(msg.delay) or 0)
     elseif msg.cmd == 'farmstop' then
         cfarm = nil
         cbuy_release()
@@ -4143,6 +5515,17 @@ local function dispatch(line)
         end
         resupply_run = nil
         resupply_cd_npc = nil
+    elseif msg.cmd == 'pvendor_set' then
+        pvendor_on = msg.on and true or false
+        pvendor_min = {}
+        local idx = build_name_index()
+        for _, it in ipairs(msg.items or {}) do
+            local id = it.id and tonumber(it.id) or (it.name and idx[tostring(it.name):lower()])
+            local min = tonumber(it.min)
+            if id and min and min > 0 then pvendor_min[id] = min end
+        end
+        pvendor_run = nil
+        pvendor_cd_npc = nil
     elseif msg.cmd == 'curioscan' then
         curio_scan_start()
     elseif msg.cmd == 'ahmenu' then
@@ -4151,7 +5534,7 @@ local function dispatch(line)
     elseif msg.cmd == 'ahslots' then
         ah_enqueue(function() return ah_request_status() end)
     elseif msg.cmd == 'ahbuy' and msg.id then
-        if not ah_at_ah() then
+        if not ah_usable() then
             queue_send('{"t":"ahmsg","ok":false,"text":"Not at an auction house"}\n')
         else
             local id, single, price = tonumber(msg.id), (msg.single == 1 and 1 or 0), tonumber(msg.price) or 0
@@ -4159,7 +5542,7 @@ local function dispatch(line)
             for _ = 1, qty do ah_enqueue(function() return ah_buy(id, single, price) end) end
         end
     elseif msg.cmd == 'ahsell' and msg.id then
-        if not ah_at_ah() then
+        if not ah_usable() then
             queue_send('{"t":"ahmsg","ok":false,"text":"Not at an auction house"}\n')
         else
             local id, single, price = tonumber(msg.id), (msg.single == 1 and 1 or 0), tonumber(msg.price) or 0
@@ -4193,7 +5576,7 @@ local function dispatch(line)
         local s = tonumber(msg.slot)
         ah_enqueue(function() return ah_clear_slot(s) end)
     elseif msg.cmd == 'ahcancel' and msg.slot ~= nil then
-        if not ah_at_ah() then
+        if not ah_usable() then
             queue_send('{"t":"ahmsg","ok":false,"text":"Not at an auction house"}\n')
         else
             local s = tonumber(msg.slot)
@@ -4429,7 +5812,10 @@ do
         if not id_cache then
             id_cache = {}
             for iid, it in pairs(res.items) do
-                if type(it) == 'table' and it.en then id_cache[it.en:lower()] = iid end
+                if type(it) == 'table' then
+                    if it.enl then id_cache[it.enl:lower()] = iid end
+                    if it.en then id_cache[it.en:lower()] = iid end
+                end
             end
         end
         return id_cache[tostring(name):lower()]
@@ -4502,7 +5888,7 @@ do
     end
 
     local function enqueue_move_slot(item_id, from_bag, slot, count)
-        act_queue[#act_queue + 1] = function()
+        enqueue_fast(function()
             local di = windower.ffxi.get_bag_info(0)
             if di and (di.max - di.count) <= 0 then return end
             local items = windower.ffxi.get_items(from_bag)
@@ -4510,7 +5896,7 @@ do
             if type(it) == 'table' and it.id == item_id and it.id ~= 0 then
                 windower.ffxi.move_item(from_bag, 0, it.slot or slot, it.count or count or 1)
             end
-        end
+        end)
     end
 
     local function ready_status()
@@ -4671,8 +6057,15 @@ do
         if not gi then gi = find_slot(aug.item_id) end
         if not gi then aug_fail('gear left inventory') return end
         local fields
-        if aug.mode == 'Geas Fete' then
+        if aug.mode == 'Geas Fete' and not aug.paid then
+            -- free daily roll: trade the gear alone to open the roll menu
             fields = { ['Target'] = aug.npc_id, ['Target Index'] = aug.npc_index, ['Number of Items'] = 1, ['Item Count 1'] = 1, ['Item Index 1'] = gi }
+        elseif aug.mode == 'Geas Fete' and aug.paid then
+            -- paid roll: trade gear + one Dark Matter (result comes back as a 0x034)
+            local mi = find_slot(aug.dm_id)
+            if not mi then aug_fail('Dark Matter left inventory') return end
+            fields = { ['Target'] = aug.npc_id, ['Target Index'] = aug.npc_index, ['Number of Items'] = 2, ['Item Count 1'] = 1, ['Item Index 1'] = gi, ['Item Count 2'] = 1, ['Item Index 2'] = mi }
+            aug.dm_used = (aug.dm_used or 0) + 1
         else
             local mi = find_slot(aug.mat_id)
             if not mi then aug_fail('material left inventory') return end
@@ -4696,6 +6089,21 @@ do
             ['Target'] = aug.npc_id, ['Option Index'] = aug.accept_option, ['Target Index'] = aug.npc_index,
             ['Automated Message'] = false, ['Zone'] = aug.zone, ['Menu ID'] = aug.menu,
         }))
+    end
+
+    -- Free daily rolls are used up: switch to the paid Dark Matter loop if budget + a stone remain
+    -- (reject/close the menu so the gear returns; the tick then trades gear + Dark Matter), else give
+    -- up and keep the previous augments. Global, not local, to stay under Lua's 200 main-chunk local
+    -- limit; it captures the surrounding locals (aug, reject_npc, ...) as upvalues.
+    function aug_start_paid(failmsg)
+        if aug.stone == 'Dark Matter' and aug.dm_id and (aug.dm_used or 0) < (aug.dm_budget or 0) and count_in_bag(aug.dm_id, 0) >= 1 then
+            aug.paid = true; aug.awaiting = false; pcall(reject_npc)
+            aug.prep = true; aug.prep_deadline = os.clock() + 15; aug.last_trade = os.clock()
+            aug.status = ('Dark Matter rolls (%d/%d)'):format(aug.dm_used or 0, aug.dm_budget or 0)
+            aug_dirty = true
+        else
+            pcall(reject_npc); aug_fail(failmsg)
+        end
     end
 
     local AUG_STALL = 20
@@ -4769,12 +6177,25 @@ do
             aug.status = 'Reached max attempts'
             reject_npc()
             alex_chat(207, '[Alexandria] augment: no match in ' .. aug.attempts .. ' rolls; rejected last roll, kept previous augments', 'progress')
+        elseif aug.mode == 'Geas Fete' and aug.paid then
+            -- Paid Dark Matter loop: keep-current on this roll, then (budget permitting) let the tick
+            -- trade the next Dark Matter. Same reject + re-trade shape as the Skirmish loop.
+            reject_npc()
+            if (aug.dm_used or 0) >= (aug.dm_budget or 0) or not aug.dm_id or count_in_bag(aug.dm_id, 0) < 1 then
+                aug.active = false
+                aug.status = 'Dark Matter spent'
+                alex_chat(207, ('[Alexandria] augment: no match in %d Dark Matter; kept previous augments'):format(aug.dm_used or 0), 'progress')
+            else
+                aug.awaiting = false
+                aug.last_trade = os.clock()  -- measure the next-trade delay from now, so the gear has time to return
+                aug.status = ('Dark Matter rolls (%d/%d)'):format(aug.dm_used or 0, aug.dm_budget or 0)
+            end
         else
             aug.status = 'Rolling (' .. aug.attempts .. ')'
             if aug.mode == 'Geas Fete' then
                 coroutine.schedule(function()
                     if aug and aug.active then
-                        if not oseem_submit() then pcall(reject_npc) aug_fail('out of stones, rejected last roll, kept previous augments') end
+                        if not oseem_submit() then aug_start_paid('out of stones, rejected last roll, kept previous augments') end
                     end
                 end, aug.delay)
             else
@@ -4831,8 +6252,16 @@ do
         aug.await_decision = false
         aug.last_progress = os.clock()
         aug.status = 'Rolling ' .. (aug.attempts or 0)
-        if aug.mode == 'Geas Fete' then
-            if not oseem_submit() then pcall(reject_npc) aug_fail('out of stones, rejected last roll, kept previous augments') end
+        if aug.mode == 'Geas Fete' and aug.paid then
+            -- paid: keep-current on this roll, then let the tick trade the next Dark Matter
+            reject_npc()
+            if (aug.dm_used or 0) >= (aug.dm_budget or 0) or not aug.dm_id or count_in_bag(aug.dm_id, 0) < 1 then
+                aug.active = false; aug.status = 'Dark Matter spent'
+            else
+                aug.awaiting = false; aug.last_trade = os.clock()
+            end
+        elseif aug.mode == 'Geas Fete' then
+            if not oseem_submit() then aug_start_paid('out of stones, rejected last roll, kept previous augments') end
         else
             reject_npc()
             aug.awaiting = false
@@ -4853,7 +6282,7 @@ do
         local lock = a.item_slot or a.cape_slot
         if find_slot(id) then
             local rb = a.return_bag
-            act_queue[#act_queue + 1] = function()
+            enqueue_fast(function()
                 local di = windower.ffxi.get_bag_info(rb)
                 if di and (di.max - di.count) <= 0 then return end
                 local mslot, mcount
@@ -4864,7 +6293,7 @@ do
                 end
                 if not mslot then local m = find_in_bag(0, id, nil); if m then mslot, mcount = m.slot, m.count end end
                 if mslot then windower.ffxi.move_item(0, rb, mslot, mcount or 1) end
-            end
+            end)
             a.returned = true
             aug_dirty = true
             alex_chat(207, '[Alexandria] returned item to its bag', 'progress')
@@ -5000,13 +6429,23 @@ do
                 if ok and p and p['NPC Index'] == aug.npc_index then
                     aug.menu = p['Menu ID']
                     aug.last_progress = os.clock()
+                    if aug.paid then
+                        -- Paid Dark Matter roll: the result comes back as a 0x034 (not the 0x05C the
+                        -- free menu-roll uses). Only the one that follows our trade is a result.
+                        if aug.awaiting then
+                            aug.awaiting = false
+                            gear_process(decode_augment((p['Menu Parameters'] or ''):sub(21)))
+                        end
+                        return true
+                    end
                     local mp = p['Menu Parameters'] or ''
                     aug.pellucid = mp:byte(1) or 0
                     aug.fern = mp:byte(2) or 0
                     aug.taupe = mp:byte(3) or 0
                     aug.dark = mp:byte(4) or 0
                     aug.gear = mp:byte(5) or 0
-                    if not oseem_submit() then pcall(reject_npc) aug_fail('out of stones or invalid style') end
+                    aug.awaiting = false
+                    if not oseem_submit() then aug_start_paid('out of stones or invalid style') end
                     return true
                 end
             elseif id == 0x05C then
@@ -5285,10 +6724,32 @@ do
                     mat_total, (res.items[mat_id] and res.items[mat_id].en) or tostring(s.material), roll_max), 'progress')
             end
         end
+        -- Techniques path: the free daily rolls are done in the menu (the storable-stone code), but
+        -- once those run out each roll costs one Dark Matter TRADED with the gear (Dark Matter can't
+        -- be stored). Pull the budgeted Dark Matter into inventory so the paid rolls can trade it;
+        -- dm_budget caps how many to spend (a set number, or all of them via dm_all).
+        local dm_id, dm_budget = nil, 0
+        if mode == 'Geas Fete' and lc(tostring(s.material)) == 'dark matter' then
+            dm_id = res_id(s.material)
+            if dm_id then
+                local dm_bags = aug_src_bags()
+                local dm_have = count_in_bag(dm_id, 0)
+                local dm_total = dm_have
+                for _, bg in ipairs(dm_bags) do dm_total = dm_total + count_in_bag(dm_id, bg) end
+                dm_budget = s.dm_all and dm_total or math.max(0, math.min(tonumber(s.dm) or 0, dm_total))
+                local short = dm_budget - dm_have
+                for _, bg in ipairs(dm_bags) do
+                    if short <= 0 then break end
+                    local avail = count_in_bag(dm_id, bg)
+                    if avail > 0 then local take = math.min(avail, short); enqueue_move(dm_id, bg, 0, take); short = short - take; prep = true end
+                end
+            end
+        end
         aug = {
             mode = mode, active = true, attempts = 0,
             total = roll_max,
             item_id = item_id, item_slot = gear_slot, mat_id = mat_id, stone = s.material, style = s.style,
+            dm_id = dm_id, dm_budget = dm_budget, dm_used = 0, paid = false,
             a1 = lc(s.augment_1), a2 = lc(s.augment_2), a3 = lc(s.augment_3),
             v1 = tonumber(s.watch_1) or 0, v2 = tonumber(s.watch_2) or 0, v3 = tonumber(s.watch_3) or 0,
             amode = (s.augment_mode == 'or') and 'or' or 'and',
@@ -5709,12 +7170,17 @@ do
 end
 
 windower.register_event('incoming chunk', function(id, data, modified, injected)
+    if capture then capture_record('in', id, data) end
     if po_state ~= 0 and packets_ok then
         local r = po_incoming(id, data)
         if r ~= nil then return r end
     end
     if aug_active() and packets_ok then
         local r = aug_incoming(id, data)
+        if r ~= nil then return r end
+    end
+    if gobbie_run and packets_ok then
+        local r = gobbie_incoming(id, data)
         if r ~= nil then return r end
     end
     if cbuy and packets_ok then
@@ -5767,6 +7233,10 @@ windower.register_event('incoming chunk', function(id, data, modified, injected)
         curio_scan = nil
         resupply_run = nil
         emit_resupply(false, 0, 0, 0, 'done')
+        pvendor_run = nil
+        pvendor_near = nil
+        pvendor_near_dirty = true
+        emit_pvendor(false, 0, 0, 0, 'done')
         emit_convert_off()
         pool_dirty = true
         pool_dirty_at = os.clock()
@@ -5788,10 +7258,10 @@ windower.register_event('incoming chunk', function(id, data, modified, injected)
         if next(shop.items) ~= nil then shop.items = {}; shop_dirty = true end
     elseif id == 0x113 then
         local ok, p = pcall(packets.parse, 'incoming', data)
-        if ok and p then currency_cur1 = p; currency_dirty = true end
+        if ok and p then currency_cur1 = p; currency_cur1_id = (windower.ffxi.get_player() or {}).id; currency_dirty = true end
     elseif id == 0x118 then
         local ok, p = pcall(packets.parse, 'incoming', data)
-        if ok and p then currency_cur2 = p; currency_dirty = true end
+        if ok and p then currency_cur2 = p; currency_cur2_id = (windower.ffxi.get_player() or {}).id; currency_dirty = true end
     elseif id == 0x04C then
         ah_handle_incoming(data)
     elseif id == 0x04B then
@@ -5821,6 +7291,7 @@ windower.register_event('incoming chunk', function(id, data, modified, injected)
 end)
 
 windower.register_event('outgoing chunk', function(id, original, modified, injected)
+    if capture then capture_record('out', id, modified or original) end
     if trade_debug and (id == 0x032 or id == 0x033 or id == 0x034) then
         local src = modified or original
         trade_log(('OUT 0x%03X %s'):format(id, injected and 'INJ ' or 'REAL') .. dbox_hex(src))
@@ -5884,10 +7355,53 @@ windower.register_event('status change', function(new, old)
     end
 end)
 
+prof_on = false
+prof = {}
+prof_frames = 0
+function prof_mark(name, t0)
+    local dt = (os.clock() - t0) * 1000
+    local e = prof[name]
+    if not e then e = { t = 0, n = 0, mx = 0 }; prof[name] = e end
+    e.t = e.t + dt; e.n = e.n + 1
+    if dt > e.mx then e.mx = dt end
+end
+function PF(name, fn, arg)
+    if not prof_on then return fn(arg) end
+    local t0 = os.clock()
+    local r = fn(arg)
+    prof_mark(name, t0)
+    return r
+end
+
+function mem_status_line()
+    local pl = windower.ffxi.get_player()
+    return ('%s  char=%s  lua=%.0fKB  txbuf=%d  act=%d  dropq=%d  dropmoveq=%d'):format(
+        os.date('%H:%M:%S'), tostring(pl and pl.name), collectgarbage('count'), #txbuf,
+        (type(act_queue) == 'table' and #act_queue or -1),
+        (type(drop_q) == 'table' and #drop_q or -1),
+        (type(drop_move_q) == 'table' and #drop_move_q or -1))
+end
+
+function mem_log_write(line)
+    local f = io.open(windower.addon_path .. 'data/mem.txt', 'a')
+    if f then f:write(line .. '\n'); f:close() end
+end
+
+function mem_log_sample()
+    local ok, line = pcall(mem_status_line)
+    if ok then mem_log_write(line) end
+end
+
 windower.register_event('prerender', function()
     local now = os.clock()
+    if prof_on then prof_frames = prof_frames + 1 end
+    if mem_log_on and (now - mem_sample_t) >= mem_log_interval then
+        mem_sample_t = now
+        mem_log_sample()
+    end
 
     if trade_tx then trade_tx_tick(now) end
+    if trade_rx and not trade_rx.opened and not trade_rx.tried and now - trade_rx_t > 1.0 then trade_rx.tried = true; trade_kind(0) end
     if trade_rx and now - trade_rx_t > TRADE_TIMEOUT then trade_rx = nil end
     if trade_armed and now - trade_armed.t > TRADE_ARM_WINDOW then trade_armed = nil end
     if trade_status_dirty then trade_status_dirty = false; queue_send(build_tradestatus()); trade_result = nil end
@@ -5935,42 +7449,84 @@ windower.register_event('prerender', function()
             rx = rx:sub(nl + 1)
             if #line > 0 then dispatch(line) end
         end
+        if #rx > TXBUF_MAX then rx = '' end
     end
     if err == 'closed' then
         disconnect()
         return
     end
 
+    -- Announce a character swap the instant the player id changes, rather than waiting up to
+    -- SEND_INTERVAL for the next 'self'. Identity MUST reach the desktop before the incoming
+    -- character's loading inventory, or the desktop pins those bags onto the character that
+    -- just logged out (the shared-client corruption). Then force a fresh inventory so the
+    -- new character's real bags follow its identity.
+    local pcur = windower.ffxi.get_player()
+    local pid_cur = pcur and pcur.id or 0
+    if pid_cur ~= last_self_id then
+        last_self_id = pid_cur
+        inv_sig_last = ''
+        if pid_cur ~= 0 then
+            last_send = now
+            queue_send(build_self('self'))
+            queue_send(build_party())
+            inv_dirty = true
+            inv_dirty_at = now - INV_DEBOUNCE
+        end
+    end
+
     if now - last_send >= SEND_INTERVAL then
         last_send = now
+        local st = os.clock()
         queue_send(build_self('self'))
         local pf = build_party()
         queue_send(pf)
+        if prof_on then prof_mark('build_self+party', st) end
     end
 
+    -- Fast lane: burst plain item moves with no throttle, capped per frame.
+    if #move_queue > 0 then
+        local n = 0
+        while n < MOVE_BURST and #move_queue > 0 do
+            local fn = table.remove(move_queue, 1)
+            if fn then pcall(fn) end
+            n = n + 1
+        end
+    end
+    -- Organize lane: one paced move per ORG_MOVE_DELAY so the game acks each before
+    -- the next is sent (bursting them made the game drop all but the first).
+    if #org_move_queue > 0 and (now - org_move_t) >= ORG_MOVE_DELAY then
+        org_move_t = now
+        local fn = table.remove(org_move_queue, 1)
+        if fn then pcall(fn) end
+    end
+    -- Throttled lane: one packet-based action per ACT_DELAY.
     if #act_queue > 0 and (now - act_t) >= ACT_DELAY then
         act_t = now
         local fn = table.remove(act_queue, 1)
         if fn then pcall(fn) end
     end
 
+    if #move_queue == 0 and next(move_dirty_bags) then
+        for bag, _ in pairs(move_dirty_bags) do
+            local b = bag
+            enqueue_fast(function() windower.ffxi.stack_items(b) end)
+        end
+        move_dirty_bags = {}
+    end
+
     drain_drops(now)
     drain_pool()
 
+    -- No background AH polling: slot status is fetched on demand only, when the
+    -- desktop opens the Market view (ahslots/ahmenu). Here we just drop a stale
+    -- box once you walk away from the counter so the app doesn't show old slots.
     if (now - ah_auto_t) >= 4 then
         ah_auto_t = now
-        if ah_at_ah() then
-            if not ah_initialized and not ah_busy and #ah_queue == 0 and ah_auto_tries < 3 then
-                ah_auto_tries = ah_auto_tries + 1
-                ah_request_status()
-            end
-        else
-            if ah_initialized or ah_box then
-                ah_initialized = false
-                ah_box = nil
-                ah_dirty = true
-            end
-            ah_auto_tries = 0
+        if not ah_at_ah() and (ah_initialized or ah_box) then
+            ah_initialized = false
+            ah_box = nil
+            ah_dirty = true
         end
     end
 
@@ -6003,10 +7559,12 @@ windower.register_event('prerender', function()
         queue_send(build_dbox())
     end
 
+    local dbst = os.clock()
     dbox_open_tick(now)
     dbox_autoref_tick(now)
     dbox_tick(now)
     dbox_pq_drain(now)
+    if prof_on then prof_mark('dbox_ticks', dbst) end
     if dbox_status_dirty then
         dbox_status_dirty = false
         queue_send(build_dbox_status())
@@ -6018,11 +7576,13 @@ windower.register_event('prerender', function()
     end
 
     if npc_driving and (now - npc_driving.t) > 6 then npc_driving = nil end
-    npc_scan(now)
-    resupply_tick(now)
-    cfarm_tick(now)
-    curio_scan_tick(now)
-    store_tick(now)
+    PF('npc_scan', npc_scan, now)
+    PF('resupply_tick', resupply_tick, now)
+    PF('pvendor_tick', pvendor_tick, now)
+    PF('cfarm_tick', cfarm_tick, now)
+    PF('curio_scan_tick', curio_scan_tick, now)
+    PF('store_tick', store_tick, now)
+    PF('gobbie_tick', gobbie_tick, now)
     local store_zid = (windower.ffxi.get_info() or {}).zone or 0
     if store_zid ~= 0 then
         if store_zid ~= store_last_zone then store_last_zone = store_zid; store_npc_cache = {}; store_dirty = true end
@@ -6070,8 +7630,7 @@ windower.register_event('prerender', function()
     if use_id and use_left > 0 and now >= use_next then
         local player = windower.ffxi.get_player()
         if not player or not (player.status == 0 or player.status == 1) then
-            use_id = nil
-            use_left = 0
+            use_next = now + 1
         else
             local inv = windower.ffxi.get_items(0)
             local have = 0
@@ -6081,21 +7640,40 @@ windower.register_event('prerender', function()
                     if type(it) == 'table' and it.id == use_id and it.status == 0 then have = have + (it.count or 0) end
                 end
             end
-            if have <= 0 then
-                use_id = nil
-                use_left = 0
-            else
+            -- Temporary items can't be moved into inventory but /item uses them in place,
+            -- so holding one in the Temporary bag (3) counts as usable right now.
+            local temp = windower.ffxi.get_items(3)
+            local temp_have = 0
+            if type(temp) == 'table' then
+                for s = 1, (temp.max or 80) do
+                    local it = temp[s]
+                    if type(it) == 'table' and it.id == use_id and (it.status or 0) == 0 then temp_have = temp_have + (it.count or 0) end
+                end
+            end
+            if have > 0 or temp_have > 0 then
                 windower.chat.input('/item "' .. use_name .. '" <me>')
                 use_left = use_left - 1
+                use_done = use_done + 1
+                use_move_at = 0
                 use_next = now + use_delay
-                if use_left <= 0 then use_id = nil end
+                if use_left <= 0 then emit_use(false); use_id = nil else emit_use(true) end
+            elseif use_move_at > 0 and (now - use_move_at) < 3 then
+                use_next = now + 0.5
+            elseif use_pull_stack(use_id) then
+                use_move_at = now
+                use_next = now + 1.0
+            else
+                emit_use(false); use_id = nil; use_left = 0
             end
         end
     end
 
     if org_active then
-        if #act_queue == 0 then
+        -- Complete when every step has reported, not when the shared queue drains
+        -- (a throttled seqack sitting behind the moves would otherwise stall it).
+        if org_done >= org_total then
             org_active = false
+            if org_verify and not org_verify.done_at then org_verify.done_at = now; org_verify.moved = org_moved; org_verify.total = org_total end
             local skipped = org_total - org_moved
             if skipped > 0 then
                 alex_chat(207, '[Alexandria] auto-organize complete: ' .. org_moved .. ' moved, ' .. skipped .. ' skipped (bag full?)', 'progress')
@@ -6115,10 +7693,45 @@ windower.register_event('prerender', function()
         end
     end
 
+    -- Post-run verify (debug log only): a settle after the paced moves finish, re-read
+    -- each planned item's source bag and record how many ACTUALLY left vs what the run
+    -- claimed. This is what exposes silent drops ("reported moved 8, really moved 1").
+    if org_verify and org_verify.done_at and (now - org_verify.done_at) >= 1.5 then
+        local v = org_verify
+        org_verify = nil
+        local function count_in(bag, id)
+            local items = windower.ffxi.get_items(bag)
+            local n = 0
+            if type(items) == 'table' then for s = 1, (items.max or 0) do local it = items[s]; if it and it.id == id then n = n + (it.count or 1) end end end
+            return n
+        end
+        local dbg = { ('POST-RUN %s: reported moved=%d/%d, verifying what actually landed:'):format(v.ts, v.moved, v.total) }
+        local landed = 0
+        for _, s in ipairs(v.steps) do
+            local src_now = count_in(s.from, s.id)
+            local moved = s.src_before - src_now
+            if moved >= s.want then landed = landed + 1 end
+            local tag = (moved >= s.want) and 'OK' or (moved > 0 and 'PARTIAL' or 'FAIL(still in source)')
+            dbg[#dbg + 1] = ('  %s: src[%d] %d->%d  moved %d/%d  %s'):format(s.n, s.from, s.src_before, src_now, moved, s.want, tag)
+        end
+        dbg[#dbg + 1] = ('VERIFIED %d/%d steps fully landed'):format(landed, #v.steps)
+        org_log_write(dbg)
+    end
+
     if inv_dirty and (now - inv_dirty_at >= INV_DEBOUNCE or now - inv_first_dirty >= 1.5) then
         inv_dirty = false
         store_dirty = true
-        queue_send(build_inventory())
+        local sst = os.clock()
+        local sig = inv_signature()
+        if prof_on then prof_mark('inv_signature', sst) end
+        if sig ~= inv_sig_last then
+            inv_sig_last = sig
+            local ist = os.clock()
+            local invf = build_inventory()
+            if invf then queue_send(invf) end
+            if prof_on then prof_mark('build_inventory', ist) end
+        end
+        if next(autosort_bags) then autosort_check() end
         if auto_drop then scan_drops() end
         if clean_set then if now < clean_until then scan_drops(clean_set) else clean_set = nil end end
         if (sell_anywhere and in_town()) or (shop_session and shop_autosell) then shop_autosell_run() end
@@ -6168,15 +7781,27 @@ windower.register_event('prerender', function()
 
     if drop_pending then
         local dp = drop_pending
-        local arrived = shop_count_inv(dp.id) - dp.before
-        if arrived >= dp.qty then
-            drop_pending = nil
-            drop_amount(dp.id, dp.qty)
-        elseif now - dp.t > 8 then
-            drop_pending = nil
-            if arrived > 0 then drop_amount(dp.id, arrived) end
+        local cur = shop_count_inv(dp.id)
+        if dp.phase == 'confirm' then
+            if cur <= dp.floor or now - dp.t > 8 then
+                drop_pending = nil
+            end
+        else
+            local arrived = cur - dp.before
+            if arrived >= dp.qty then
+                drop_amount(dp.id, dp.qty)
+                dp.phase = 'confirm'; dp.floor = dp.before; dp.t = now
+            elseif now - dp.t > 8 then
+                if arrived > 0 then
+                    drop_amount(dp.id, arrived)
+                    dp.phase = 'confirm'; dp.floor = dp.before; dp.t = now
+                else
+                    drop_pending = nil
+                end
+            end
         end
     end
+    pump_drop_moves()
 
     if po_progress_dirty then
         po_progress_dirty = false
@@ -6205,7 +7830,18 @@ windower.register_event('prerender', function()
         if rf then queue_send(rf) end
     end
 
-    aug_tick(now)
+    if pvendor_near_dirty then
+        pvendor_near_dirty = false
+        queue_send(build_pvendornear())
+    end
+
+    if pvendor_dirty then
+        pvendor_dirty = false
+        local pf = build_pvendor()
+        if pf then queue_send(pf) end
+    end
+
+    PF('aug_tick', aug_tick, now)
     if aug_dirty then
         aug_dirty = false
         queue_send(build_aug())
@@ -6215,7 +7851,7 @@ windower.register_event('prerender', function()
         queue_send(build_auginfo())
     end
 
-    bz_tick(now)
+    PF('bz_tick', bz_tick, now)
     if bz_sellers_dirty then
         bz_sellers_dirty = false
         queue_send(build_bzsellers())
@@ -6246,12 +7882,18 @@ windower.register_event('prerender', function()
         queue_send(build_currency())
     end
 
+    if #txbuf >= TXBUF_MAX then
+        alex_chat(207, '[Alexandria] app not responding; resetting connection', 'error')
+        disconnect()
+        return
+    end
     if #txbuf > 0 then
         local sent, serr, last = conn:send(txbuf)
         local n = sent or last
         if n and n > 0 then txbuf = txbuf:sub(n + 1) end
         if serr == 'closed' then disconnect() return end
     end
+    if prof_on then prof_mark('TOTAL_FRAME', now) end
 end)
 
 function ax_forward(a)
@@ -6325,6 +7967,67 @@ windower.register_event('addon command', function(...)
     elseif cmd == 'sync' then
         inv_dirty = true
         inv_dirty_at = os.clock() - INV_DEBOUNCE
+    elseif cmd == 'orglog' then
+        local sub = (a[2] or ''):lower()
+        if sub == 'off' then
+            org_debug = false
+            alex_chat(207, '[Alexandria] organize debug log OFF')
+        elseif sub == 'clear' then
+            local base = windower.addon_path .. 'debug'
+            if windower.dir_exists and not windower.dir_exists(base) then windower.create_dir(base) end
+            local f = io.open(base .. '/organize.log', 'w')
+            if f then f:close() end
+            alex_chat(207, '[Alexandria] organize log cleared (debug/organize.log)')
+        else
+            org_debug = true
+            alex_chat(207, '[Alexandria] organize debug log ON -> debug/organize.log (logs each Organize plan + verifies what actually landed). //ax orglog off to stop.')
+        end
+    elseif cmd == 'store' then
+        local sub = (a[2] or ''):lower()
+        if sub == 'batch' then
+            local npc, n = a[3], tonumber(a[4])
+            if npc and n and n >= 1 then
+                local d = store_discovered[npc]
+                if type(d) == 'table' then
+                    d.batch = (n > 1) and n or nil
+                    if STORE_FIXED_NPCS[npc] then STORE_FIXED_NPCS[npc].batch = d.batch end
+                    store_save_discovered()
+                    store_dirty = true
+                    alex_chat(207, ('[Alexandria] %s now stores in batches of %s'):format(npc, tostring(d.batch or 'any')), 'action')
+                else
+                    alex_chat(207, ('[Alexandria] no discovered NPC named "%s" (capture it first)'):format(tostring(npc)), 'error')
+                end
+            else
+                alex_chat(207, '[Alexandria] usage: //ax store batch <NpcName> <count>')
+            end
+        elseif sub == 'export' then
+            local lines, n = {}, 0
+            for name, e in pairs(store_discovered) do
+                if type(e) == 'table' and not STORE_DEFAULTS[name] and e.id and e.index and e.zone then
+                    local ids, names = {}, {}
+                    for _, iid in ipairs(e.items or {}) do
+                        ids[#ids + 1] = tostring(iid)
+                        names[#names + 1] = (res.items[iid] and res.items[iid].en) or ('item ' .. iid)
+                    end
+                    local bpart = e.batch and (', batch = ' .. e.batch) or ''
+                    lines[#lines + 1] = ("    ['%s'] = { zone = %d, id = %d, index = %d, items = { %s }%s },  -- %s"):format(
+                        name, e.zone, e.id, e.index, table.concat(ids, ', '), bpart, table.concat(names, ', '))
+                    n = n + 1
+                end
+            end
+            if n == 0 then
+                alex_chat(207, '[Alexandria] no new captured NPCs to export (all are already built in)')
+            else
+                table.sort(lines)
+                local base = windower.addon_path .. 'debug'
+                if windower.dir_exists and not windower.dir_exists(base) then windower.create_dir(base) end
+                local f = io.open(base .. '/store_export.txt', 'w')
+                if f then f:write(table.concat(lines, '\n') .. '\n'); f:close() end
+                alex_chat(207, ('[Alexandria] exported %d NPC(s) to debug/store_export.txt -- send that file to the developer'):format(n))
+            end
+        else
+            alex_chat(207, '[Alexandria] usage: //ax store batch <NpcName> <count>  |  //ax store export')
+        end
     elseif cmd == 'bags' then
         local info = windower.ffxi.get_info()
         alex_chat(207, ('[Alexandria] mog_house=%s zone=%s'):format(tostring(info and info.mog_house), tostring(info and info.zone)))
@@ -6347,6 +8050,9 @@ windower.register_event('addon command', function(...)
     elseif cmd == 'selllog' then
         sell_log = not sell_log
         alex_chat(207, '[Alexandria] sell packet log ' .. (sell_log and 'ON' or 'OFF'))
+    elseif cmd == 'storedebug' then
+        store_debug = not store_debug
+        alex_chat(207, '[Alexandria] store/gobbie debug log ' .. (store_debug and 'ON (phases + packets print to chat)' or 'OFF'))
     elseif cmd == 'npcinfo' then
         local t = windower.ffxi.get_mob_by_target('t')
         if not t or not t.id then
@@ -6375,6 +8081,149 @@ windower.register_event('addon command', function(...)
             local _, pk = build_party()
             alex_chat(207, '[party] computed key=[' .. tostring(pk) .. ']')
         end
+    elseif cmd == 'mem' then
+        local ok, info = pcall(mem_status_line)
+        if ok then
+            mem_log_write(info)
+            alex_chat(207, '[Alexandria] mem: ' .. info)
+        end
+    elseif cmd == 'memlog' then
+        local sub = (a[2] or ''):lower()
+        if sub == 'off' then
+            mem_log_on = false
+            alex_chat(207, '[Alexandria] memory logging OFF')
+        else
+            mem_log_on = true
+            mem_sample_t = 0
+            local iv = tonumber(sub)
+            if iv and iv >= 30 then mem_log_interval = iv end
+            alex_chat(207, '[Alexandria] memory logging ON (every ' .. mem_log_interval .. 's -> data/mem.txt)')
+        end
+    elseif cmd == 'capture' then
+        local sub = (a[2] or ''):lower()
+        if sub == 'start' then
+            local zinfo = windower.ffxi.get_info()
+            capture = { t0 = os.clock(), events = {}, npc = {}, items = {}, zone = (zinfo and zinfo.zone) or 0, label = a[3], batch = tonumber(a[4]) }
+            local tgt = windower.ffxi.get_mob_by_target('t')
+            if tgt and tgt.name and tgt.name ~= '' then capture.tname = tgt.name; capture.tid = tgt.id; capture.tindex = tgt.index end
+            alex_chat(207, '[Alexandria] capture ON (//ax capture start [label] [batch] for nameless/batched NPCs). Target + trade, click through, then //ax capture stop', 'action')
+        elseif sub == 'cancel' then
+            capture = nil
+            alex_chat(207, '[Alexandria] capture cancelled')
+        else
+            if not capture then
+                alex_chat(207, '[Alexandria] capture not running; //ax capture start first', 'error')
+            else
+                local c = capture; capture = nil
+                local r = store_capture_commit(c)
+                local npcname, eid, eidx, item_names, primary = r.npcname, r.eid, r.eidx, r.item_names, r.primary
+
+                local lines = {}
+                lines[#lines + 1] = '=== Alexandria storage capture ==='
+                lines[#lines + 1] = ('when=%s  zone=%d  packets=%d'):format(os.date('%Y-%m-%d %H:%M:%S'), c.zone, #c.events)
+                lines[#lines + 1] = ('NPC: name=%s id=%s index=%s menu=%s'):format(tostring(npcname), tostring(eid), tostring(eidx), tostring(c.npc.menu))
+                lines[#lines + 1] = ('item(s) traded: %s'):format(#item_names > 0 and table.concat(item_names, ', ') or '(none detected)')
+                if eid and eidx then
+                    lines[#lines + 1] = 'STORE_FIXED_NPCS entry:'
+                    lines[#lines + 1] = ("    ['%s'] = { zone = %d, id = %d, index = %d },"):format(tostring(npcname), c.zone, eid, eidx)
+                end
+                lines[#lines + 1] = '--- sequence ---'
+                for _, ev in ipairs(c.events) do
+                    lines[#lines + 1] = ('[+%7.3f] %s 0x%03X len=%-3d %s'):format(ev.t, ev.dir == 'in' and 'IN ' or 'OUT', ev.id, ev.len, ev.note)
+                    lines[#lines + 1] = '            ' .. ev.hex
+                end
+
+                local base = windower.addon_path .. 'debug'
+                if windower.dir_exists and not windower.dir_exists(base) then windower.create_dir(base) end
+                if windower.dir_exists and not windower.dir_exists(base .. '/captures') then windower.create_dir(base .. '/captures') end
+                local function san(s) return (tostring(s):gsub('[^%w]', '-')) end
+                local fname = ('%s_%s_%s.txt'):format(san(npcname), san(primary), os.date('%Y%m%d_%H%M%S'))
+                local f = io.open(base .. '/captures/' .. fname, 'w')
+                if f then f:write(table.concat(lines, '\n') .. '\n'); f:close() end
+                alex_chat(207, ('[Alexandria] capture saved: %s stores %s (%d packets) -> debug/captures/%s'):format(npcname, primary, #c.events, fname), 'action')
+            end
+        end
+    elseif cmd == 'learn' then
+        local sub = (a[2] or ''):lower()
+        local batch = tonumber(sub)
+        if sub == '' or sub == 'start' or (batch and batch > 0) then
+            local tgt = windower.ffxi.get_mob_by_target('t')
+            local b = (batch and batch > 1) and batch or nil
+            if not (tgt and tgt.name and tgt.name ~= '') then
+                alex_chat(207, '[Alexandria] Target the NPC first, then //ax learn', 'error')
+            elseif capture then
+                alex_chat(207, '[Alexandria] Already learning; trade, click through, then //ax learn done', 'action')
+            else
+                local zinfo = windower.ffxi.get_info()
+                capture = { t0 = os.clock(), events = {}, npc = {}, items = {}, zone = (zinfo and zinfo.zone) or 0,
+                    tname = tgt.name, tid = tgt.id, tindex = tgt.index, batch = b }
+                alex_chat(207, ('[Alexandria] Learning %s%s: trade the item(s), click through, then //ax learn done'):format(tgt.name, b and (' (batches of ' .. b .. ')') or ''), 'action')
+            end
+        elseif sub == 'done' then
+            if not capture then
+                alex_chat(207, '[Alexandria] Nothing to learn; target the NPC and //ax learn first', 'error')
+            else
+                local c = capture; capture = nil
+                local r = store_capture_commit(c)
+                if not r.saved then
+                    alex_chat(207, '[Alexandria] No completed trade caught; try //ax learn again', 'error')
+                else
+                    local _, path = store_share_write()
+                    local what = (r.added and r.added > 0) and ('+%d item(s) incl. %s'):format(r.added, r.primary) or ('%s (already knew it)'):format(r.primary)
+                    local tail = (r.added and r.added > 0 and path) and (' In %s to send the dev.'):format(path) or ''
+                    alex_chat(207, ('[Alexandria] Learned %s: %s. Usable in-game now.%s'):format(r.npcname, what, tail), 'action')
+                end
+            end
+        elseif sub == 'send' then
+            local n, path = store_share_write()
+            alex_chat(207, path and (('[Alexandria] %d NPC(s), send to dev: %s'):format(n, path)) or '[Alexandria] Nothing to share yet', path and 'action' or 'error')
+        elseif sub == 'list' then
+            local names = {}
+            for name, e in pairs(store_discovered) do if type(e) == 'table' and not STORE_DEFAULTS[name] then names[#names + 1] = name end end
+            table.sort(names)
+            alex_chat(207, #names == 0 and '[Alexandria] No NPCs taught yet' or ('[Alexandria] Taught: ' .. table.concat(names, ', ')))
+        elseif sub == 'cancel' then
+            capture = nil
+            alex_chat(207, '[Alexandria] learn cancelled')
+        else
+            alex_chat(207, '[Alexandria] //ax learn [batchSize] | done | send | list | cancel')
+        end
+    elseif cmd == 'perf' then
+        local sub = (a[2] or ''):lower()
+        if sub == 'on' then
+            prof = {}; prof_frames = 0; prof_on = true
+            alex_chat(207, '[Alexandria] perf ON; play normally ~30s, then //ax perf to see the report')
+        elseif sub == 'off' then
+            prof_on = false
+            alex_chat(207, '[Alexandria] perf OFF')
+        elseif sub == 'reset' then
+            prof = {}; prof_frames = 0
+            alex_chat(207, '[Alexandria] perf counters reset')
+        else
+            local list = {}
+            for name, e in pairs(prof) do list[#list + 1] = { name = name, t = e.t, n = e.n, mx = e.mx } end
+            table.sort(list, function(x, y) return x.mx > y.mx end)
+            if #list == 0 then
+                alex_chat(207, '[Alexandria] no samples; run //ax perf on first')
+            else
+                local pl = windower.ffxi.get_player()
+                local lines = {}
+                lines[#lines + 1] = ('Alexandria perf report  char=%s  zone=%s  frames=%d'):format(
+                    tostring(pl and pl.name), tostring((windower.ffxi.get_info() or {}).zone), prof_frames)
+                lines[#lines + 1] = 'section              max(ms)   avg(ms)  total(ms)   samples'
+                for _, e in ipairs(list) do
+                    lines[#lines + 1] = ('%-18s  %8.2f  %8.3f  %9.0f  %8d'):format(e.name, e.mx, e.t / math.max(1, e.n), e.t, e.n)
+                end
+                local path = windower.addon_path .. 'data/perf.txt'
+                local f = io.open(path, 'w')
+                if f then
+                    f:write(table.concat(lines, '\n') .. '\n'); f:close()
+                    alex_chat(207, '[Alexandria] wrote perf report to Alexandria/data/perf.txt')
+                else
+                    alex_chat(207, '[Alexandria] could not open data/perf.txt for writing')
+                end
+            end
+        end
     elseif cmd == 'release' then
         cfarm = nil
         cbuy_release()
@@ -6395,8 +8244,49 @@ windower.register_event('addon command', function(...)
         elseif shop_sell_by_id(sid, math.max(1, qty)) then
             alex_chat(207, '[Alexandria] direct sell sent: ' .. (res.items[sid] and res.items[sid].en or sid) .. ' x' .. qty)
         else
-            alex_chat(207, '[Alexandria] sell: none in inventory or unsellable', 'error')
+            local inv = windower.ffxi.get_items(0)
+            local found, st, cnt, bz = false, -1, 0, -1
+            if inv then for s = 1, (inv.max or 80) do local it = inv[s]; if type(it) == 'table' and it.id == sid then found = true; st = it.status or -1; cnt = it.count or 0; bz = it.bazaar or -1; break end end end
+            alex_chat(207, ('[Alexandria] sell fail id=%d found=%s status=%s count=%d bazaar=%s'):format(sid, tostring(found), tostring(st), cnt, tostring(bz)), 'error')
         end
+    elseif cmd == 'sellall' then
+        -- Fire the auto-sell list on demand. Gated on Experimental Features so it
+        -- works even when "Auto-Sell In Towns" is toggled off, letting you trigger
+        -- a shop sell from the command line.
+        if not experimental_features then
+            alex_chat(207, '[Alexandria] sellall requires Experimental Features (enable it in Settings).', 'error')
+        elseif next(shop_sell_list) == nil then
+            alex_chat(207, '[Alexandria] sellall: your Sell list is empty.', 'progress')
+        elseif not (shop_session or in_town()) then
+            alex_chat(207, '[Alexandria] sellall: open a shop or stand in a town first.', 'error')
+        else
+            local inv = windower.ffxi.get_items(0)
+            local n = 0
+            if inv then for s = 1, (inv.max or 80) do local it = inv[s]; if type(it) == 'table' and it.id and it.id ~= 0 and shop_sell_list[it.id] and it.status == 0 and not shop_no_sale(it.id) then n = n + 1 end end end
+            if n == 0 then
+                alex_chat(207, '[Alexandria] sellall: no auto-sell items in your inventory.', 'progress')
+            else
+                shop_sold = {}
+                shop_autosell_run()
+                alex_chat(207, '[Alexandria] sellall: selling ' .. n .. ' auto-sell item(s).', 'action')
+            end
+        end
+    elseif cmd == 'autolot' then
+        -- Toggle acting on the lot list. Per-character by default; add "all" to flip
+        -- every character (the desktop relays and persists it across the fleet).
+        local t1 = (a[2] or ''):lower()
+        local scope_all = (t1 == 'all')
+        local onoff = scope_all and (a[3] or ''):lower() or t1
+        local target
+        if onoff == 'on' then target = true
+        elseif onoff == 'off' then target = false
+        else target = not pool_autolot_on end
+        pool_autolot_on = target
+        queue_send('{"t":"autolot","on":' .. (target and 'true' or 'false') .. (scope_all and ',"all":true' or '') .. '}\n')
+        alex_chat(207, '[Alexandria] auto-lot ' .. (target and 'ON' or 'OFF') .. (scope_all and ' for all characters.' or ' for this character.'), 'action')
+    elseif cmd == 'rsdebug' then
+        rs_debug = not rs_debug
+        alex_chat(207, '[Alexandria] resupply debug ' .. (rs_debug and 'ON' or 'OFF'))
     elseif cmd == 'shopdebug' then
         local watching = {}
         for nm in pairs(npc_watch) do watching[#watching + 1] = nm end

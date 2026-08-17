@@ -1,15 +1,19 @@
 import { useEffect, useMemo, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { useKnownCharacters, broadcastCurrency, type KnownChar } from './bridge';
-import { Segmented } from './ui';
+import { Segmented, Select } from './ui';
 import { useStars, toggleStar } from './currencyStars';
-import { useSticky } from './sticky';
+import { useSticky, useStickyPersisted } from './sticky';
 import { useCharScope, CharScopeBar } from './CharScope';
 import { Collapse } from './overlay';
 import { relTime, useNowTick } from './reltime';
 import { useAnon } from './anonymize';
 
 const fmt = (v: number | null) => (v == null ? '·' : v.toLocaleString());
+const fmtRemain = (ms: number) => {
+  const s = Math.max(0, Math.ceil(ms / 1000));
+  return s >= 60 ? `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}` : `${s}s`;
+};
 
 type SortMode = 'name' | 'total';
 
@@ -18,7 +22,7 @@ function Star({ on, onClick }: { on: boolean; onClick: () => void }) {
     <button
       onClick={(e) => { e.stopPropagation(); onClick(); }}
       aria-label={on ? 'Unstar' : 'Star'}
-      className={`shrink-0 transition-colors ${on ? 'text-amber-400 hover:text-amber-300' : 'text-fg-4/30 hover:text-fg-4 opacity-0 group-hover:opacity-100'} ${on ? '!opacity-100' : ''}`}
+      className={`shrink-0 grid place-items-center w-7 h-7 -m-1.5 rounded transition-colors ${on ? 'text-amber-400 hover:text-amber-300' : 'text-fg-4/40 hover:text-fg-2 hover:bg-line/50 opacity-0 group-hover:opacity-100'} ${on ? '!opacity-100' : ''}`}
     >
       <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill={on ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth={1.8} strokeLinejoin="round"><path d="M12 2.5l2.9 6 6.6.9-4.8 4.6 1.2 6.5L12 17.8 6.1 20.5l1.2-6.5L2.5 9.4l6.6-.9z" /></svg>
     </button>
@@ -28,13 +32,18 @@ function Star({ on, onClick }: { on: boolean; onClick: () => void }) {
 export default function CurrencyView() {
   const known = useKnownCharacters();
   const anon = useAnon();
-  useNowTick();
   const stars = useStars();
   const starSet = useMemo(() => new Set(stars), [stars]);
   const [updating, setUpdating] = useState(false);
   const [query, setQuery] = useSticky('cur.q', '');
   const [sort, setSort] = useSticky<SortMode>('cur.sort', 'total');
-  const [starredOnly, setStarredOnly] = useSticky('cur.starred', false);
+  const [starredOnly, setStarredOnly] = useStickyPersisted('cur.starred', false);
+  const [autoUpdate, setAutoUpdate] = useStickyPersisted('cur.auto', false);
+  const [autoMins, setAutoMins] = useStickyPersisted('cur.automins', 3);
+  const [nextSyncAt, setNextSyncAt] = useState<number | null>(null);
+  // Tick every second while auto is on so the countdown updates smoothly; a minute
+  // is plenty otherwise (that only feeds the relative "Synced Nm ago" text).
+  useNowTick(autoUpdate ? 1000 : 60000);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const toggleExpand = (name: string) => setExpanded((prev) => { const next = new Set(prev); if (next.has(name)) next.delete(name); else next.add(name); return next; });
 
@@ -79,6 +88,17 @@ export default function CurrencyView() {
     window.setTimeout(() => setUpdating(false), 2500);
   };
 
+  // Auto-Update: press Update on a fixed cadence while enabled and at least one
+  // character is connected. Toggling it on fires one immediately for instant feedback.
+  useEffect(() => {
+    if (!autoUpdate || onlineCount === 0) { setNextSyncAt(null); return; }
+    const period = Math.max(1, autoMins) * 60000;
+    setNextSyncAt(Date.now() + period);
+    const id = window.setInterval(() => { update(); setNextSyncAt(Date.now() + period); }, period);
+    return () => window.clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoUpdate, autoMins, onlineCount]);
+
   return (
     <div className="h-full flex flex-col">
       <div className="shrink-0 px-4 pt-4 pb-3 border-b border-line flex flex-col gap-2.5">
@@ -91,23 +111,29 @@ export default function CurrencyView() {
             {onlineCount === 0 ? 'No Characters Connected' : updating ? 'Updating…' : 'Update'}
           </button>
 
-          {hasData && (
-            <>
-              <div className="relative flex-1 min-w-0">
-                <svg viewBox="0 0 24 24" className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-fg-4 pointer-events-none" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="7" /><path d="M21 21l-4-4" /></svg>
-                <input
-                  value={query}
-                  onChange={(e) => setQuery(e.target.value)}
-                  placeholder="Filter Currencies"
-                  className="pl-8 pr-7 py-1.5 w-full text-[12px] rounded-md bg-field border border-line text-fg-2 placeholder:text-fg-4 focus:outline-none focus:border-accent"
-                />
-                {query && (
-                  <button onClick={() => setQuery('')} aria-label="Clear" className="absolute right-2 top-1/2 -translate-y-1/2 text-fg-4 hover:text-fg">
-                    <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><path d="M6 6l12 12M18 6L6 18" /></svg>
-                  </button>
-                )}
-              </div>
+          <div className="shrink-0 w-[132px]" title="Auto-press Update on a set cadence">
+            <Select
+              full
+              value={autoUpdate ? String(autoMins) : 'off'}
+              onChange={(v) => {
+                if (v === 'off') { setAutoUpdate(false); return; }
+                const wasOff = !autoUpdate;
+                setAutoMins(Number(v)); setAutoUpdate(true);
+                if (wasOff && onlineCount > 0) update();
+              }}
+              options={['off', '1', '3', '5', '10', '15', '30']}
+              renderValue={(v) => (
+                <span className={`flex items-center gap-1.5 ${v === 'off' ? 'text-fg-3' : 'text-accent'}`}>
+                  <svg viewBox="0 0 24 24" className="w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></svg>
+                  <span className="truncate">{v === 'off' ? 'Auto' : `Auto · ${v}m`}</span>
+                </span>
+              )}
+              renderOption={(v) => (v === 'off' ? 'Auto: Off' : `Every ${v} min`)}
+            />
+          </div>
 
+          {hasData && (
+            <div className="ml-auto flex items-center gap-3">
               <div className="shrink-0">
                 <Segmented
                   value={sort}
@@ -125,7 +151,7 @@ export default function CurrencyView() {
                 <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill={starredOnly ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth={1.8} strokeLinejoin="round"><path d="M12 2.5l2.9 6 6.6.9-4.8 4.6 1.2 6.5L12 17.8 6.1 20.5l1.2-6.5L2.5 9.4l6.6-.9z" /></svg>
                 Starred
               </button>
-            </>
+            </div>
           )}
 
           {!hasData && (
@@ -134,6 +160,22 @@ export default function CurrencyView() {
             </span>
           )}
         </div>
+        {hasData && (
+          <div className="relative">
+            <svg viewBox="0 0 24 24" className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-fg-4 pointer-events-none" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="7" /><path d="M21 21l-4-4" /></svg>
+            <input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Filter Currencies"
+              className="pl-8 pr-7 py-1.5 w-full text-[12px] rounded-md bg-field border border-line text-fg-2 placeholder:text-fg-4 focus:outline-none focus:border-accent"
+            />
+            {query && (
+              <button onClick={() => setQuery('')} aria-label="Clear" className="absolute right-2 top-1/2 -translate-y-1/2 text-fg-4 hover:text-fg">
+                <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><path d="M6 6l12 12M18 6L6 18" /></svg>
+              </button>
+            )}
+          </div>
+        )}
         {hasData && (
           <CharScopeBar
             chars={chars}
@@ -144,6 +186,9 @@ export default function CurrencyView() {
               <span className="shrink-0 inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-field border border-line text-[10px] font-semibold text-fg-3" title="Last time currency was refreshed">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400/80" />
                 Synced {relTime(lastSync)}
+                {autoUpdate && (updating
+                  ? <span className="text-accent font-normal">· syncing…</span>
+                  : nextSyncAt ? <span className="text-fg-4 font-normal">· next in {fmtRemain(nextSyncAt - Date.now())}</span> : null)}
               </span>
             ) : undefined}
           />
@@ -207,7 +252,7 @@ export default function CurrencyView() {
                           <div className="text-[11px] text-fg-4 py-1 pl-6">No character holds this.</div>
                         ) : (
                           holders.map(({ c, v }) => (
-                            <div key={c.name} className="flex items-center gap-2 text-[11px] pl-6 py-0.5">
+                            <div key={c.name} className="group flex items-center gap-2 text-[11px] pl-6 py-0.5">
                               <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${c.online ? 'bg-emerald-400' : 'bg-fg-4'}`} />
                               <span className="min-w-0 truncate text-fg-3">{anon(c.name)}</span>
                               {!c.online && c.curAt && <span className="text-[10px] text-fg-4/70 shrink-0">{relTime(c.curAt)}</span>}

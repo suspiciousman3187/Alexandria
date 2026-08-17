@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { useKnownCharacters, type KnownChar, type InvBag, type InvItem } from './bridge';
 import { useRecent, clearRecent } from './recent';
+import { itemNameMatches } from './itemNames';
 import { useSettings, setSettings } from './settings';
 import { ItemRow, RowActions } from './InventoryView';
 import { Select, SearchInput } from './ui';
@@ -43,6 +44,7 @@ export default function RecentView() {
 
   const [charFilter, setCharFilter] = useSticky('recent.char', 'all');
   const [q, setQ] = useSticky('recent.q', '');
+  const [hideTemp, setHideTemp] = useSticky('recent.hideTemp', false);
 
   const byName = useMemo(() => new Map(known.map((k) => [k.name, k])), [known]);
 
@@ -63,15 +65,21 @@ export default function RecentView() {
     const query = q.trim().toLowerCase();
     return rows.filter((r) => {
       if (charFilter !== 'all' && r.char !== charFilter) return false;
-      if (query && !r.n.toLowerCase().includes(query)) return false;
-      return !!locate(byName.get(r.char), r.id);
+      if (query && !itemNameMatches(r.id, r.n, query)) return false;
+      const loc = locate(byName.get(r.char), r.id);
+      if (!loc) return false;
+      if (hideTemp && loc.bag.id === 3) return false;
+      return true;
     });
-  }, [rows, charFilter, q, byName]);
+  }, [rows, charFilter, q, byName, hideTemp]);
 
   return (
     <div className="h-full flex flex-col">
       <div className="shrink-0 px-3 pt-3 pb-2 flex flex-col gap-2 border-b border-line">
-        <Select value={charFilter} onChange={setCharFilter} options={charOpts} renderOption={(v) => (v === 'all' ? 'All Characters' : anon(v))} full />
+        <div className="flex items-center gap-2">
+          <div className="flex-1 min-w-0"><Select value={charFilter} onChange={setCharFilter} options={charOpts} renderOption={(v) => (v === 'all' ? 'All Characters' : anon(v))} full /></div>
+          <button onClick={() => setHideTemp((v) => !v)} title="Hide temporary items from this list" className={`le-tap shrink-0 px-2.5 py-1.5 text-[11px] font-semibold rounded-md border transition-colors ${hideTemp ? 'border-accent bg-accent/15 text-accent' : 'border-line bg-surface text-fg-3 hover:text-fg'}`}>Hide Temp</button>
+        </div>
         <div className="flex items-center gap-2">
           <SearchInput
             value={q}

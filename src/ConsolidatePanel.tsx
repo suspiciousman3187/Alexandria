@@ -3,6 +3,8 @@ import { AnimatePresence, motion } from 'motion/react';
 import { useKnownCharacters, useAvailableIcons, type KnownChar } from './bridge';
 import { IconInner } from './atlasIcon';
 import { CharacterSelect, SearchInput } from './ui';
+import { itemNameMatches } from './itemNames';
+import { Collapse } from './overlay';
 import { useConsolidate, runConsolidate, stopConsolidate, reachableTotal, isNoTrade } from './consolidate';
 import { useSettings } from './settings';
 import { useAnon } from './anonymize';
@@ -33,6 +35,11 @@ export default function ConsolidatePanel() {
   const collName = online.find((k) => k.name === collector)?.name ?? online[0]?.name ?? '';
   const senders = useMemo(() => online.filter((k) => k.name !== collName), [online, collName]);
   const assetsAny = online.find((c) => c.assets)?.assets;
+  const itemName = useMemo(() => {
+    const m = new Map<number, string>();
+    for (const c of senders) for (const b of c.inv ?? []) for (const it of b.items) if (!m.has(it.id)) m.set(it.id, it.n);
+    return m;
+  }, [senders]);
 
   const rows = useMemo(() => {
     const ids = new Map<number, string>();
@@ -47,7 +54,7 @@ export default function ConsolidatePanel() {
         noTrade: senders.some((c) => isNoTrade(c, id)),
       }))
       .filter((r) => r.total > 0 && !r.noTrade);
-    if (search) out = out.filter((r) => r.n.toLowerCase().includes(search));
+    if (search) out = out.filter((r) => itemNameMatches(r.id, r.n, search));
     out.sort((a, b) => b.total - a.total || a.n.localeCompare(b.n));
     return out;
   }, [senders, q, experimental]);
@@ -56,6 +63,9 @@ export default function ConsolidatePanel() {
   const selRows = rows.filter((r) => sel.has(r.id));
   const selTotal = selRows.reduce((s, r) => s + r.total, 0);
   const affected = useMemo(() => senders.filter((c) => selRows.some((r) => reachableTotal(c, r.id, experimental) > 0)).length, [senders, selRows, experimental]);
+  // While a run is going the full tradeable list is just noise; show only the items
+  // actually being consolidated.
+  const listRows = run.running ? rows.filter((r) => sel.has(r.id)) : rows;
 
   const start = () => { if (collName && sel.size) void runConsolidate(collName, [...sel], experimental); };
 
@@ -64,7 +74,7 @@ export default function ConsolidatePanel() {
       <div className="h-full grid place-items-center p-6">
         <div className="text-center max-w-sm">
           <div className="text-[14px] font-bold text-fg mb-1">Need Two Characters</div>
-          <div className="text-[12px] text-fg-4 leading-relaxed">Consolidate gathers items from your other characters onto one collector. Load the Alexandria addon on at least two characters, parked together in-game.</div>
+          <div className="text-[12px] text-fg-4 leading-relaxed">Consolidate gathers items from your other characters onto one collector. Load the Alexandria addon on at least two characters in the same zone.</div>
         </div>
       </div>
     );
@@ -97,13 +107,29 @@ export default function ConsolidatePanel() {
             {run.order.map((name) => {
               const cs = run.chars[name];
               if (!cs) return null;
+              const showItems = cs.items && cs.items.length > 0 && cs.status !== 'ok' && cs.status !== 'fail';
               return (
-                <div key={name} className="px-3 py-2 flex items-center gap-2">
-                  <span className={`w-2 h-2 rounded-full shrink-0 ${STATUS_DOT[cs.status]}`} />
-                  <span className="text-[12px] text-fg-2 font-semibold min-w-0 truncate">{anon(name)}</span>
-                  <span className="text-[11px] text-fg-4 shrink-0">{STATUS_LABEL[cs.status]}</span>
-                  <span className="ml-auto text-[11px] tabular-nums text-fg-3 shrink-0">{cs.sent}/{cs.goal}</span>
-                  {cs.note && <span className="text-[10px] text-red-300 shrink-0 max-w-[160px] truncate" title={cs.note}>{cs.note}</span>}
+                <div key={name} className="px-3 py-2 flex flex-col gap-1.5">
+                  <div className="flex items-center gap-2">
+                    <span className={`w-2 h-2 rounded-full shrink-0 ${STATUS_DOT[cs.status]}`} />
+                    <span className="text-[12px] text-fg-2 font-semibold min-w-0 truncate">{anon(name)}</span>
+                    <span className="text-[11px] text-fg-4 shrink-0">{STATUS_LABEL[cs.status]}</span>
+                    <span className="ml-auto text-[11px] tabular-nums text-fg-3 shrink-0">{cs.sent}/{cs.goal}</span>
+                    {cs.note && <span className="text-[10px] text-red-300 shrink-0 max-w-[160px] truncate" title={cs.note}>{cs.note}</span>}
+                  </div>
+                  <Collapse open={!!showItems}>{showItems && (
+                    <div className="flex flex-wrap gap-1 pl-4">
+                      {cs.items!.map((it) => (
+                        <span key={it.id} className="inline-flex items-center gap-1 rounded bg-field border border-line px-1 py-0.5">
+                          <div className="relative shrink-0 w-4 h-4 rounded bg-surface grid place-items-center overflow-hidden">
+                            <IconInner id={it.id} size={16} name={itemName.get(it.id) ?? ''} assets={assetsAny} bmpHas={it.id > 0 && iconSet.has(it.id)} />
+                          </div>
+                          <span className="text-[10px] text-fg-3 max-w-[110px] truncate">{itemName.get(it.id) ?? ('Item ' + it.id)}</span>
+                          <span className="text-[10px] font-bold text-fg-2 tabular-nums">×{it.want}</span>
+                        </span>
+                      ))}
+                    </div>
+                  )}</Collapse>
                 </div>
               );
             })}
@@ -113,11 +139,11 @@ export default function ConsolidatePanel() {
         </AnimatePresence>
 
         <div className="rounded-lg border border-line bg-surface divide-y divide-line overflow-hidden">
-          {rows.length === 0 ? (
-            <div className="text-center text-[12px] text-fg-4 py-12">Nothing tradeable on your other characters.</div>
+          {listRows.length === 0 ? (
+            <div className="text-center text-[12px] text-fg-4 py-12">{run.running ? 'Consolidating…' : 'Nothing tradeable on your other characters.'}</div>
           ) : (
             <AnimatePresence mode="popLayout" initial={false}>
-              {rows.map((r) => {
+              {listRows.map((r) => {
                 const on = sel.has(r.id);
                 return (
                   <motion.button

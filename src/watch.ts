@@ -97,6 +97,10 @@ export function useWatchAlerts() {
   useEffect(() => {
     const now = Date.now();
     const throttleMs = Math.max(1, getSettings().watchFreqMin) * 60 * 1000;
+    // Broadcast low-stock alerts to every open window, not just the low character's own -- when
+    // multiboxing you are looking at your active character, not the mule that ran dry. Name the low
+    // character so any window tells you which mule to restock (local add_to_chat only, never public).
+    const targets = known.filter((k) => k.online && k.conn != null).map((k) => k.conn as number);
     for (const c of known) {
       if (!c.online || c.conn == null || !c.inv) continue;
       const wc = s[c.name];
@@ -107,7 +111,8 @@ export function useWatchAlerts() {
         if (total < it.min) {
           if (now - (lastAlert.get(key) ?? 0) > throttleMs) {
             lastAlert.set(key, now);
-            sendBoxCommand(c.conn, JSON.stringify({ cmd: 'alert', text: `Low on ${ascii(it.name)}: ${total} left (want ${it.min})` }));
+            const text = `${ascii(c.name)} is low on ${ascii(it.name)}: ${total} left (want ${it.min})`;
+            for (const conn of targets) sendBoxCommand(conn, JSON.stringify({ cmd: 'alert', text }));
           }
         } else {
           lastAlert.delete(key);

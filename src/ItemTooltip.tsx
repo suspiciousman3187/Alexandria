@@ -3,8 +3,11 @@ import { createPortal } from 'react-dom';
 import { AnimatePresence, motion } from 'motion/react';
 import { IconInner } from './atlasIcon';
 import { useAvailableIcons, useItemDescription, useKnownCharacters, openExternal, useAhCatalog, type KnownChar } from './bridge';
+import { useItemTags, bulkSetTag } from './itemTags';
 import { openAhDetail } from './ahNav';
 import { bagColor } from './bagColors';
+import { Collapse } from './overlay';
+import { useSettings } from './settings';
 
 export type HoverMeta = { id: number; n?: string; c?: number; ms?: number; f?: number; aug?: string[] };
 type HoverState = { meta: HoverMeta; rect: DOMRect } | null;
@@ -115,11 +118,11 @@ export function WhereOwned({ id, collapsible = true, defaultOpen = false }: { id
               <span className="truncate">{c.name}</span>
               <span className="ml-auto text-amber-300 font-bold tabular-nums">×{c.total.toLocaleString()}</span>
             </div>
-            {showBags && (
+            <Collapse open={showBags}>
               <div className="ml-3 flex flex-wrap gap-x-2.5 gap-y-0.5 text-[10px] tabular-nums">
                 {c.spots.map((s) => <span key={s.bag} className="whitespace-nowrap"><span className={`font-medium ${bagColor(s.bagId).text}`}>{s.bag}</span> <span className="text-sky-300 font-semibold">×{s.c.toLocaleString()}</span></span>)}
               </div>
-            )}
+            </Collapse>
           </div>
         ))}
       </div>
@@ -162,6 +165,7 @@ function Card({ meta, rect, onClose, cardRef }: { meta: HoverMeta; rect: DOMRect
   const desc = useItemDescription(meta.id);
   const chars = useKnownCharacters();
   const ahCat = useAhCatalog();
+  const tagStore = useItemTags();
   const assets = useMemo(() => chars.find((c) => c.assets)?.assets, [chars]);
 
   useEffect(() => {
@@ -170,12 +174,23 @@ function Card({ meta, rect, onClose, cardRef }: { meta: HoverMeta; rect: DOMRect
     return () => window.removeEventListener('keydown', onKey);
   }, [onClose]);
 
-  const W = 300, M = 8;
+  const big = useSettings().bigItemCard;
+  const M = 8;
+  // "Large" mode is about HEIGHT, not width: it gives the card the full height of the screen so
+  // long items (many tags + description + owners) fit without scrolling. It keeps the same 300px
+  // width and the anchor beside the clicked item; only the available height changes.
+  const W = 300;
   let left = rect.right + M;
   if (left + W > window.innerWidth) left = rect.left - W - M;
   if (left < M) left = M;
-  const top = Math.max(M, Math.min(rect.top, window.innerHeight - 200));
-  const maxHeight = window.innerHeight - top - M;
+  let top: number, maxHeight: number;
+  if (big) {
+    top = M;
+    maxHeight = window.innerHeight - 2 * M;
+  } else {
+    top = Math.max(M, Math.min(rect.top, window.innerHeight - 200));
+    maxHeight = window.innerHeight - top - M;
+  }
 
   const name = meta.n || `Item ${meta.id}`;
   const badges = flagBadges(meta.f);
@@ -193,8 +208,8 @@ function Card({ meta, rect, onClose, cardRef }: { meta: HoverMeta; rect: DOMRect
   return createPortal(
     <motion.div
       ref={cardRef}
-      className="fixed z-[80] w-[300px] rounded-lg border border-line bg-popover shadow-2xl p-3 overscroll-contain"
-      style={{ left, top, maxHeight, overflowY: 'auto' }}
+      className="fixed z-[80] rounded-lg border border-line bg-popover shadow-2xl p-3 overscroll-contain"
+      style={{ left, top, width: W, maxHeight, overflowY: 'auto' }}
       initial={{ opacity: 0, scale: 0.97, y: -3 }}
       animate={{ opacity: 1, scale: 1, y: 0 }}
       exit={{ opacity: 0, scale: 0.97 }}
@@ -221,6 +236,22 @@ function Card({ meta, rect, onClose, cardRef }: { meta: HoverMeta; rect: DOMRect
           )}
         </div>
       </div>
+
+      {tagStore.tags.length > 0 && (
+        <div className="mt-2.5 flex flex-wrap items-center gap-1">
+          <span className="text-[9px] font-bold uppercase tracking-wide text-fg-4 mr-0.5">Tags</span>
+          {tagStore.tags.map((t) => {
+            const has = (tagStore.assign[meta.id] ?? []).includes(t.id);
+            return (
+              <button key={t.id} onClick={() => bulkSetTag([meta.id], t.id, !has)} title={has ? `Remove ${t.name}` : `Tag as ${t.name}`}
+                className="px-2 py-0.5 rounded text-[10px] border font-semibold flex items-center gap-1 transition-colors"
+                style={has ? { backgroundColor: `${t.color}26`, color: t.color, borderColor: `${t.color}66` } : { color: t.color, borderColor: 'var(--color-line)' }}>
+                <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ backgroundColor: t.color }} />{t.name}
+              </button>
+            );
+          })}
+        </div>
+      )}
 
       {desc && (
         <div className="mt-2.5 text-[11px] leading-relaxed flex flex-col gap-0.5">

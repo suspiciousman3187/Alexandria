@@ -34,7 +34,7 @@ export default function KeyItemsView() {
   useNowTick();
   const [q, setQ] = useSticky('ki.q', '');
   const [diffOnly, setDiffOnly] = useSticky('ki.diff', false);
-  const [starOnly, setStarOnly] = useSticky('ki.staronly', false);
+  const [starOnly, setStarOnly] = useStickyPersisted('ki.staronly', false);
   const [starred, setStarred] = useStickyPersisted<number[]>('ki.starred', []);
   const starSet = useMemo(() => new Set(starred), [starred]);
   const toggleStar = (id: number) => setStarred((p) => (p.includes(id) ? p.filter((x) => x !== id) : [...p, id]));

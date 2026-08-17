@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, type ReactNode } from 'react';
+import { useState, useEffect, useLayoutEffect, useCallback, type ReactNode, type CSSProperties, type RefObject } from 'react';
 import { createPortal } from 'react-dom';
 import { AnimatePresence, motion } from 'motion/react';
 
@@ -83,8 +83,48 @@ export function Collapse({ open, children, className }: { open: boolean; childre
 }
 
 export function Popover({
-  open, children, style, className = '', up = false,
-}: { open: boolean; children: ReactNode; style?: React.CSSProperties; className?: string; up?: boolean }) {
+  open, children, style, className = '', up = false, anchor,
+}: { open: boolean; children: ReactNode; style?: CSSProperties; className?: string; up?: boolean; anchor?: RefObject<HTMLElement | null> }) {
+  const [pos, setPos] = useState<{ left: number; width: number; top?: number; bottom?: number } | null>(null);
+  useLayoutEffect(() => {
+    if (!anchor || !open) return;
+    const measure = () => {
+      const el = anchor.current; if (!el) return;
+      const r = el.getBoundingClientRect();
+      const below = window.innerHeight - r.bottom;
+      const flip = below < 248 && r.top > below; // no room under the input -> open upward
+      setPos({ left: r.left, width: r.width, top: flip ? undefined : r.bottom + 4, bottom: flip ? window.innerHeight - r.top + 4 : undefined });
+    };
+    measure();
+    window.addEventListener('scroll', measure, true);
+    window.addEventListener('resize', measure);
+    return () => { window.removeEventListener('scroll', measure, true); window.removeEventListener('resize', measure); };
+  }, [anchor, open]);
+
+  // Anchored mode: render in a <body> portal fixed to the input, so no scroll
+  // container or sibling panel can ever clip or cover the list on any window size.
+  // This is the standard way to build a typeahead/dropdown here; pass `anchor`.
+  if (anchor) {
+    const flipUp = pos != null && pos.bottom != null;
+    return createPortal(
+      <AnimatePresence>
+        {open && pos && (
+          <motion.div
+            className={className}
+            style={{ position: 'fixed', left: pos.left, width: pos.width, top: pos.top, bottom: pos.bottom, zIndex: 1000, ...style }}
+            initial={{ opacity: 0, y: flipUp ? 4 : -4, scale: 0.97 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: flipUp ? 4 : -4, scale: 0.97 }}
+            transition={{ duration: 0.14, ease: EASE_OUT }}
+          >
+            {children}
+          </motion.div>
+        )}
+      </AnimatePresence>,
+      document.body,
+    );
+  }
+
   return (
     <AnimatePresence>
       {open && (

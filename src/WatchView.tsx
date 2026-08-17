@@ -6,6 +6,7 @@ import { useItemHover } from './ItemTooltip';
 import { Stepper, Toggle, SearchInput } from './ui';
 import { Modal, Collapse } from './overlay';
 import { useAnon } from './anonymize';
+import { itemNameMatches } from './itemNames';
 
 const fmt = (v: number) => v.toLocaleString();
 type CatItem = { id: number; n: string };
@@ -62,7 +63,7 @@ function WatchPicker({ catalog, chars, initialTargets, assets, onAdd, onRemove, 
 
   const shown = useMemo(() => {
     const s = q.trim().toLowerCase();
-    return catalog.filter((it) => it.n.toLowerCase().includes(s)).slice(0, 200);
+    return catalog.filter((it) => itemNameMatches(it.id, it.n, s)).slice(0, 200);
   }, [catalog, q]);
 
   return (

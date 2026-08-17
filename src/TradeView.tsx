@@ -6,6 +6,7 @@ import { Group, Row, RowStacked, CharacterSelect, SectionTabs, Stepper } from '.
 import { Crossfade } from './overlay';
 import { ItemHoverTarget } from './ItemTooltip';
 import { useSticky, useStickyChar } from './sticky';
+import { itemNameMatches } from './itemNames';
 
 type Alias = { label: string; item: string; count: number; times?: number };
 
@@ -20,7 +21,7 @@ function ItemSearch({ items, value, onChange, onPick, count, onCount }: { items:
   const matches = useMemo(() => {
     const s = value.trim().toLowerCase();
     if (!s) return [];
-    return items.filter((it) => it.n.toLowerCase().includes(s)).slice(0, 8);
+    return items.filter((it) => itemNameMatches(it.id, it.n, s)).slice(0, 8);
   }, [value, items]);
   return (
     <div>
@@ -146,7 +147,7 @@ function PcPanel({ active, items }: { active?: KnownChar; items: InvItem[] }) {
     setList([...list, { item: n, count: c }]);
     setQ(''); setCount(1);
   };
-  const offer = () => { if (active?.conn != null && list.length) tradePcOffer(active.conn, { target: target.trim() || undefined, items: list }); };
+  const offer = () => { if (active?.conn != null && !active.mog && list.length) tradePcOffer(active.conn, { target: target.trim() || undefined, items: list }); };
 
   return (
     <>
@@ -178,10 +179,10 @@ function PcPanel({ active, items }: { active?: KnownChar; items: InvItem[] }) {
 
       <button
         onClick={offer}
-        disabled={list.length === 0 || active?.conn == null}
+        disabled={list.length === 0 || active?.conn == null || !!active?.mog}
         className="w-full px-3 py-2.5 text-[12px] font-bold rounded-md bg-accent text-on-accent enabled:hover:bg-accent-hover disabled:opacity-40 transition-colors"
       >
-        Offer Trade
+        {active?.mog ? 'Offer Trade · Leave Mog House First' : 'Offer Trade'}
       </button>
       <p className="mt-2 text-[10px] text-fg-4 leading-snug">Opens the trade window, adds the items, and offers. Confirm the final accept in-game once your partner offers back.</p>
     </>
@@ -196,6 +197,13 @@ export default function TradeView() {
   useEffect(() => { if (active && active.name !== name) setName(active.name); }, [active, name]);
   const [tab, setTab] = useSticky<'pc' | 'npc'>('trade.tab', 'pc');
   const items = useMemo(() => uniqueItems(active), [active]);
+  // Player trade: only items actually in inventory (bag 0) and not Ex/No-Trade (0x02).
+  const pcItems = useMemo(() => {
+    const inv0 = active?.inv?.find((b) => b.id === 0);
+    const seen = new Map<number, InvItem>();
+    for (const it of inv0?.items ?? []) if (it.id && !(it.f && it.f & 0x02) && !seen.has(it.id)) seen.set(it.id, it);
+    return [...seen.values()].sort((a, b) => a.n.localeCompare(b.n));
+  }, [active]);
 
   if (online.length === 0) {
     return (
@@ -216,7 +224,7 @@ export default function TradeView() {
       </div>
       <div className="flex-1 min-h-0 overflow-y-auto p-4">
         <div className="max-w-2xl mx-auto">
-          <Crossfade id={tab}>{tab === 'pc' ? <PcPanel active={active} items={items} /> : <NpcPanel active={active} items={items} />}</Crossfade>
+          <Crossfade id={tab}>{tab === 'pc' ? <PcPanel active={active} items={pcItems} /> : <NpcPanel active={active} items={items} />}</Crossfade>
         </div>
       </div>
     </div>

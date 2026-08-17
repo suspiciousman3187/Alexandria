@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from 'react';
+import { itemStack } from './itemNames';
 
 export type CartEntry = {
   key: string;
@@ -19,7 +20,20 @@ let cart: CartEntry[] = [];
 const subs = new Set<() => void>();
 const notify = () => subs.forEach((s) => s());
 
-export function addToCart(e: CartEntry) {
+export function singleSlotCap(id: number): number | null {
+  const stack = itemStack(id);
+  return stack > 1 ? stack : null;
+}
+
+export function singleSlotQueued(id: number, exceptKey?: string): number {
+  return cart
+    .filter((x) => x.id === id && x.maxQty <= 1 && x.key !== exceptKey)
+    .reduce((s, x) => s + x.qty, 0);
+}
+
+export function addToCart(e: CartEntry): boolean {
+  const cap = e.maxQty <= 1 ? singleSlotCap(e.id) : null;
+  if (cap != null && singleSlotQueued(e.id, e.key) + e.qty > cap) return false;
   const i = cart.findIndex((x) => x.key === e.key);
   if (i >= 0) {
     const next = [...cart];
@@ -29,6 +43,7 @@ export function addToCart(e: CartEntry) {
     cart = [...cart, e];
   }
   notify();
+  return true;
 }
 export function setCartQty(key: string, qty: number) {
   cart = cart.map((x) => (x.key === key ? { ...x, qty: Math.max(1, Math.min(x.maxQty, qty)) } : x));

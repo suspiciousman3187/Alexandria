@@ -2,15 +2,20 @@ import { useSyncExternalStore } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import {
   appDataPath, inTauri, getKnownCharacters, axEcho, onAxCommand, stackBag,
-  ahMenu, ahBuy, ahSell, ahClearSold, bzApply, lotAll, passAll, passDone, dropOne,
-  broadcastDropRules, broadcastPoolRules, runOrganize, storeRequest, NOMAD_BAGS, inNomadZone,
-  type KnownChar, type PoolRules, type OrganizeRules,
+  ahMenu, ahBuy, ahSell, ahClearSold, fetchMarket, bzApply, lotAll, passAll, passDone, dropOne, useItem,
+  broadcastDropRules, runOrganize, storeRequest, NOMAD_BAGS, inNomadZone,
+  type KnownChar, type OrganizeRules,
 } from './bridge';
-import { resolveItemName } from './itemNames';
+import { resolveItemName, itemNameMatches } from './itemNames';
+import { openUseAll } from './useAllHost';
+import { isPoolOverlay, isGearsetWindow } from './overlayWindow';
+import { addRuleToChars, removeRuleFromChar } from './poolRules';
+import { findEntriesFor, getFindCache, type FindEntry } from './findCache';
 import { MOG_ONLY_BAGS } from './bagConstants';
 import { runStep, runSequence, type Step } from './seq';
 import { runConsolidate } from './consolidate';
-import { getDrop, setDrop } from './drop';
+import { getDrop, setDrop, dropItemEverywhere } from './drop';
+import { getSettings } from './settings';
 import { addWatchItem, removeWatchItem } from './watch';
 
 export type Alias = { name: string; script: string };
@@ -50,9 +55,15 @@ function fresh(name: string): KnownChar | undefined {
 function onlineFleet(): KnownChar[] {
   return getKnownCharacters().filter((k) => k.online && k.conn != null);
 }
+const unquote = (s: string): string => s.trim().replace(/^['"]+/, '').replace(/['"]+$/, '').trim();
+
 function searchInv(c: KnownChar | undefined, lc: string): { id: number; n: string } | null {
-  for (const b of c?.inv ?? []) for (const it of b.items) if (it.n.toLowerCase() === lc) return { id: it.id, n: it.n };
-  for (const b of c?.inv ?? []) for (const it of b.items) if (it.n.toLowerCase().includes(lc)) return { id: it.id, n: it.n };
+  const items: { id: number; n: string; ln: string }[] = [];
+  for (const b of c?.inv ?? []) for (const it of b.items) items.push({ id: it.id, n: it.n, ln: it.n.toLowerCase() });
+  for (const it of items) if (it.ln === lc) return { id: it.id, n: it.n };
+  for (const it of items) if (it.ln.includes(lc)) return { id: it.id, n: it.n };
+  const toks = lc.split(/[^a-z0-9]+/).filter(Boolean);
+  if (toks.length > 1) for (const it of items) if (toks.every((t) => it.ln.includes(t))) return { id: it.id, n: it.n };
   return null;
 }
 function globToRe(glob: string): RegExp | null {
@@ -66,7 +77,7 @@ function matchInvAll(c: KnownChar | undefined, re: RegExp): { id: number; n: str
   return [...seen].map(([id, n]) => ({ id, n }));
 }
 function resolveItem(char: KnownChar | undefined, name: string): { id: number; n: string } | null {
-  const lc = name.trim().toLowerCase();
+  const lc = unquote(name).toLowerCase();
   if (!lc) return null;
   const own = searchInv(char, lc);
   if (own) return own;
@@ -100,6 +111,19 @@ function bagsHolding(char: KnownChar | undefined, id: number, onlyBag?: number):
   return out;
 }
 
+// How many of an item the character's main inventory (bag 0) can still hold: free slots x stack
+// size, plus room left in existing partial stacks. Lets "get all" pull as much as fits instead of a
+// fixed cap.
+function invCapacityFor(char: KnownChar | undefined, id: number): number {
+  const inv = char?.inv?.find((b) => b.id === 0);
+  if (!inv) return ALL;
+  let stack = 1;
+  for (const b of char?.inv ?? []) { const it = b.items.find((x) => x.id === id && x.ms); if (it?.ms) { stack = it.ms; break; } }
+  let partial = 0;
+  for (const it of inv.items) if (it.id === id) partial += Math.max(0, stack - it.c);
+  return Math.max(0, inv.max - inv.used) * stack + partial;
+}
+
 function popCount(toks: string[], forceAll: boolean, min = 2): number {
   if (forceAll) return ALL;
   if (toks.length >= min) {
@@ -126,6 +150,7 @@ async function moveAcross(ctx: Ctx, it: { id: number; n: string }, sources: { ba
 async function doGet(ctx: Ctx, a: string[], forceAll: boolean): Promise<string> {
   const toks = [...a];
   const count = popCount(toks, forceAll);
+  const pullAll = count === ALL;  // "get all"/`//gets`: pull up to inventory capacity, not a fixed cap
   let bag: number | null = null;
   if (toks.length > 1) { const b = bagId(toks[toks.length - 1]); if (b != null) { bag = b; toks.pop(); } }
   const name = toks.join(' ').trim();
@@ -140,7 +165,7 @@ async function doGet(ctx: Ctx, a: string[], forceAll: boolean): Promise<string> 
       const all = bagsHolding(ctx.char, m.id, bag ?? undefined).filter((s) => s.bag !== 0);
       const src = all.filter((s) => bagReach(ctx.char, s.bag));
       if (!src.length) { if (all.length) mogOnly = true; continue; }
-      const n = await moveAcross(ctx, m, src, 0, count);
+      const n = await moveAcross(ctx, m, src, 0, pullAll ? invCapacityFor(ctx.char, m.id) : count);
       if (n > 0) got.push(`${n}x ${m.n}`);
     }
     if (!got.length) throw new Error(mogOnly ? `${name}: needs a Mog House or Nomad Moogle to reach` : `${name}: nothing to get (already in inventory?)`);
@@ -152,7 +177,7 @@ async function doGet(ctx: Ctx, a: string[], forceAll: boolean): Promise<string> 
   if (!sources.length) throw new Error(`${it.n} not in ${bag != null ? 'that bag' : 'any bag'}`);
   const reach = sources.filter((s) => bagReach(ctx.char, s.bag));
   if (!reach.length) throw new Error(`${it.n} needs a Mog House or Nomad Moogle to reach`);
-  const moved = await moveAcross(ctx, it, reach, 0, count);
+  const moved = await moveAcross(ctx, it, reach, 0, pullAll ? invCapacityFor(ctx.char, it.id) : count);
   return `got ${moved}x ${it.n}`;
 }
 
@@ -163,6 +188,20 @@ async function doPut(ctx: Ctx, a: string[], forceAll: boolean): Promise<string> 
   const name = toks.join(' ').trim();
   if (bag == null || !name) throw new Error('put <item> <bag> [count]');
   if (!bagReach(ctx.char, bag)) throw new Error('that bag needs a Mog House or Nomad Moogle');
+  const re = globToRe(name);
+  if (re) {
+    const matches = matchInvAll(ctx.char, re);
+    if (!matches.length) throw new Error(`no match: ${name}`);
+    const put: string[] = [];
+    for (const m of matches) {
+      const inInv = bagsHolding(ctx.char, m.id, 0);
+      if (!inInv.length) continue;
+      const n = await moveAcross(ctx, m, inInv, bag, count);
+      if (n > 0) put.push(`${n}x ${m.n}`);
+    }
+    if (!put.length) throw new Error(`${name}: nothing in inventory to put`);
+    return `put ${put.join(', ')}`;
+  }
   const it = searchInv(ctx.char, name.toLowerCase());
   if (!it) throw new Error(`no item: ${name}`);
   const inInv = bagsHolding(ctx.char, it.id, 0);
@@ -181,6 +220,23 @@ async function doMove(ctx: Ctx, a: string[], forceAll: boolean): Promise<string>
   if (toks.length > 1) { const b = bagId(toks[toks.length - 1]); if (b != null) { from = b; toks.pop(); } }
   const name = toks.join(' ').trim();
   if (!name) throw new Error('move <item> [from] <to> [count]');
+  const re = globToRe(name);
+  if (re) {
+    const matches = matchInvAll(ctx.char, re);
+    if (!matches.length) throw new Error(`no match: ${name}`);
+    const movedList: string[] = [];
+    let mogOnly = false;
+    for (const m of matches) {
+      const all = from != null ? bagsHolding(ctx.char, m.id, from) : bagsHolding(ctx.char, m.id).filter((s) => s.bag !== to);
+      if (!all.length) continue;
+      const src = all.filter((s) => bagReach(ctx.char, s.bag));
+      if (!src.length) { mogOnly = true; continue; }
+      const n = await moveAcross(ctx, m, src, to, count === 1 ? ALL : count);
+      if (n > 0) movedList.push(`${n}x ${m.n}`);
+    }
+    if (!movedList.length) throw new Error(mogOnly ? `${name}: needs a Mog House or Nomad Moogle to reach` : `${name}: nothing to move`);
+    return `moved ${movedList.join(', ')}`;
+  }
   const it = searchInv(ctx.char, name.toLowerCase());
   if (!it) throw new Error(`no item: ${name}`);
   const all = from != null ? bagsHolding(ctx.char, it.id, from) : bagsHolding(ctx.char, it.id).filter((s) => s.bag !== to);
@@ -225,16 +281,29 @@ function doFind(ctx: Ctx, a: string[], selfDefault: boolean): string {
   if (!q && include.size === 0) return 'find <item> [:char] [!char]';
   const lines: string[] = [];
   let total = 0;
-  for (const c of getKnownCharacters()) {
-    const ln = c.name.toLowerCase();
+  const online = getKnownCharacters().filter((c) => c.online && c.conn != null);
+  const onlineNames = new Set(online.map((c) => c.name.toLowerCase()));
+  const searched: { name: string; entries: FindEntry[] }[] = online.map((c) => ({ name: c.name, entries: findEntriesFor(c) }));
+  for (const [name, entries] of Object.entries(getFindCache())) {
+    if (!onlineNames.has(name.toLowerCase())) searched.push({ name, entries });
+  }
+  for (const { name, entries } of searched) {
+    const ln = name.toLowerCase();
     if (include.size && !include.has(ln)) continue;
     if (exclude.has(ln)) continue;
-    for (const b of c.inv ?? []) {
-      for (const it of b.items) {
-        if (q && !it.n.toLowerCase().includes(q)) continue;
-        total += it.c;
-        lines.push(`${c.name}/${b.b}: ${it.n}${it.c > 1 ? ` (${it.c})` : ''}`);
-      }
+    // Merge the same item held in the same bag into one line: a stack split across
+    // several slots would otherwise print once per slot (findAll sums them). Key on
+    // name too so key items (all id 0) stay distinct.
+    const merged = new Map<string, { loc: string; id: number; n: string; c: number }>();
+    for (const it of entries) {
+      if (q && !itemNameMatches(it.id, it.n, q)) continue;
+      const k = `${it.loc}|${it.id}|${it.n}`;
+      const m = merged.get(k);
+      if (m) m.c += it.c; else merged.set(k, { loc: it.loc, id: it.id, n: it.n, c: it.c });
+    }
+    for (const m of merged.values()) {
+      if (m.id > 0) total += m.c;
+      lines.push(`${name}/${m.loc}: ${m.n}${m.c > 1 ? ` (${m.c})` : ''}`);
     }
   }
   for (const l of lines) axEcho(ctx.conn, l);
@@ -275,7 +344,47 @@ async function doAh(ctx: Ctx, a: string[]): Promise<string> {
     ahSell(ctx.conn, it.id, single, price, 1);
     return `listing ${it.n} (${kind}) at ${price}`;
   }
-  throw new Error('ah [buy|sell|clear]');
+  return doAhPrice(ctx, a);
+}
+
+function saleAge(ts?: number): string {
+  if (!ts) return '';
+  const sec = Math.max(0, Math.floor(Date.now() / 1000) - ts);
+  if (sec < 90) return 'just now';
+  const m = Math.floor(sec / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(sec / 3600);
+  if (h < 72) return `${h}h ago`;
+  return `${Math.floor(sec / 86400)}d ago`;
+}
+
+async function doAhPrice(ctx: Ctx, a: string[]): Promise<string> {
+  let stack = false;
+  const rest = a.filter((t) => {
+    const lc = t.toLowerCase();
+    if (lc === '-s' || lc === '--stack' || lc === '-stack') { stack = true; return false; }
+    return true;
+  });
+  const name = unquote(rest.join(' '));
+  if (!name) throw new Error('ah [-s] <item>  |  ah [buy|sell|clear]');
+  const it = resolveItemName(name);
+  if (!it) throw new Error(`unknown item: ${name}`);
+  const kind = stack ? 'stack' : 'single';
+  const m = await fetchMarket(it.id, stack, ctx.char.server);
+  const parts: string[] = [];
+  parts.push(m.median ? `{price|${m.median}}g median` : 'no recent sales');
+  if (m.listedTotal != null) parts.push(`{stock|${m.listedTotal}} listed`);
+  if (m.rate) parts.push(`{rate|${m.rate}}/day`);
+  const srv = ctx.char.server ? ` @ ${ctx.char.server}` : '';
+  axEcho(ctx.conn, `${it.n} ${kind}${srv}: ${parts.join(', ')}`);
+  // Sort by the same timestamp that renders the "Xh ago" label so the shown ages are
+  // always newest-first (and we pick the true 5 most recent, not just the first 5).
+  const recent = [...m.sales].sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0)).slice(0, 5);
+  for (const s of recent) {
+    axEcho(ctx.conn, `  {price|${s.price.toLocaleString()}}g  ${saleAge(s.ts) || s.date}`);
+  }
+  if (!recent.length) axEcho(ctx.conn, '  no recent sales on record');
+  return '';
 }
 
 async function doBazaar(ctx: Ctx, a: string[]): Promise<string> {
@@ -302,7 +411,7 @@ function invSlots(char: KnownChar | undefined, id?: number): { slot: number; id:
 async function doDrop(ctx: Ctx, a: string[]): Promise<string> {
   const op = (a[0] ?? '').toLowerCase();
   if (op === 'add' || op === 'remove') {
-    const name = a.slice(1).join(' ').trim();
+    const name = unquote(a.slice(1).join(' '));
     if (!name) throw new Error('drop <add|remove> <item>');
     const cfg = getDrop();
     const has = cfg.drop.some((x) => x.toLowerCase() === name.toLowerCase());
@@ -318,7 +427,7 @@ async function doDrop(ctx: Ctx, a: string[]): Promise<string> {
     for (const s of all) dropOne(ctx.conn, s.slot, s.id);
     return `dropping ${all.length} inventory item(s)`;
   }
-  const name = a.join(' ').trim();
+  const name = unquote(a.join(' '));
   if (!name) throw new Error('drop <item> | drop <add|remove> <item> | drop all');
   const it = searchInv(ctx.char, name.toLowerCase());
   if (!it) throw new Error(`no item: ${name}`);
@@ -328,13 +437,25 @@ async function doDrop(ctx: Ctx, a: string[]): Promise<string> {
   return `dropped ${slots.length}x ${it.n}`;
 }
 
+// Like `drop <item>` but fleet-wide: drops every reachable copy on every connected
+// character. Shares dropItemEverywhere with the "Drop All On Party" action.
+async function doDropAll(ctx: Ctx, a: string[]): Promise<string> {
+  const name = unquote(a.join(' '));
+  if (!name) throw new Error('dropall <item>');
+  const it = resolveItem(undefined, name);
+  if (!it) throw new Error(`no item: ${name}`);
+  const { items, chars } = dropItemEverywhere(it.id, getSettings().experimentalFeatures);
+  if (items === 0) throw new Error(`no ${it.n} on any connected character`);
+  return `dropping ${items}x ${it.n} across ${chars} character${chars === 1 ? '' : 's'}`;
+}
+
 async function doPoolRule(ctx: Ctx, kind: 'lot' | 'pass', a: string[]): Promise<string> {
   const op = (a[0] ?? '').toLowerCase();
   if (op === 'all') {
     if (kind === 'lot') lotAll(ctx.conn); else passAll(ctx.conn);
     return `${kind === 'lot' ? 'lotting' : 'passing'} all pool items`;
   }
-  const name = a.slice(1).join(' ').trim();
+  const name = unquote(a.slice(1).join(' '));
   if (!name || (op !== 'add' && op !== 'remove')) throw new Error(`${kind} <add|remove|all> <item>`);
   let entries: string[];
   if (name.toLowerCase() === 'pool') {
@@ -343,15 +464,10 @@ async function doPoolRule(ctx: Ctx, kind: 'lot' | 'pass', a: string[]): Promise<
   } else {
     entries = [name];
   }
-  const rules = (await readJson<PoolRules>('pool_rules.json')) ?? { ...POOL_DEFAULT };
-  let cur = rules[kind];
   for (const e of entries) {
-    const has = cur.some((x) => x.toLowerCase() === e.toLowerCase());
-    cur = op === 'add' ? (has ? cur : [...cur, e]) : cur.filter((x) => x.toLowerCase() !== e.toLowerCase());
+    if (op === 'add') addRuleToChars([ctx.charName], kind, e);
+    else removeRuleFromChar(ctx.charName, kind, e);
   }
-  rules[kind] = cur;
-  await writeJson('pool_rules.json', rules);
-  void broadcastPoolRules(rules);
   return `${kind}${op === 'add' ? '+' : '-'} ${entries.length > 1 ? `${entries.length} items` : name}`;
 }
 
@@ -360,6 +476,26 @@ function splitCount(tokens: string[]): { name: string; count: number } {
     return { name: tokens.slice(0, -1).join(' '), count: Math.max(1, Number(tokens[tokens.length - 1])) };
   }
   return { name: tokens.join(' '), count: 1 };
+}
+
+// Bags the addon uses/pulls from when using an item (inventory + satchel/sack/case).
+const USE_BAGS = new Set([0, 3, 5, 6, 7]); // + Temporary (3): usable in place via /item
+function useableTotal(char: KnownChar, id: number): number {
+  let n = 0;
+  for (const b of char.inv ?? []) if (USE_BAGS.has(b.id)) for (const it of b.items) if (it.id === id) n += it.c;
+  return n;
+}
+
+// Drive the addon's native use loop (the same one behind the UI's Use One / Use Amount /
+// Use All) and block until it finishes, so chained `//ax use` calls run in order.
+async function runCliUse(ctx: Ctx, id: number, all: boolean, count: number): Promise<void> {
+  useItem(ctx.conn, id, all, 0, undefined, all ? undefined : (count > 1 ? count : undefined));
+  await new Promise((r) => setTimeout(r, 350)); // let the addon start the loop
+  const deadline = Date.now() + 600000;
+  while (Date.now() < deadline) {
+    if (fresh(ctx.charName)?.useProg?.active !== true) return;
+    await new Promise((r) => setTimeout(r, 300));
+  }
 }
 
 async function readJson<T>(rel: string): Promise<T | null> {
@@ -371,22 +507,32 @@ async function writeJson(rel: string, data: unknown) {
   try { await invoke('write_text_file', { path: await appDataPath(rel), contents: JSON.stringify(data) }); } catch { /* ignore */ }
 }
 
-const POOL_DEFAULT: PoolRules = { lot: [], pass: [], drop: [] };
 const ORG_STORAGE = [5, 6, 7, 1, 9, 2, 4];
-const ORG_DEFAULT: OrganizeRules = { alwaysBring: [], keep: [], keepSingle: [], storableBags: [5, 6, 7], storeUsable: true, reserve: 3 };
+const ORG_DEFAULT: OrganizeRules = { alwaysBring: [], keep: [], keepSingle: [], keepQty: [], storableBags: [5, 6, 7], storeUsable: true, reserve: 3, strictInventory: false };
 
 type Ctx = { conn: number; charName: string; target?: string; char: KnownChar };
 type Verb = { usage: string; run: (ctx: Ctx, args: string[]) => Promise<string> };
 
 const VERBS: Record<string, Verb> = {
   use: {
-    usage: 'use <item> [count]',
+    usage: 'use <item> [count|all]',
     run: async (ctx, a) => {
+      // Trailing "all" -> use ONE on every connected character (Use One Everywhere). A trailing
+      // number uses that many on the caller; otherwise one on the caller.
+      const everyChar = a.length > 1 && (a[a.length - 1] ?? '').toLowerCase() === 'all';
+      if (everyChar) {
+        const it = resolveItem(ctx.char, a.slice(0, -1).join(' '));
+        if (!it) throw new Error(`no item: ${a.slice(0, -1).join(' ')}`);
+        openUseAll(it.id, it.n, false);
+        return `using one ${it.n} on every character`;
+      }
       const { name, count } = splitCount(a);
       const it = resolveItem(ctx.char, name);
       if (!it) throw new Error(`no item: ${name}`);
-      await runStep(ctx.char, { type: 'use', item: it.n, count });
-      return `used ${count}x ${it.n}`;
+      const n = Math.min(count, useableTotal(ctx.char, it.id));
+      if (n <= 0) throw new Error(`no ${it.n} to use`);
+      await runCliUse(ctx, it.id, false, n);
+      return `used ${n}x ${it.n}`;
     },
   },
   move: { usage: 'move <item> [from] <to> [count]', run: (ctx, a) => doMove(ctx, a, false) },
@@ -399,7 +545,7 @@ const VERBS: Record<string, Verb> = {
   stack: { usage: 'stack', run: async (ctx) => { stackBag(ctx.conn); return 'stacking all bags'; } },
   find: { usage: 'find <item> [:char] [!char]', run: async (ctx, a) => doFind(ctx, a, true) },
   findall: { usage: 'findall <item> [:char] [!char]', run: async (ctx, a) => doFind(ctx, a, false) },
-  ah: { usage: 'ah [buy|sell|clear] <item> <stack|single> <price>', run: (ctx, a) => doAh(ctx, a) },
+  ah: { usage: 'ah [-s] <item> (price check) | ah buy|sell <item> <stack|single> <price> | ah clear', run: (ctx, a) => doAh(ctx, a) },
   bazaar: { usage: 'bazaar <item> <price>', run: (ctx, a) => doBazaar(ctx, a) },
   buy: {
     usage: 'buy <item> <count>',
@@ -453,6 +599,7 @@ const VERBS: Record<string, Verb> = {
   organize: { usage: 'organize', run: async (ctx) => { await doOrganize(ctx, false); return `organizing ${ctx.charName}`; } },
   'light-organize': { usage: 'light-organize', run: async (ctx) => { await doOrganize(ctx, true); return `light organizing ${ctx.charName}`; } },
   drop: { usage: 'drop <item> | drop <add|remove> <item> | drop all confirm', run: (ctx, a) => doDrop(ctx, a) },
+  dropall: { usage: 'dropall <item> (drops it on every connected character)', run: (ctx, a) => doDropAll(ctx, a) },
   lot: { usage: 'lot <add|remove|all> <item>', run: (ctx, a) => doPoolRule(ctx, 'lot', a) },
   pass: { usage: 'pass <add|remove|all> <item>', run: (ctx, a) => doPoolRule(ctx, 'pass', a) },
   lotall: { usage: 'lotall', run: async (ctx) => { lotAll(ctx.conn); return 'lotting all pool items'; } },
@@ -505,7 +652,7 @@ function expandAlias(script: string, me: string, target: string | undefined, res
 async function runVerb(ctx: Ctx, toks: string[], echo: (t: string) => void) {
   const v = VERBS[(toks[0] ?? '').toLowerCase()];
   if (!v) { echo(`unknown: ${toks[0]} (//ax help)`); return; }
-  try { echo(await v.run(ctx, toks.slice(1))); }
+  try { const r = await v.run(ctx, toks.slice(1)); if (r) echo(r); }
   catch (e) { echo('x ' + (e instanceof Error ? e.message : String(e))); }
 }
 
@@ -551,6 +698,7 @@ export const VERB_FORMS: { verb: string; params: Param[] }[] = [
   { verb: 'organize', params: [] },
   { verb: 'light-organize', params: [] },
   { verb: 'drop', params: [{ kind: 'op', label: 'Action' }, { kind: 'item', label: 'Item' }] },
+  { verb: 'dropall', params: [{ kind: 'item', label: 'Item' }] },
   { verb: 'lot', params: [{ kind: 'op', label: 'Action' }, { kind: 'item', label: 'Item' }] },
   { verb: 'pass', params: [{ kind: 'op', label: 'Action' }, { kind: 'item', label: 'Item' }] },
   { verb: 'lotall', params: [] },
@@ -559,4 +707,4 @@ export const VERB_FORMS: { verb: string; params: Param[] }[] = [
   { verb: 'watch', params: [{ kind: 'op', label: 'Action' }, { kind: 'item', label: 'Item' }, { kind: 'threshold', label: 'Threshold', optional: true }] },
 ];
 
-onAxCommand(runAxCommand);
+if (!isPoolOverlay() && !isGearsetWindow()) onAxCommand(runAxCommand);

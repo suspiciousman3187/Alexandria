@@ -1,12 +1,15 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { useKnownCharacters, useAvailableIcons } from './bridge';
 import { useShopSell, setShopSell } from './shop';
-import { useItemNames, type ItemName } from './itemNames';
+import { useItemNames, itemNameMatches, itemStack, type ItemName } from './itemNames';
 import { IconInner } from './atlasIcon';
+import { Popover } from './overlay';
 import { useSticky } from './sticky';
 import { Group, Row, Toggle, SearchInput } from './ui';
 import { useSettings } from './settings';
+import { useItemValues } from './priceStore';
+import { openAhDetail } from './ahNav';
 
 function SmallIcon({ id, n, assets, iconSet }: { id?: number; n: string; assets?: string; iconSet: Set<number> }) {
   return (
@@ -26,6 +29,7 @@ export default function SellView() {
   const idByName = useMemo(() => new Map(allItems.map((it) => [it.n.toLowerCase(), it.id])), [allItems]);
 
   const [add, setAdd] = useState('');
+  const addWrap = useRef<HTMLDivElement | null>(null);
   const [filter, setFilter] = useSticky('sell.filter', '');
 
   const set = (items: string[], auto: boolean, anywhere: boolean = sell.anywhere) => setShopSell({ items, auto, anywhere });
@@ -42,7 +46,7 @@ export default function SellView() {
     if (!q) return [];
     const out: ItemName[] = [];
     for (const it of allItems) {
-      if (it.n.toLowerCase().includes(q) && !has(it.n)) { out.push(it); if (out.length >= 8) break; }
+      if (itemNameMatches(it.id, it.n, q) && !has(it.n)) { out.push(it); if (out.length >= 8) break; }
     }
     return out;
   }, [add, allItems, sell.items]);
@@ -51,6 +55,27 @@ export default function SellView() {
     const q = filter.trim().toLowerCase();
     return q ? sell.items.filter((n) => n.toLowerCase().includes(q)) : sell.items;
   }, [sell.items, filter]);
+
+  const world = useSettings().ahServer || known.find((c) => c.online)?.server;
+  const held = useMemo(() => {
+    const m = new Map<number, { id: number; n: string; count: number }>();
+    for (const c of known) {
+      if (!c.online) continue;
+      for (const b of c.inv ?? []) for (const it of b.items) {
+        if (!it.id || ((it.f ?? 0) & 0x0A) || (it.aug && it.aug.length > 0)) continue;
+        const e = m.get(it.id);
+        if (e) e.count += it.c; else m.set(it.id, { id: it.id, n: it.n, count: it.c });
+      }
+    }
+    return [...m.values()];
+  }, [known]);
+  const heldIds = useMemo(() => held.map((h) => h.id), [held]);
+  const sellValues = useItemValues(world, heldIds);
+  const ranked = useMemo(() => held
+    .map((h) => { const v = sellValues.get(h.id); return { ...h, median: v?.median ?? 0, stock: v?.stock }; })
+    .filter((h) => h.median > 0)
+    .sort((a, b) => (b.median * b.count) - (a.median * a.count))
+    .slice(0, 25), [held, sellValues]);
 
   return (
     <div className="h-full flex flex-col">
@@ -72,9 +97,26 @@ export default function SellView() {
           </Row>
         </Group>
 
+        {ranked.length > 0 && (
+          <Group title="Worth Selling">
+            <div className="divide-y divide-line">
+              {ranked.map((h) => (
+                <button key={h.id} onClick={() => openAhDetail({ id: h.id, n: h.n, st: itemStack(h.id), back: 'selllist' })} className="le-tap w-full flex items-center gap-2.5 px-3 py-2 text-left hover:bg-field transition-colors">
+                  <SmallIcon id={h.id} n={h.n} assets={assetsAny} iconSet={iconSet} />
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-[12px] text-fg-2">{h.n}{h.count > 1 ? ` ×${h.count}` : ''}</div>
+                    <div className="text-[10px] text-fg-4 tabular-nums">{h.median.toLocaleString()} G ea{h.stock != null ? ` · ${h.stock} listed` : ''}</div>
+                  </div>
+                  <span className="shrink-0 text-[13px] font-bold text-amber-300 tabular-nums">{(h.median * h.count).toLocaleString()}<span className="text-[9px] text-fg-4 ml-0.5">G</span></span>
+                </button>
+              ))}
+            </div>
+          </Group>
+        )}
+
         <Group title="Sell List" right={<span className="text-[11px] text-fg-4 tabular-nums">{filter.trim() ? `${shown.length}/${sell.items.length}` : sell.items.length}</span>}>
           <div className="px-2.5 pt-2.5 pb-1.5 flex flex-col gap-2">
-            <div className="relative">
+            <div ref={addWrap} className="relative">
               <div className="flex items-center gap-2">
                 <input
                   value={add}
@@ -83,19 +125,17 @@ export default function SellView() {
                   placeholder="Add any item by name…"
                   className="flex-1 min-w-0 bg-field border border-line rounded-md px-3 py-1.5 text-xs text-fg-2 placeholder-fg-4 outline-none focus:border-accent/50 transition-colors"
                 />
-                <button onClick={() => addItem(add)} disabled={!add.trim()} className="shrink-0 px-3 py-1.5 text-[12px] font-semibold rounded-md border border-line bg-surface text-fg-2 hover:text-fg disabled:opacity-40 transition-colors">Add</button>
+                <button onClick={() => addItem(add)} disabled={!add.trim()} className="le-tap shrink-0 px-3 py-1.5 text-[12px] font-semibold rounded-md border border-line bg-surface text-fg-2 hover:text-fg disabled:opacity-40 transition-colors">Add</button>
               </div>
-              {matches.length > 0 && (
-                <div className="mt-1 rounded-lg border border-line bg-surface divide-y divide-line overflow-hidden">
-                  {matches.map((it) => (
-                    <button key={it.id} onClick={() => addItem(it.n)} className="le-tap w-full flex items-center gap-2 px-3 py-1.5 text-left hover:bg-field transition-colors">
-                      <SmallIcon id={it.id} n={it.n} assets={assetsAny} iconSet={iconSet} />
-                      <span className="flex-1 min-w-0 truncate text-[12px] text-fg-2">{it.n}</span>
-                      <span className="shrink-0 text-[11px] font-semibold text-accent">Add</span>
-                    </button>
-                  ))}
-                </div>
-              )}
+              <Popover open={matches.length > 0} anchor={addWrap} className="rounded-lg border border-line bg-popover divide-y divide-line overflow-hidden max-h-64 overflow-y-auto shadow-2xl">
+                {matches.map((it) => (
+                  <button key={it.id} onClick={() => addItem(it.n)} className="le-tap w-full flex items-center gap-2 px-3 py-1.5 text-left hover:bg-field transition-colors">
+                    <SmallIcon id={it.id} n={it.n} assets={assetsAny} iconSet={iconSet} />
+                    <span className="flex-1 min-w-0 truncate text-[12px] text-fg-2">{it.n}</span>
+                    <span className="shrink-0 text-[11px] font-semibold text-accent">Add</span>
+                  </button>
+                ))}
+              </Popover>
             </div>
             {sell.items.length > 0 && (
               <SearchInput

@@ -34,7 +34,7 @@ function BuyRow({ it, assets, iconSet, gil, onBuy }: { it: ShopItem; assets?: st
       <button
         onClick={() => onBuy(qty)}
         disabled={!afford}
-        className="shrink-0 px-3 py-1.5 text-[12px] font-bold rounded-md bg-accent text-on-accent enabled:hover:opacity-90 disabled:opacity-40 transition-opacity"
+        className="le-tap shrink-0 px-3 py-1.5 text-[12px] font-bold rounded-md bg-accent text-on-accent enabled:hover:opacity-90 disabled:opacity-40 transition-opacity"
       >
         Buy
       </button>
@@ -63,7 +63,7 @@ function SellRow({ it, assets, iconSet, marked, onToggle, onSell, canSell }: { i
         onClick={onSell}
         disabled={!canSell}
         title={canSell ? 'Sell Now' : 'Open a shop in-game to sell'}
-        className="shrink-0 px-3 py-1.5 text-[12px] font-bold rounded-md border border-line bg-field text-fg-2 enabled:hover:text-fg disabled:opacity-30 transition-colors"
+        className="le-tap shrink-0 px-3 py-1.5 text-[12px] font-bold rounded-md border border-line bg-field text-fg-2 enabled:hover:text-fg disabled:opacity-30 transition-colors"
       >
         Sell
       </button>

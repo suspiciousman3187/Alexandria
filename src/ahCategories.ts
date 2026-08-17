@@ -99,6 +99,10 @@ export const AH_CATEGORY_TREE: AhCategoryGroup[] = (() => {
   return [...groups.entries()].map(([top, subs]) => ({ top, subs }));
 })();
 
+// Leaf label ("Smithing") and full " / "-joined path ("Materials / Smithing") for a category id.
+export const acLeaf = (ac?: number) => (ac && AH_CATEGORY_PATH[ac] ? AH_CATEGORY_PATH[ac].split('->').pop() ?? '' : '');
+export const acPathLabel = (ac?: number) => (ac && AH_CATEGORY_PATH[ac] ? AH_CATEGORY_PATH[ac].replace(/->/g, ' / ') : '');
+
 // Top-level group name for a category id (for filtering by whole group).
 export const AH_CATEGORY_TOP: Record<number, string> = (() => {
   const m: Record<number, string> = {};

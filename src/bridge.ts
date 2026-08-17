@@ -2,29 +2,40 @@ import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { appLocalDataDir } from '@tauri-apps/api/path';
 import { useEffect, useMemo, useSyncExternalStore } from 'react';
+import { logPriceSnapshot } from './priceStore';
 
 export const inTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
-export type InvItem = { s: number; id: number; c: number; n: string; u?: number; f?: number; ms?: number; aug?: string[] };
+export type InvItem = { s: number; id: number; c: number; n: string; u?: number; f?: number; ms?: number; aug?: string[]; bz?: number };
 export type InvBag = { b: string; id: number; max: number; used: number; items: InvItem[] };
+export type SelItem = InvItem & { bag: number };
 export type PoolItem = { i: number; id: number; n: string; ts: number; lotter: string | null; lot: number; mylot: number | null };
 export type PartyInfo = { key: string; members: string[]; size: number };
 export type SlipStored = { id: number; n: string };
 export type SlipStorable = { id: number; n: string; c: number };
-export type Slip = { sid: number; num: number; name: string; ready: boolean; getable: boolean; loc: number; locname: string; stored: SlipStored[]; storable: SlipStorable[] };
+export type Slip = { sid: number; num: number; name: string; ready: boolean; getable: boolean; owned?: boolean; loc: number; locname: string; stored: SlipStored[]; storable: SlipStorable[] };
 export type PorterProgress = { active: boolean; op?: 'store' | 'retrieve'; total?: number; done?: number };
 export type OrgStatus = { active: boolean; total: number; done: number };
 export type ConvertProgress = { active: boolean; shop: string; item: number; bought: number; total: number; phase: string };
 export type CurioCatalogItem = { id: number; n: string; price: number; opt: number; stack?: number; rare?: boolean; ex?: boolean };
 export type CurioScan = { active: boolean; opt: number; max: number; count: number };
 export type ResupplyProgress = { active: boolean; item: number; have: number; target: number; phase: string };
+export type UseProgress = { active: boolean; id: number; name: string; done: number; total: number };
 export type StoreNpcItem = { id: number; n: string; c: number };
-export type StoreNpc = { npc: string; items: StoreNpcItem[] };
+export type StoreNpc = { npc: string; items: StoreNpcItem[]; batch?: number };
 
 // Nomad Moogle zones grant access to Safe / Safe 2 / Locker (and the Delivery Box),
 // the same way a Mog House does, except Storage which needs your actual residence.
 export const NOMAD_ZONES = new Set([26, 53, 247, 248, 249, 250, 252]);
 export const NOMAD_BAGS = new Set([1, 4, 9]);
+
+export const TRADE_RANGE = 7;
+export function withinTradeRange(a?: KnownChar, b?: KnownChar): boolean {
+  if (!a || !b) return false;
+  if (a.zone == null || b.zone == null || a.zone !== b.zone) return false;
+  if (a.px == null || a.py == null || b.px == null || b.py == null) return true;
+  return Math.hypot(a.px - b.px, a.py - b.py) <= TRADE_RANGE;
+}
 export const inNomadZone = (zone?: number): boolean => zone != null && NOMAD_ZONES.has(zone);
 export const nomadReachable = (char: { zone?: number; nomadNear?: boolean } | undefined, experimental: boolean): boolean =>
   !!char && (experimental ? inNomadZone(char.zone) : !!char.nomadNear);
@@ -69,6 +80,8 @@ export type Box = {
   subLvl?: number;
   zone?: number;
   zoneName?: string;
+  px?: number;
+  py?: number;
   assets?: string;
   apath?: string;
   av?: string;
@@ -90,6 +103,9 @@ export type Box = {
   vendorNear?: { sparks: boolean; unity: boolean; curio: boolean };
   convert?: ConvertProgress;
   resupply?: ResupplyProgress;
+  pvendor?: ResupplyProgress;
+  pvendorNear?: string | null;
+  useProg?: UseProgress;
   storeZone?: StoreNpc[];
   store?: StoreProgress;
   aug?: AugState;
@@ -107,6 +123,7 @@ export type Box = {
   slips?: Slip[];
   org?: OrgStatus;
   orgPlan?: OrgStep[];
+  orgPreview?: OrgStep[];
   orgDone?: number[];
   orgOk?: number[];
   cur?: Currency;
@@ -141,6 +158,8 @@ export type KnownChar = {
   sub?: string;
   zone?: number;
   zoneName?: string;
+  px?: number;
+  py?: number;
   assets?: string;
   inv?: InvBag[];
   keyItems?: KeyItem[];
@@ -149,6 +168,7 @@ export type KnownChar = {
   slips?: Slip[];
   org?: OrgStatus;
   orgPlan?: OrgStep[];
+  orgPreview?: OrgStep[];
   orgDone?: number[];
   orgOk?: number[];
   cur?: Currency;
@@ -170,6 +190,9 @@ export type KnownChar = {
   vendorNear?: { sparks: boolean; unity: boolean; curio: boolean };
   convert?: ConvertProgress;
   resupply?: ResupplyProgress;
+  pvendor?: ResupplyProgress;
+  pvendorNear?: string | null;
+  useProg?: UseProgress;
   storeZone?: StoreNpc[];
   store?: StoreProgress;
   aug?: AugState;
@@ -185,15 +208,17 @@ export type KnownChar = {
 };
 
 type Frame =
-  | { t: 'hello'; id: number; name: string; main?: string; main_lvl?: number; sub?: string; sub_lvl?: number; zone?: number; zone_name?: string; assets?: string; apath?: string; av?: string; atah?: boolean; in_town?: boolean; server?: string; gil?: number; mog?: boolean; nomad_near?: boolean }
-  | { t: 'self'; id: number; name: string; main?: string; main_lvl?: number; sub?: string; sub_lvl?: number; zone?: number; zone_name?: string; assets?: string; apath?: string; av?: string; atah?: boolean; in_town?: boolean; server?: string; gil?: number; mog?: boolean; nomad_near?: boolean }
-  | { t: 'inv'; bags: InvBag[] }
+  | { t: 'hello'; id: number; name: string; main?: string; main_lvl?: number; sub?: string; sub_lvl?: number; zone?: number; zone_name?: string; px?: number; py?: number; assets?: string; apath?: string; av?: string; atah?: boolean; in_town?: boolean; server?: string; gil?: number; mog?: boolean; nomad_near?: boolean }
+  | { t: 'self'; id: number; name: string; main?: string; main_lvl?: number; sub?: string; sub_lvl?: number; zone?: number; zone_name?: string; px?: number; py?: number; assets?: string; apath?: string; av?: string; atah?: boolean; in_town?: boolean; server?: string; gil?: number; mog?: boolean; nomad_near?: boolean }
+  | { t: 'inv'; id?: number; bags: InvBag[] }
   | { t: 'keyitems'; items: KeyItem[] }
   | { t: 'pool'; items: PoolItem[] }
+  | { t: 'autolot'; on: boolean; all?: boolean }
   | { t: 'party'; key: string; members: string[]; size: number }
   | { t: 'slips'; slips: Slip[] }
   | { t: 'orgstatus'; active: boolean; total: number; done: number }
   | { t: 'orgplan'; steps: OrgStep[] }
+  | { t: 'orgpreview'; steps: OrgStep[] }
   | { t: 'orgstep'; i: number; ok: boolean }
   | { t: 'dropmap'; map: Record<string, number> }
   | { t: 'currency'; gil: number; list: CurrencyEntry[] }
@@ -207,7 +232,11 @@ type Frame =
   | { t: 'vendornear'; sparks: boolean; unity: boolean; curio: boolean }
   | { t: 'convert'; active: boolean; shop: string; item: number; bought: number; total: number; phase: string }
   | { t: 'resupply'; active: boolean; item: number; have: number; target: number; phase: string }
+  | { t: 'pvendor'; active: boolean; item: number; have: number; target: number; phase: string }
+  | { t: 'pvendornear'; name: string | null }
+  | { t: 'use'; active: boolean; id: number; name: string; done: number; total: number }
   | { t: 'storezone'; npcs: StoreNpc[] }
+  | { t: 'storelearn'; npc: string; zone: number; id: number; index: number; items: number[]; batch?: number }
   | { t: 'store'; active: boolean; item?: number; done?: number; total?: number; phase?: string }
   | { t: 'curioscan'; active: boolean; opt: number; max: number; count: number }
   | { t: 'curiocatalog'; items: CurioCatalogItem[] }
@@ -248,8 +277,8 @@ function rebuild() {
     const pc = persisted.get(b.name);
     known.set(b.name, {
       name: b.name, id: b.id, online: true, conn: b.conn,
-      main: b.main, sub: b.sub, zone: b.zone, zoneName: b.zoneName, assets: b.assets,
-      inv: b.inv ?? pc?.inv, keyItems: b.keyItems ?? pc?.keyItems, keyAt: b.keyAt ?? pc?.keyAt, pool: b.pool, party: b.party, slips: b.slips, org: b.org, orgPlan: b.orgPlan, orgDone: b.orgDone, orgOk: b.orgOk, cur: b.cur ?? pc?.cur, curAt: b.curAt ?? pc?.curAt, atah: b.atah, inTown: b.inTown, server: b.server, gil: b.gil, mog: b.mog, nomadNear: b.nomadNear, ah: b.ah, dbox: b.dbox, dboxStatus: b.dboxStatus, tradeStatus: b.tradeStatus, shop: b.shop, npcNear: b.npcNear, fixedNear: b.fixedNear, porter: b.porter, porterNear: b.porterNear, vendorNear: b.vendorNear, convert: b.convert, resupply: b.resupply, storeZone: b.storeZone, store: b.store, aug: b.aug, augInfo: b.augInfo, bzSellers: b.bzSellers, bzListings: b.bzListings, bzMy: b.bzMy, bzScan: b.bzScan, bzMem: b.bzMem, savedAt: pc?.savedAt,
+      main: b.main, sub: b.sub, zone: b.zone, zoneName: b.zoneName, px: b.px, py: b.py, assets: b.assets,
+      inv: b.inv ?? pc?.inv, keyItems: b.keyItems ?? pc?.keyItems, keyAt: b.keyAt ?? pc?.keyAt, pool: b.pool, party: b.party, slips: b.slips, org: b.org, orgPlan: b.orgPlan, orgPreview: b.orgPreview, orgDone: b.orgDone, orgOk: b.orgOk, cur: b.cur ?? pc?.cur, curAt: b.curAt ?? pc?.curAt, atah: b.atah, inTown: b.inTown, server: b.server, gil: b.gil, mog: b.mog, nomadNear: b.nomadNear, ah: b.ah, dbox: b.dbox, dboxStatus: b.dboxStatus, tradeStatus: b.tradeStatus, shop: b.shop, npcNear: b.npcNear, fixedNear: b.fixedNear, porter: b.porter, porterNear: b.porterNear, vendorNear: b.vendorNear, convert: b.convert, resupply: b.resupply, pvendor: b.pvendor, pvendorNear: b.pvendorNear, useProg: b.useProg, storeZone: b.storeZone, store: b.store, aug: b.aug, augInfo: b.augInfo, bzSellers: b.bzSellers, bzListings: b.bzListings, bzMy: b.bzMy, bzScan: b.bzScan, bzMem: b.bzMem, savedAt: pc?.savedAt,
     });
   }
   knownSnapshot = [...known.values()].sort((a, b) => (a.online === b.online ? a.name.localeCompare(b.name) : a.online ? -1 : 1));
@@ -316,6 +345,40 @@ async function loadPersisted() {
   } catch { /* ignore */ }
 }
 
+// Drop a character's cached currency snapshot from memory and disk. For a character that can't be
+// logged in to self-correct (e.g. a mule that inherited another character's Currency 2 before the
+// addon ownership fix), this is the only way to clear a stale value. It repopulates correctly if
+// the character ever connects again.
+export async function clearCharCurrency(name: string): Promise<void> {
+  const pc = persisted.get(name);
+  if (pc) {
+    const next = { ...pc }; delete next.cur; delete next.curAt;
+    persisted.set(name, next);
+    if (inTauri) {
+      try { await invoke('write_text_file', { path: `${await cacheDir()}/${safeName(name)}.json`, contents: JSON.stringify(next) }); } catch { /* ignore */ }
+    }
+  }
+  for (const [conn, b] of byConn) {
+    if (b.name === name && b.cur) { const next = { ...b }; delete next.cur; delete next.curAt; byConn.set(conn, next); }
+  }
+  rebuild();
+}
+
+// Unregister a character from Alexandria entirely: delete its cached snapshot (currency, inventory,
+// key items, slips, everything) from memory and disk. It reappears only if that character logs in
+// again, which re-registers it fresh. Only meaningful for offline characters -- an online one keeps
+// broadcasting and would just re-register on the next frame.
+export async function removeChar(name: string): Promise<void> {
+  const t = diskTimers.get(name);
+  if (t != null) { clearTimeout(t); diskTimers.delete(name); }
+  persisted.delete(name);
+  if (inTauri) {
+    try { await invoke('delete_file', { path: `${await cacheDir()}/${safeName(name)}.json` }); } catch { /* ignore */ }
+  }
+  for (const [conn, b] of byConn) if (b.name === name) byConn.delete(conn);
+  rebuild();
+}
+
 function mergeInv(prev: InvBag[] | undefined, next: InvBag[]): InvBag[] {
   if (!prev || prev.length === 0) return next;
   const have = new Set(next.map((b) => b.id));
@@ -329,60 +392,85 @@ function onLine(conn: number, line: string) {
   const prev = byConn.get(conn);
   if (f.t === 'seqack') { resolveSeqAck(f.seq, f.ok, f.reason); return; }
   if (f.t === 'axcmd') { axHandler?.(conn, f.char, f.target, f.args); return; }
+  // One character learned a storage NPC — rebroadcast it to the whole fleet so every
+  // connected addon registers it immediately (already-running characters don't re-read
+  // the shared discovered file on their own).
+  if (f.t === 'storelearn') {
+    void broadcastBoxCommand(JSON.stringify({ cmd: 'storeadd', npc: f.npc, zone: f.zone, id: f.id, index: f.index, items: f.items, ...(f.batch != null ? { batch: f.batch } : {}) }));
+    return;
+  }
   if (f.t === 'hello' || f.t === 'self') {
+    // A DIFFERENT character identifying on this same connection (a shared POL client swap)
+    // must start clean -- otherwise it inherits the previous character's inventory, slips,
+    // currency, etc. (and mergeInv then grafts the old bags onto the new character). Only
+    // reuse prior per-character data when the very same character is reconnecting.
+    const sameChar = !!prev && prev.id === f.id;
+    const carry = sameChar ? prev : undefined;
+    // Seed the online box from THIS character's own persisted snapshot (looked up by name,
+    // so never another character's). Mog storage -- Locker/Safe/Storage -- only loads at a
+    // Moogle and reads empty in the field, so without a seed the first live report would
+    // shadow the last-known contents and the Locker would vanish. Seeding lets mergeInv
+    // keep it through field reports.
+    const pc = persisted.get(f.name);
     const next: Box = {
       conn,
       id: f.id,
       name: f.name,
-      main: f.main ?? prev?.main,
-      mainLvl: f.main_lvl ?? prev?.mainLvl,
-      sub: f.sub ?? prev?.sub,
-      subLvl: f.sub_lvl ?? prev?.subLvl,
-      zone: f.zone ?? prev?.zone,
-      zoneName: f.zone_name ?? prev?.zoneName,
-      assets: f.assets ?? prev?.assets,
-      apath: f.apath ?? prev?.apath,
-      av: f.av ?? prev?.av,
-      atah: f.atah ?? prev?.atah,
-      inTown: f.in_town ?? prev?.inTown,
-      server: f.server ?? prev?.server,
-      gil: f.gil ?? prev?.gil,
-      mog: f.mog ?? prev?.mog,
-      nomadNear: f.nomad_near ?? prev?.nomadNear,
-      inv: prev?.inv,
-      invAt: prev?.invAt ?? 0,
-      keyItems: prev?.keyItems,
-      party: prev?.party,
-      storeZone: prev?.storeZone,
-      store: prev?.store,
-      pool: prev?.pool,
-      slips: prev?.slips,
-      org: prev?.org,
-      orgPlan: prev?.orgPlan,
-      orgDone: prev?.orgDone,
-      orgOk: prev?.orgOk,
-      cur: prev?.cur,
-      curAt: prev?.curAt,
-      keyAt: prev?.keyAt,
-      ah: prev?.ah,
-      dbox: prev?.dbox,
-      dboxStatus: prev?.dboxStatus,
-      tradeStatus: prev?.tradeStatus,
-      shop: prev?.shop,
-      npcNear: prev?.npcNear,
-      fixedNear: prev?.fixedNear,
-      porter: prev?.porter,
-      porterNear: prev?.porterNear,
-      vendorNear: prev?.vendorNear,
-      convert: prev?.convert,
-      resupply: prev?.resupply,
-      aug: prev?.aug,
-      augInfo: prev?.augInfo,
-      bzSellers: prev?.bzSellers,
-      bzListings: prev?.bzListings,
-      bzMy: prev?.bzMy,
-      bzScan: prev?.bzScan,
-      bzMem: prev?.bzMem,
+      main: f.main ?? carry?.main,
+      mainLvl: f.main_lvl ?? carry?.mainLvl,
+      sub: f.sub ?? carry?.sub,
+      subLvl: f.sub_lvl ?? carry?.subLvl,
+      zone: f.zone ?? carry?.zone,
+      zoneName: f.zone_name ?? carry?.zoneName,
+      px: f.px ?? carry?.px,
+      py: f.py ?? carry?.py,
+      assets: f.assets ?? carry?.assets,
+      apath: f.apath ?? carry?.apath,
+      av: f.av ?? carry?.av,
+      atah: f.atah ?? carry?.atah,
+      inTown: f.in_town ?? carry?.inTown,
+      server: f.server ?? carry?.server,
+      gil: f.gil ?? carry?.gil,
+      mog: f.mog ?? carry?.mog,
+      nomadNear: f.nomad_near ?? carry?.nomadNear,
+      inv: carry?.inv ?? pc?.inv,
+      invAt: carry?.invAt ?? 0,
+      keyItems: carry?.keyItems ?? pc?.keyItems,
+      party: carry?.party,
+      storeZone: carry?.storeZone,
+      store: carry?.store,
+      pool: carry?.pool,
+      slips: carry?.slips,
+      org: carry?.org,
+      orgPlan: carry?.orgPlan,
+      orgPreview: carry?.orgPreview,
+      orgDone: carry?.orgDone,
+      orgOk: carry?.orgOk,
+      cur: carry?.cur ?? pc?.cur,
+      curAt: carry?.curAt ?? pc?.curAt,
+      keyAt: carry?.keyAt ?? pc?.keyAt,
+      ah: carry?.ah,
+      dbox: carry?.dbox,
+      dboxStatus: carry?.dboxStatus,
+      tradeStatus: carry?.tradeStatus,
+      shop: carry?.shop,
+      npcNear: carry?.npcNear,
+      fixedNear: carry?.fixedNear,
+      porter: carry?.porter,
+      porterNear: carry?.porterNear,
+      vendorNear: carry?.vendorNear,
+      convert: carry?.convert,
+      resupply: carry?.resupply,
+      pvendor: carry?.pvendor,
+      pvendorNear: carry?.pvendorNear,
+      useProg: carry?.useProg,
+      aug: carry?.aug,
+      augInfo: carry?.augInfo,
+      bzSellers: carry?.bzSellers,
+      bzListings: carry?.bzListings,
+      bzMy: carry?.bzMy,
+      bzScan: carry?.bzScan,
+      bzMem: carry?.bzMem,
       lastSeen: Date.now(),
     };
     byConn.set(conn, next);
@@ -394,6 +482,11 @@ function onLine(conn: number, line: string) {
       || prev.atah !== next.atah || prev.server !== next.server || prev.gil !== next.gil || prev.mog !== next.mog || prev.nomadNear !== next.nomadNear;
     if (changed) scheduleRebuild();
   } else if (f.t === 'inv' && prev) {
+    // Inventory is attributed by connection, not by name. On a shared-client swap the
+    // identity ('self') can lag the incoming character's loading bags by up to a send
+    // cycle, so an inv feed whose id doesn't match this box belongs to the character that
+    // just logged out -- drop it instead of corrupting the previous character's snapshot.
+    if (f.id != null && prev.id != null && f.id !== prev.id) return;
     const bags = mergeInv(prev.inv, f.bags);
     const box: Box = { ...prev, inv: bags, invAt: Date.now(), lastSeen: Date.now() };
     byConn.set(conn, box);
@@ -402,7 +495,7 @@ function onLine(conn: number, line: string) {
       main: box.main, mainLvl: box.mainLvl, sub: box.sub, subLvl: box.subLvl,
       zoneName: box.zoneName, assets: box.assets, inv: bags, savedAt: Date.now(),
     });
-    invHook?.(box.name, bags);
+    invHooks.forEach((fn) => fn(box.name, bags));
     scheduleRebuild();
   } else if (f.t === 'keyitems' && prev) {
     const now = Date.now();
@@ -438,6 +531,9 @@ function onLine(conn: number, line: string) {
   } else if (f.t === 'orgplan' && prev) {
     byConn.set(conn, { ...prev, orgPlan: f.steps, orgDone: [], orgOk: [], lastSeen: Date.now() });
     scheduleRebuild();
+  } else if (f.t === 'orgpreview' && prev) {
+    byConn.set(conn, { ...prev, orgPreview: f.steps, lastSeen: Date.now() });
+    scheduleRebuild();
   } else if (f.t === 'orgstep' && prev) {
     byConn.set(conn, {
       ...prev,
@@ -446,6 +542,8 @@ function onLine(conn: number, line: string) {
       lastSeen: Date.now(),
     });
     scheduleRebuild();
+  } else if (f.t === 'autolot') {
+    autoLotFeedCb?.(prev?.name, f.on, !!f.all);
   } else if (f.t === 'ah' && prev) {
     byConn.set(conn, { ...prev, ah: { atah: f.atah, init: f.init, qn: f.qn, slots: f.slots }, lastSeen: Date.now() });
     scheduleRebuild();
@@ -475,6 +573,15 @@ function onLine(conn: number, line: string) {
     scheduleRebuild();
   } else if (f.t === 'resupply' && prev) {
     byConn.set(conn, { ...prev, resupply: { active: f.active, item: f.item, have: f.have, target: f.target, phase: f.phase }, lastSeen: Date.now() });
+    scheduleRebuild();
+  } else if (f.t === 'pvendor' && prev) {
+    byConn.set(conn, { ...prev, pvendor: { active: f.active, item: f.item, have: f.have, target: f.target, phase: f.phase }, lastSeen: Date.now() });
+    scheduleRebuild();
+  } else if (f.t === 'pvendornear' && prev) {
+    byConn.set(conn, { ...prev, pvendorNear: f.name, lastSeen: Date.now() });
+    scheduleRebuild();
+  } else if (f.t === 'use' && prev) {
+    byConn.set(conn, { ...prev, useProg: { active: f.active, id: f.id, name: f.name, done: f.done, total: f.total }, lastSeen: Date.now() });
     scheduleRebuild();
   } else if (f.t === 'storezone' && prev) {
     byConn.set(conn, { ...prev, storeZone: f.npcs, lastSeen: Date.now() });
@@ -578,12 +685,23 @@ export function useAhMessages(): AhMsg[] {
   return useSyncExternalStore((cb) => { ahMsgListeners.add(cb); return () => ahMsgListeners.delete(cb); }, () => ahMsgs, () => ahMsgs);
 }
 
+export function nextAhMsg(conn: number, timeoutMs = 10000): Promise<AhMsg | null> {
+  const startAt = ahMsgs.find((m) => m.conn === conn)?.at ?? 0;
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (v: AhMsg | null) => { if (done) return; done = true; ahMsgListeners.delete(cb); clearTimeout(to); resolve(v); };
+    const cb = () => { const m = ahMsgs.find((x) => x.conn === conn); if (m && m.at > startAt) finish(m); };
+    const to = setTimeout(() => finish(null), timeoutMs);
+    ahMsgListeners.add(cb);
+  });
+}
+
 export type AhListing = { key: number; conn: number; name: string; status: 'pending' | 'ok' | 'fail'; reason?: string; at: number; batchId?: number };
 let ahListings: AhListing[] = [];
 let listingSeq = 0;
 let batchSeq = 0;
 const listingListeners = new Set<() => void>();
-const notifyListings = () => { ahListings = [...ahListings]; listingListeners.forEach((l) => l()); };
+const notifyListings = () => { ahListings = ahListings.length > 300 ? ahListings.slice(-300) : [...ahListings]; listingListeners.forEach((l) => l()); };
 function removeListingLater(key: number, ms: number) {
   setTimeout(() => { ahListings = ahListings.filter((l) => l.key !== key); listingListeners.forEach((l) => l()); }, ms);
 }
@@ -693,46 +811,22 @@ export function useAhCatalog(): AhCatalog {
   }), [snap]);
 }
 
-export type MarketSale = { date: string; price: number; seller: string; buyer: string };
-export type MarketBazaar = { player: string; server: string; price: number; quantity: number; zone: string };
-export type MarketData = { stock?: string; rate?: string; median?: string; sales: MarketSale[]; bazaar: MarketBazaar[] };
-
-function parseMarket(html: string): MarketData {
-  const out: MarketData = { sales: [], bazaar: [] };
-  const salesM = html.match(/Item\.sales\s*=\s*(\[[\s\S]*?\])\s*;/);
-  if (salesM) {
-    try {
-      const arr = JSON.parse(salesM[1]) as { saleon: number; seller_name?: string; buyer_name?: string; price?: number }[];
-      out.sales = arr.map((s) => ({
-        date: s.saleon ? new Date(s.saleon * 1000).toLocaleDateString() : '',
-        price: s.price ?? 0,
-        seller: s.seller_name ?? '',
-        buyer: s.buyer_name ?? '',
-      }));
-    } catch { /* ignore */ }
-  }
-  const bazM = html.match(/Item\.bazaar\s*=\s*(\[[\s\S]*?\])\s*;/);
-  if (bazM) {
-    try {
-      const arr = JSON.parse(bazM[1]) as unknown[][];
-      out.bazaar = arr.map((e) => {
-        const html0 = typeof e[0] === 'string' ? e[0] : '';
-        const m = html0.match(/([^.]+)\.<a href='[^']*\/([^/']+)'/);
-        return {
-          server: m?.[1] ?? '',
-          player: m?.[2] ?? '',
-          price: typeof e[1] === 'number' ? e[1] : 0,
-          quantity: typeof e[2] === 'number' ? e[2] : 0,
-          zone: typeof e[3] === 'string' ? e[3] : '',
-        };
-      });
-    } catch { /* ignore */ }
-  }
-  out.stock = html.match(/<td>\s*Stock\s*<\/td>\s*<td><span[^>]*>(\d+)<\/span>/)?.[1];
-  out.rate = html.match(/Rate<\/td>\s*<td><span[^>]*>([^<]+)<\/span>/)?.[1];
-  out.median = html.match(/<td>Median<\/td>\s*<td><span[^>]*>([\d,]+)<\/span>/)?.[1];
-  return out;
+// Reactive id -> AH category id map, from the loaded catalog.
+export function useAcMap(): Map<number, number> {
+  const snap = useSyncExternalStore(
+    (cb) => { ahCatListeners.add(cb); return () => ahCatListeners.delete(cb); },
+    () => ahCat.length,
+    () => 0,
+  );
+  return useMemo(() => {
+    const m = new Map<number, number>();
+    for (const it of ahCat) if (it.ac) m.set(it.id, it.ac);
+    return m;
+  }, [snap]);
 }
+
+export type MarketSale = { date: string; price: number; seller: string; buyer: string; ts?: number };
+export type MarketData = { stock?: string; rate?: string; median?: string; sales: MarketSale[]; listedTotal?: number };
 
 let descMap: Record<string, string> | null = null;
 let descLoading = false;
@@ -765,19 +859,229 @@ export function ffxiahSid(server?: string): number | undefined {
   return undefined;
 }
 
+type AhSale = { price: number; date: number; seller: string; buyer: string };
+type AhHistory = { item: number; count: number; cat: number; sales: AhSale[] };
+type AhListingCount = { id: number; single: number; stack: number };
+type AhCategory = { total: number; items: AhListingCount[] };
+
+const IP_PREFIX = '124.150.154.';
+const WORLD_OFFSET: Record<string, number> = {
+  Bahamut: 0, Shiva: 1, Phoenix: 2, Carbuncle: 3, Fenrir: 4, Sylph: 5, Valefor: 6, Leviathan: 7,
+  Odin: 8, Quetzalcoatl: 9, Siren: 10, Ragnarok: 11, Cerberus: 12, Bismarck: 13, Lakshmi: 14, Asura: 15,
+};
+const WORLD_COUNT = 16;
+const DEFAULT_BASE = 61;
+const DEFAULT_WORLD = 'Siren';
+const PROBE_ITEM = 4096;
+
+let ipBase = DEFAULT_BASE;
+let ahHealth: 'ok' | 'degraded' | 'unknown' = 'unknown';
+let ahLastOkAt = 0;
+let ahFails = 0;
+let ahScanning = false;
+let ahLastScanAt = 0;
+let ahLoaded = false;
+let ahSaveT: number | null = null;
+
+export type AhServerHealth = { health: 'ok' | 'degraded' | 'unknown'; base: number; scanning: boolean; lastOkAt: number };
+let ahSnap: AhServerHealth = { health: 'unknown', base: DEFAULT_BASE, scanning: false, lastOkAt: 0 };
+const ahHealthSubs = new Set<() => void>();
+function notifyAhHealth() {
+  ahSnap = { health: ahHealth, base: ipBase, scanning: ahScanning, lastOkAt: ahLastOkAt };
+  ahHealthSubs.forEach((f) => f());
+}
+
+function canonWorld(server?: string): string {
+  const t = (server ?? '').trim();
+  if (WORLD_OFFSET[t] != null) return t;
+  const lc = t.toLowerCase();
+  for (const k in WORLD_OFFSET) if (k.toLowerCase() === lc) return k;
+  return DEFAULT_WORLD;
+}
+
+function searchServerIp(server?: string): string {
+  return `${IP_PREFIX}${ipBase + WORLD_OFFSET[canonWorld(server)]}`;
+}
+
+async function loadAhBase() {
+  if (ahLoaded) return;
+  ahLoaded = true;
+  if (!inTauri) return;
+  try {
+    const txt = await invoke<string>('read_text_file', { path: await appDataPath('ah_servers.json') });
+    const p = JSON.parse(txt);
+    if (p && typeof p.base === 'number' && p.base >= 1 && p.base + WORLD_COUNT - 1 <= 254) { ipBase = p.base; notifyAhHealth(); }
+  } catch { /* none saved */ }
+}
+
+function saveAhBase() {
+  if (!inTauri || ahSaveT != null) return;
+  ahSaveT = window.setTimeout(async () => {
+    ahSaveT = null;
+    try { await invoke('write_text_file', { path: await appDataPath('ah_servers.json'), contents: JSON.stringify({ base: ipBase }) }); } catch { /* ignore */ }
+  }, 500);
+}
+
+async function probeIp(ip: string, timeoutMs = 1800): Promise<boolean> {
+  try {
+    const res = await Promise.race([
+      invoke<AhHistory>('ah_history', { host: ip, itemId: PROBE_ITEM, stack: false }),
+      new Promise<null>((_, rej) => window.setTimeout(() => rej(new Error('timeout')), timeoutMs)),
+    ]);
+    return !!res && (res as AhHistory).item === PROBE_ITEM;
+  } catch { return false; }
+}
+
+function noteAhOk() {
+  ahLastOkAt = Date.now();
+  ahFails = 0;
+  if (ahHealth !== 'ok') ahHealth = 'ok';
+  notifyAhHealth();
+}
+
+function noteAhFail() {
+  ahFails++;
+  if (ahFails >= 3) {
+    if (ahHealth !== 'degraded') { ahHealth = 'degraded'; notifyAhHealth(); }
+    void healServers(false);
+  }
+}
+
+async function healServers(manual: boolean): Promise<boolean> {
+  if (ahScanning) return false;
+  const now = Date.now();
+  if (!manual && now - ahLastScanAt < 5 * 60 * 1000) return false;
+  ahScanning = true; ahLastScanAt = now; notifyAhHealth();
+  try {
+    const live: boolean[] = new Array(255).fill(false);
+    const octets: number[] = [];
+    for (let o = 1; o <= 254; o++) octets.push(o);
+    let idx = 0;
+    const worker = async () => {
+      while (idx < octets.length) {
+        const o = octets[idx++];
+        live[o] = await probeIp(`${IP_PREFIX}${o}`);
+      }
+    };
+    await Promise.all(Array.from({ length: 16 }, worker));
+    let found = -1;
+    for (let s = 1; s + WORLD_COUNT - 1 <= 254; s++) {
+      let all = true;
+      for (let k = 0; k < WORLD_COUNT; k++) if (!live[s + k]) { all = false; break; }
+      if (!all) continue;
+      const boundedBelow = s === 1 || !live[s - 1];
+      const boundedAbove = s + WORLD_COUNT > 254 || !live[s + WORLD_COUNT];
+      if (boundedBelow && boundedAbove) { found = s; break; }
+    }
+    if (found > 0) {
+      ipBase = found; saveAhBase();
+      ahFails = 0; ahHealth = 'ok'; ahLastOkAt = Date.now();
+      return true;
+    }
+    return false;
+  } finally { ahScanning = false; notifyAhHealth(); }
+}
+
+export function useAhServerHealth(): AhServerHealth {
+  return useSyncExternalStore(
+    (cb) => { ahHealthSubs.add(cb); return () => { ahHealthSubs.delete(cb); }; },
+    () => ahSnap,
+    () => ahSnap,
+  );
+}
+
+export function rescanAhServers(): Promise<boolean> { return healServers(true); }
+
+function medianOf(nums: number[]): number | undefined {
+  if (!nums.length) return undefined;
+  const s = [...nums].sort((a, b) => a - b);
+  const m = Math.floor(s.length / 2);
+  return s.length % 2 ? s[m] : Math.round((s[m - 1] + s[m]) / 2);
+}
+
+// FFXI players wash-transfer gil by listing cheap stackables near the 999,999,999
+// cap, and those "sales" poison a plain median. A real price is orders of magnitude
+// below a wash price, so drop anything >30x the cheapest sale. Legit recent sales
+// rarely span 30x, so clean data is untouched. Shared with the price chart so the
+// median and the plotted points hide the same wash trades, with no blacklist.
+export function washCap(prices: number[]): number {
+  let min = Infinity;
+  for (const p of prices) if (p > 0 && p < min) min = p;
+  return Number.isFinite(min) ? min * 30 : Infinity;
+}
+function robustMedianOf(nums: number[]): number | undefined {
+  const s = nums.filter((n) => n > 0).sort((a, b) => a - b);
+  if (s.length < 2) return s.length ? s[0] : undefined;
+  const cap = washCap(s);
+  const kept = s.filter((p) => p <= cap);
+  return medianOf(kept.length ? kept : s);
+}
+
+const NO_LISTING = 0xffffffff;
 const marketInflight = new Map<string, Promise<MarketData>>();
+const catCache = new Map<string, { at: number; p: Promise<AhCategory> }>();
+const CAT_TTL = 60 * 1000;
+
+function ahCategoryCached(ip: string, cat: number): Promise<AhCategory> {
+  const k = `${ip}:${cat}`;
+  const e = catCache.get(k);
+  if (e && Date.now() - e.at < CAT_TTL) return e.p;
+  const entry = { at: Date.now(), p: invoke<AhCategory>('ah_category', { host: ip, cat }) };
+  catCache.set(k, entry);
+  entry.p.catch(() => { if (catCache.get(k) === entry) catCache.delete(k); });
+  return entry.p;
+}
+
 export function fetchMarket(id: number, stack: boolean, server?: string): Promise<MarketData> {
-  const sid = ffxiahSid(server);
-  const key = `${id}:${stack ? 1 : 0}:${sid ?? ''}`;
+  void loadAhBase();
+  const ip = searchServerIp(server);
+  const key = `${id}:${stack ? 1 : 0}:${ip}`;
   const inflight = marketInflight.get(key);
   if (inflight) return inflight;
-  const url = `https://www.ffxiah.com/item/${id}?stack=${stack ? '1' : '0'}`;
-  const cookie = sid ? `sid=${sid}` : undefined;
-  const p = invoke<string>('http_get', { url, cookie })
-    .then(parseMarket)
-    .finally(() => marketInflight.delete(key));
+  const p = (async (): Promise<MarketData> => {
+    let hist: AhHistory;
+    try {
+      hist = await invoke<AhHistory>('ah_history', { host: ip, itemId: id, stack });
+    } catch (e) { noteAhFail(); throw e; }
+    noteAhOk();
+    const ordered = [...hist.sales].sort((a, b) => b.date - a.date);
+    const sales: MarketSale[] = ordered.map((s) => ({
+      date: s.date ? new Date(s.date * 1000).toLocaleDateString() : '',
+      price: s.price, seller: s.seller, buyer: s.buyer, ts: s.date || undefined,
+    }));
+    const median = robustMedianOf(hist.sales.map((s) => s.price));
+    const times = hist.sales.map((s) => s.date).filter((n) => n > 0);
+    let rate: string | undefined;
+    if (times.length >= 2) {
+      const span = (Math.max(...times) - Math.min(...times)) / 86400;
+      if (span > 0) rate = String(+((times.length - 1) / span).toFixed(2));
+    }
+    let stock: string | undefined;
+    let listedTotal: number | undefined;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const c = await ahCategoryCached(ip, hist.cat);
+        const row = c.items.find((it) => it.id === id);
+        const single = row && row.single !== NO_LISTING ? row.single : 0;
+        const stk = row && row.stack !== NO_LISTING ? row.stack : 0;
+        stock = String(stack ? stk : single);
+        listedTotal = stack ? stk : single;
+        break;
+      } catch { /* retry once */ }
+    }
+    if (median != null && median > 0) await logPriceSnapshot(server ?? '', id, stack, median, listedTotal ?? 0);
+    return { median: median != null ? median.toLocaleString() : undefined, stock, rate, sales, listedTotal };
+  })().finally(() => marketInflight.delete(key));
   marketInflight.set(key, p);
   return p;
+}
+
+export async function fetchCategoryCounts(server: string | undefined, cat: number): Promise<Record<number, { single: number; stack: number }>> {
+  const ip = searchServerIp(server);
+  const c = await ahCategoryCached(ip, cat);
+  const out: Record<number, { single: number; stack: number }> = {};
+  for (const it of c.items) out[it.id] = { single: it.single === NO_LISTING ? 0 : it.single, stack: it.stack === NO_LISTING ? 0 : it.stack };
+  return out;
 }
 
 let dropIconMap: Record<string, number> = {};
@@ -809,21 +1113,70 @@ export function getKnownCharacters(): KnownChar[] {
 
 export type AddonInfo = { dir: string; version: string | null };
 
+const ADDON_DIR_KEY = 'alexandria-addon-dir';
+const ADDON_VER_KEY = 'alexandria-addon-ver';
+const ADDON_DIR_MANUAL_KEY = 'alexandria-addon-dir-manual';
+
+const addonManualSubs = new Set<() => void>();
+
+function persistAddon(info: AddonInfo): void {
+  try {
+    localStorage.setItem(ADDON_DIR_KEY, info.dir);
+    localStorage.setItem(ADDON_VER_KEY, info.version ?? '');
+  } catch { /* ignore */ }
+}
+
+function readPersistedAddon(): AddonInfo | null {
+  try {
+    const dir = localStorage.getItem(ADDON_DIR_KEY);
+    if (dir) return { dir, version: localStorage.getItem(ADDON_VER_KEY) || null };
+  } catch { /* ignore */ }
+  return null;
+}
+
+export function getManualAddonDir(): string | null {
+  try { return localStorage.getItem(ADDON_DIR_MANUAL_KEY) || null; } catch { return null; }
+}
+
+export function setManualAddonDir(dir: string | null): void {
+  try {
+    if (dir) localStorage.setItem(ADDON_DIR_MANUAL_KEY, dir.replace(/[\\/]+$/, ''));
+    else localStorage.removeItem(ADDON_DIR_MANUAL_KEY);
+  } catch { /* ignore */ }
+  addonManualSubs.forEach((f) => f());
+}
+
 export function getConnectedAddonInfo(): AddonInfo | null {
   for (const b of byConn.values()) {
-    if (b.apath) return { dir: b.apath.replace(/[\\/]+$/, ''), version: b.av ?? null };
+    if (b.apath) {
+      const info = { dir: b.apath.replace(/[\\/]+$/, ''), version: b.av ?? null };
+      persistAddon(info);
+      return info;
+    }
   }
   return null;
 }
 
+export function getAddonInfo(): AddonInfo | null {
+  const manual = getManualAddonDir();
+  const live = getConnectedAddonInfo();
+  if (manual) return { dir: manual, version: live?.dir === manual ? live.version : null };
+  return live ?? readPersistedAddon();
+}
+
 function addonKey(): string {
-  for (const b of liveSnapshot) if (b.apath) return `${b.apath}|${b.av ?? ''}`;
-  return '';
+  let live = '';
+  for (const b of liveSnapshot) if (b.apath) { live = `${b.apath}|${b.av ?? ''}`; break; }
+  return `${getManualAddonDir() ?? ''}#${live}`;
 }
 
 export function useAddonInfo(): AddonInfo | null {
-  const key = useSyncExternalStore(subscribe, addonKey, () => '');
-  return useMemo(() => (key ? getConnectedAddonInfo() : null), [key]);
+  const key = useSyncExternalStore(
+    (cb) => { const un = subscribe(cb); addonManualSubs.add(cb); return () => { un(); addonManualSubs.delete(cb); }; },
+    addonKey,
+    () => '#',
+  );
+  return useMemo(() => getAddonInfo(), [key]);
 }
 
 // Which item-icon BMPs exist on disk, so the UI never requests a not-yet-extracted icon (404 spam); refreshed as the addon fills the folder.
@@ -868,12 +1221,13 @@ type AxHandler = (conn: number, char: string, target: string | undefined, args: 
 let axHandler: AxHandler | null = null;
 export function onAxCommand(fn: AxHandler) { axHandler = fn; }
 
-let invHook: ((name: string, bags: InvBag[]) => void) | null = null;
-export function onInventoryUpdate(fn: (name: string, bags: InvBag[]) => void) { invHook = fn; }
+const invHooks = new Set<(name: string, bags: InvBag[]) => void>();
+export function onInventoryUpdate(fn: (name: string, bags: InvBag[]) => void) { invHooks.add(fn); return () => invHooks.delete(fn); }
 export function axEcho(conn: number, text: string) {
   const clean = text.replace(/[^\x20-\x7E]/g, '').slice(0, 150);
   sendBoxCommand(conn, JSON.stringify({ cmd: 'axecho', text: clean }));
 }
+export function useStop(conn: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'usestop' })); }
 
 let seqCounter = 1;
 export function nextSeq(): number { return seqCounter++; }
@@ -1005,17 +1359,44 @@ export function stackBag(conn: number, bag?: number) {
 }
 
 
+export type KeepQtyRule = { item: string; qty: number; stacks?: boolean };
 export type OrganizeRules = {
   alwaysBring: string[];
   keep: string[];
   keepSingle: string[];
+  keepQty: KeepQtyRule[];
   storableBags: number[];
   storeUsable: boolean;
   reserve: number;
+  strictInventory: boolean;
 };
 
-export function runOrganize(conn: number, rules: OrganizeRules) {
-  sendBoxCommand(conn, JSON.stringify({ cmd: 'organize', ...rules }));
+export const DEFAULT_ORGANIZE_RULES: OrganizeRules = { alwaysBring: [], keep: [], keepSingle: [], keepQty: [], storableBags: [5, 6, 7], storeUsable: true, reserve: 3, strictInventory: false };
+
+// Migrate the old passive modes into the active model: Keep All -> Bring everything
+// to inventory (alwaysBring), Keep 1 Stack -> Bring 1 stack (keepQty stacks=1).
+export function normalizeOrganizeRules(r: OrganizeRules): OrganizeRules {
+  if ((r.keep?.length ?? 0) === 0 && (r.keepSingle?.length ?? 0) === 0) return r;
+  return {
+    ...r,
+    alwaysBring: [...r.alwaysBring, ...(r.keep ?? [])],
+    keepQty: [...r.keepQty, ...(r.keepSingle ?? []).map((n) => ({ item: n, qty: 1, stacks: true }))],
+    keep: [],
+    keepSingle: [],
+  };
+}
+
+export function runOrganize(conn: number, rules: OrganizeRules, layout?: { item: string; bags: number[] }[]) {
+  sendBoxCommand(conn, JSON.stringify({ cmd: 'organize', ...rules, ...(layout && layout.length ? { layout } : {}) }));
+}
+
+// Dry-run: the addon computes the full organize plan and reports it via the
+// `orgpreview` feed (stored as `orgPreview`) without moving anything. Clears any
+// stale preview first so the UI shows a loading state until fresh data arrives.
+export function runOrganizePreview(conn: number, rules: OrganizeRules, layout?: { item: string; bags: number[] }[]) {
+  const prev = byConn.get(conn);
+  if (prev) { byConn.set(conn, { ...prev, orgPreview: undefined }); scheduleRebuild(); }
+  sendBoxCommand(conn, JSON.stringify({ cmd: 'organizepreview', ...rules, ...(layout && layout.length ? { layout } : {}) }));
 }
 
 export function broadcastOrganize(rules: OrganizeRules): Promise<number> {
@@ -1025,21 +1406,35 @@ export function broadcastOrganize(rules: OrganizeRules): Promise<number> {
 export function retrieveItems(conn: number, items: string[]) { sendBoxCommand(conn, JSON.stringify({ cmd: 'retrieve', items })); }
 export function broadcastRetrieve(items: string[]): Promise<number> { return broadcastBoxCommand(JSON.stringify({ cmd: 'retrieve', items })); }
 
+export function localConsolidate(conn: number, bags?: number[]) { sendBoxCommand(conn, JSON.stringify({ cmd: 'localconsolidate', ...(bags && bags.length ? { bags } : {}) })); }
+
+export function broadcastSortBag(bags: number[]): Promise<number> { return broadcastBoxCommand(JSON.stringify({ cmd: 'sortbag', bags })); }
+export function sortBag(conn: number, bags: number[]) { sendBoxCommand(conn, JSON.stringify({ cmd: 'sortbag', bags })); }
+
 export function requestCurrency(conn: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'currency' })); }
 export function broadcastCurrency(): Promise<number> { return broadcastBoxCommand(JSON.stringify({ cmd: 'currency' })); }
+export function broadcastSync(): Promise<number> { return broadcastBoxCommand(JSON.stringify({ cmd: 'sync' })); }
 
-export type PoolRules = { lot: string[]; pass: string[]; drop: string[]; passOnLot?: boolean };
+export type PoolRules = { lot: string[]; pass: string[]; drop: string[]; passOnLot?: boolean; autoLot?: boolean };
 
 export function lotPool(conn: number, index: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'lot', index })); }
 export function passPool(conn: number, index: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'pass', index })); }
 export function lotAll(conn: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'lotall' })); }
 export function passAll(conn: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'passall' })); }
 export function passDone(conn: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'passdone' })); }
+let autoLotFeedCb: ((name: string | undefined, on: boolean, all: boolean) => void) | null = null;
+// poolRules registers here so a //ax autolot toggle typed in-game flows back to the
+// desktop (updates the UI + persists), without bridge importing poolRules (circular).
+export function onAutoLotFeed(cb: (name: string | undefined, on: boolean, all: boolean) => void) { autoLotFeedCb = cb; }
 export function setPoolRules(conn: number, r: PoolRules) { sendBoxCommand(conn, JSON.stringify({ cmd: 'poolrules', ...r })); }
 export function broadcastPoolRules(r: PoolRules) { return broadcastBoxCommand(JSON.stringify({ cmd: 'poolrules', ...r })); }
 
 export function setResupply(conn: number, on: boolean, items: { name: string; min: number }[], options: number[]) {
   sendBoxCommand(conn, JSON.stringify({ cmd: 'resupply_set', on, items, options }));
+}
+
+export function setVendors(conn: number, on: boolean, items: { name: string; min: number }[]) {
+  sendBoxCommand(conn, JSON.stringify({ cmd: 'pvendor_set', on, items }));
 }
 
 let curioCatalogHook: ((server: string | undefined, items: CurioCatalogItem[]) => void) | null = null;
@@ -1048,11 +1443,11 @@ export function onCurioCatalog(fn: (server: string | undefined, items: CurioCata
 export function currencyFarmStop(conn: number) {
   sendBoxCommand(conn, JSON.stringify({ cmd: 'farmstop' }));
 }
-export function currencyConvert(conn: number, shop: 'sparks' | 'unity') {
-  sendBoxCommand(conn, JSON.stringify({ cmd: 'currencyfarmall', shop }));
+export function currencyConvert(conn: number, shop: 'sparks' | 'unity', delay = 0) {
+  sendBoxCommand(conn, JSON.stringify({ cmd: 'currencyfarmall', shop, delay }));
 }
-export function currencyConvertOn(conn: number, shop?: 'sparks' | 'unity') {
-  sendBoxCommand(conn, JSON.stringify({ cmd: 'currencyfarmall', ...(shop ? { shop } : {}) }));
+export function currencyConvertOn(conn: number, shop?: 'sparks' | 'unity', delay = 0) {
+  sendBoxCommand(conn, JSON.stringify({ cmd: 'currencyfarmall', ...(shop ? { shop } : {}), delay }));
 }
 export function bulkConvertStop() {
   return broadcastBoxCommand(JSON.stringify({ cmd: 'farmstop' }));
@@ -1060,10 +1455,11 @@ export function bulkConvertStop() {
 
 export type DropRules = { drop: string[]; autodrop: boolean; delay?: number };
 export function broadcastDropRules(r: DropRules) { return broadcastBoxCommand(JSON.stringify({ cmd: 'droprules', drop: r.drop, autodrop: r.autodrop, delay: r.delay ?? 0 })); }
+export function sendDropRules(conn: number, r: DropRules) { sendBoxCommand(conn, JSON.stringify({ cmd: 'droprules', drop: r.drop, autodrop: r.autodrop, delay: r.delay ?? 0 })); }
 export function broadcastDropNow() { return broadcastBoxCommand(JSON.stringify({ cmd: 'dropnow' })); }
 export function dropOne(conn: number, slot: number, id: number, bag = 0, count?: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'dropone', slot, id, bag, ...(count != null ? { count } : {}) })); }
 export function dropClean(conn: number, items: string[]) { sendBoxCommand(conn, JSON.stringify({ cmd: 'dropclean', items })); }
-export function useItem(conn: number, id: number, all: boolean, bag = 0, slot?: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'use', id, all, bag, ...(slot != null ? { slot } : {}) })); }
+export function useItem(conn: number, id: number, all: boolean, bag = 0, slot?: number, count?: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'use', id, all, bag, ...(slot != null ? { slot } : {}), ...(count != null && count > 0 ? { count } : {}) })); }
 
 export type TradeArg = { id?: number; item?: string; count?: number; times?: number; target_id?: number; target_index?: number };
 export function tradeNpc(conn: number, a: TradeArg) { sendBoxCommand(conn, JSON.stringify({ cmd: 'tradenpc', ...a })); }
@@ -1075,7 +1471,7 @@ export type CapeAugArg = { job: string; material: string; path: string; repeats:
 export function augCape(conn: number, a: CapeAugArg) { sendBoxCommand(conn, JSON.stringify({ cmd: 'augcape', ...a })); }
 export type CapeSeqStep = { material: string; path: string; repeats: number };
 export function augCapeSeq(conn: number, a: { job: string; bag: number; slot: number; steps: CapeSeqStep[] }) { sendBoxCommand(conn, JSON.stringify({ cmd: 'augcapeseq', ...a })); }
-export type GearAugArg = { mode: string; item: string; bag?: number; slot?: number; material?: string; style?: string; augment_1?: string; augment_2?: string; augment_3?: string; watch_1?: number; watch_2?: number; watch_3?: number; augment_mode?: 'and' | 'or'; delay?: number; max?: number; manual?: boolean };
+export type GearAugArg = { mode: string; item: string; bag?: number; slot?: number; material?: string; style?: string; augment_1?: string; augment_2?: string; augment_3?: string; watch_1?: number; watch_2?: number; watch_3?: number; augment_mode?: 'and' | 'or'; delay?: number; max?: number; manual?: boolean; dm?: number; dm_all?: boolean };
 export function augGear(conn: number, a: GearAugArg) { sendBoxCommand(conn, JSON.stringify({ cmd: 'auggear', ...a })); }
 export function augStop(conn: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'augstop' })); }
 export function augKeep(conn: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'augkeep' })); }

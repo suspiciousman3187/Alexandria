@@ -4,36 +4,49 @@ import type { InvBag, GearAugArg } from './bridge';
 
 export type GearInst = { key: string; name: string; bagId: number; bagName: string; slot: number; aug: string[] };
 
+export const instKey = (name: string, bagId: number, slot: number) => `${name}@${bagId}:${slot}`;
+
+export function nameFromSelKey(selKey: string): string {
+  const at = selKey.indexOf('@');
+  if (at >= 0) return selKey.slice(0, at);
+  return /^\d+:\d+$/.test(selKey) ? '' : selKey;
+}
+
+// One entry per physical copy in the bags. NEVER dedupe by name: a character can hold
+// several of the same item (e.g. 3x Odyssea Greaves) and must be able to pick which one.
 export function gearInstancesFor(view: string, inv?: InvBag[]): GearInst[] {
   const types = VIEW_TRADE_TYPES[view] ?? ['Cape'];
   const allow = new Set<string>();
   for (const tid of types) for (const g of TRADE_TYPES[tid].gear) allow.add(g.toLowerCase());
   const out: GearInst[] = [];
-  const seen = new Set<string>();
   for (const bag of inv ?? []) for (const it of bag.items) {
     if (!it.n || !allow.has(it.n.toLowerCase())) continue;
-    if (seen.has(it.n)) continue;
-    seen.add(it.n);
-    out.push({ key: it.n, name: it.n, bagId: bag.id, bagName: bag.b, slot: it.s, aug: it.aug ?? [] });
+    out.push({ key: instKey(it.n, bag.id, it.s), name: it.n, bagId: bag.id, bagName: bag.b, slot: it.s, aug: it.aug ?? [] });
   }
-  return out.sort((a, b) => a.name.localeCompare(b.name) || a.bagName.localeCompare(b.bagName));
+  return out.sort((a, b) => a.name.localeCompare(b.name) || a.bagId - b.bagId || a.slot - b.slot);
 }
 
-// Resolve a saved selection to a gear instance by IDENTITY (item name), so a configured
-// roll keeps working wherever the item is in the bags. New selections store the item name.
-// Legacy selections stored "bag:slot": recover those by reading the item that now sits
-// there and matching it by name, so old configs aren't silently lost.
+// Resolve a saved selection to the exact physical copy it names. New selections store
+// "name@bag:slot" so a specific copy is targeted. If that exact copy has moved or is gone
+// (or the config is legacy: bare "bag:slot" or a plain item name), recover by matching the
+// item name so an old config still points at a real copy instead of vanishing.
 export function resolveSel(selKey: string, instances: GearInst[], inv?: InvBag[]): GearInst | undefined {
   if (!selKey) return undefined;
-  const byName = instances.find((i) => i.key === selKey);
-  if (byName) return byName;
+  const exact = instances.find((i) => i.key === selKey);
+  if (exact) return exact;
+  const at = selKey.indexOf('@');
+  if (at >= 0) {
+    const nm = selKey.slice(0, at).toLowerCase();
+    return instances.find((i) => i.name.toLowerCase() === nm);
+  }
   const m = /^(\d+):(\d+)$/.exec(selKey);
   if (m && inv) {
     const bagId = Number(m[1]), slot = Number(m[2]);
     const it = inv.find((b) => b.id === bagId)?.items.find((x) => x.s === slot);
     if (it) return instances.find((i) => i.name.toLowerCase() === it.n.toLowerCase());
   }
-  return undefined;
+  const lc = selKey.toLowerCase();
+  return instances.find((i) => i.name.toLowerCase() === lc);
 }
 
 export const augKey = (view: string, char: string, field: string) => `aug.${view}.${char}.${field}`;
@@ -64,7 +77,7 @@ export function readGearCfg(view: string, char: string, inv?: InvBag[]): GearCfg
   const selKey = getStickyPersisted(k('sel'), '');
   const inst = resolveSel(selKey, gearInstancesFor(view, inv), inv);
   return {
-    item: inst?.name ?? (selKey.includes(':') ? '' : selKey),
+    item: inst?.name ?? nameFromSelKey(selKey),
     inst,
     material: getStickyPersisted(k('mat'), ''),
     style: getStickyPersisted(k('style'), 'Melee'),

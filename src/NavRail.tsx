@@ -7,11 +7,12 @@ import { useSettings } from './settings';
 const DISCORD_URL = 'https://discord.com/invite/vSgYvdh8gT';
 
 export type Section =
-  | 'inventory' | 'recent' | 'watch' | 'drop' | 'dupe' | 'keyitems' | 'currency' | 'trade'
-  | 'pool' | 'lotlist' | 'passlist'
-  | 'shop' | 'selllist' | 'resupply' | 'auction' | 'bazaar' | 'delivery' | 'sparks'
-  | 'organize' | 'sequences' | 'commands' | 'store'
+  | 'inventory' | 'library' | 'recent' | 'watch' | 'drop' | 'dupe' | 'keyitems' | 'currency' | 'trade'
+  | 'pool' | 'lotlist' | 'passlist' | 'pricelist'
+  | 'shop' | 'selllist' | 'resupply' | 'vendors' | 'auction' | 'bazaar' | 'delivery' | 'sparks' | 'networth'
+  | 'organize' | 'sequences' | 'commands' | 'store' | 'tags'
   | 'slips' | 'ambuscade' | 'skirmish' | 'reive' | 'geasfete'
+  | 'gearsets'
   | 'settings';
 
 const S = { fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round' as const, strokeLinejoin: 'round' as const };
@@ -24,6 +25,7 @@ const sword = (<svg viewBox="0 0 24 24" {...S}><path d="M14.5 17.5 L3 6 L3 3 L6 
 
 const ICONS: Record<Section, ReactElement> = {
   inventory: (<svg viewBox="0 0 24 24" {...S}><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M3 9h18" /><path d="M9 4v5" /><path d="M15 4v5" /></svg>),
+  library:    (<svg viewBox="0 0 24 24" {...S}><path d="M12 6.5C10.3 5.2 7.6 4.5 4 4.5v13c3.6 0 6.3.7 8 2 1.7-1.3 4.4-2 8-2v-13c-3.6 0-6.3.7-8 2z" /><path d="M12 6.5v13" /></svg>),
   recent:    (<svg viewBox="0 0 24 24" {...S}><path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5" /><path d="M12 8v4l3 2" /></svg>),
   watch:     (<svg viewBox="0 0 24 24" {...S}><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z" /><circle cx="12" cy="12" r="3" /></svg>),
   drop:      (<svg viewBox="0 0 24 24" {...S}><path d="M4 7h16" /><path d="M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" /><path d="m6 7 1 13h10l1-13" /></svg>),
@@ -34,31 +36,37 @@ const ICONS: Record<Section, ReactElement> = {
   pool:      (<svg viewBox="0 0 24 24" {...S}><path d="M3 7l9-4 9 4-9 4-9-4z" /><path d="M3 12l9 4 9-4" /><path d="M3 17l9 4 9-4" /></svg>),
   lotlist:   rulesIcon,
   passlist:  passIcon,
+  pricelist: (<svg viewBox="0 0 24 24" {...S}><rect x="3" y="9" width="12" height="12" rx="1.5" /><path d="M9 9V4.5A1.5 1.5 0 0 1 10.5 3h9A1.5 1.5 0 0 1 21 4.5v9a1.5 1.5 0 0 1-1.5 1.5H15" /></svg>),
   shop:      (<svg viewBox="0 0 24 24" {...S}><path d="M3 9 4.5 4h15L21 9" /><path d="M4 9h16v10a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1z" /><path d="M3 9a2.5 2.5 0 0 0 5 0 2.5 2.5 0 0 0 5 0 2.5 2.5 0 0 0 5 0 2.5 2.5 0 0 0 3 0" /><path d="M9 20v-5h6v5" /></svg>),
   auction:   (<svg viewBox="0 0 24 24" {...S}><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z" /><circle cx="7" cy="7" r="1.2" /></svg>),
   bazaar:    (<svg viewBox="0 0 24 24" {...S}><path d="M5 8h14l-1 4H6z" /><path d="M6 12v7h12v-7" /><path d="M9 8V5a3 3 0 0 1 6 0v3" /></svg>),
   delivery:  (<svg viewBox="0 0 24 24" {...S}><rect x="2" y="5" width="20" height="14" rx="2" /><path d="m2 7 10 6 10-6" /></svg>),
   sparks:    (<svg viewBox="0 0 24 24" {...S}><path d="M12 2l2.2 6.3L20 10l-5.8 1.7L12 18l-2.2-6.3L4 10l5.8-1.7z" /><path d="M18 14l.8 2.2L21 17l-2.2.8L18 20l-.8-2.2L15 17l2.2-.8z" /></svg>),
   selllist:  (<svg viewBox="0 0 24 24" {...S}><path d="M4 6h10" /><path d="M4 12h10" /><path d="M4 18h6" /><path d="M16 15l3 3 3-5" /></svg>),
+  networth:  (<svg viewBox="0 0 24 24" {...S}><path d="M3 3v18h18" /><path d="m7 14 3-3 3 3 5-6" /><path d="M18 8h3v3" /></svg>),
   resupply:  (<svg viewBox="0 0 24 24" {...S}><path d="M3 7h13l-2-2" /><path d="M21 17H8l2 2" /><path d="M16 11h4v4" /></svg>),
+  vendors:   (<svg viewBox="0 0 24 24" {...S}><path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z" /><path d="M3 6h18" /><path d="M16 10a4 4 0 0 1-8 0" /></svg>),
   organize:  (<svg viewBox="0 0 24 24" {...S}><rect x="3" y="3" width="7" height="7" rx="1.5" /><rect x="14" y="3" width="7" height="7" rx="1.5" /><rect x="3" y="14" width="7" height="7" rx="1.5" /><rect x="14" y="14" width="7" height="7" rx="1.5" /></svg>),
   sequences: (<svg viewBox="0 0 24 24" {...S}><path d="M8 6h12" /><path d="M8 12h12" /><path d="M8 18h12" /><path d="M3.5 6h.01" /><path d="M3.5 12h.01" /><path d="M3.5 18h.01" /></svg>),
   commands:  (<svg viewBox="0 0 24 24" {...S}><rect x="3" y="4" width="18" height="16" rx="2" /><path d="m7 9 3 3-3 3" /><path d="M13 15h4" /></svg>),
   store:     (<svg viewBox="0 0 24 24" {...S}><path d="M3 9 4.5 4h15L21 9" /><path d="M5 9v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9" /><path d="M9 13h6" /><path d="M9 17h6" /></svg>),
+  tags:      (<svg viewBox="0 0 24 24" {...S}><path d="M20.59 13.41 13.42 20.58a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z" /><circle cx="7" cy="7" r="1.5" /></svg>),
   slips:     (<svg viewBox="0 0 24 24" {...S}><path d="M3 5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /><path d="M15 3v5h5" /><path d="M8 13h8" /><path d="M8 17h5" /></svg>),
   ambuscade: cape,
   skirmish:  sword,
   reive:     cape,
   geasfete:  armor,
+  gearsets:  sword,
   settings:  (<svg viewBox="0 0 24 24" {...S}><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2V21a2 2 0 1 1-4 0v-.1A1.7 1.7 0 0 0 7 19.4a1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0-1.2-2.9H1a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 2.6 7a1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H7a1.7 1.7 0 0 0 1-1.5V1a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V7a1.7 1.7 0 0 0 1.5 1H23a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z" /></svg>),
 };
 
 const LABELS: Record<Section, string> = {
-  inventory: 'Inventory', recent: 'Recent Items', watch: 'Watch List', drop: 'Drop List', dupe: 'Dupe Find', keyitems: 'Key Items',
-  currency: 'Currency', trade: 'Trade', pool: 'Pool', lotlist: 'Lot List', passlist: 'Pass List',
-  shop: 'Shop', selllist: 'Sell List', resupply: 'Curio', auction: 'Auction', bazaar: 'Bazaar', delivery: 'Delivery', sparks: 'Sparks/Unity',
-  organize: 'Organize', sequences: 'Sequences', commands: 'Commands', store: 'Storage NPC',
+  inventory: 'Inventory', library: 'Library', recent: 'Recent Items', watch: 'Watch List', drop: 'Drop List', dupe: 'Consolidate', keyitems: 'Key Items',
+  currency: 'Currency', trade: 'Trade', pool: 'Pool', lotlist: 'Lot List', passlist: 'Pass List', pricelist: 'Price Display',
+  shop: 'Shop', selllist: 'Sell List', resupply: 'Curio', vendors: 'Vendors', auction: 'Auction', bazaar: 'Bazaar', delivery: 'Delivery', sparks: 'Sparks/Unity', networth: 'Net Worth',
+  organize: 'Organize', sequences: 'Sequences', commands: 'Commands', store: 'Storage NPC', tags: 'Tagging',
   slips: 'Storage Slips', ambuscade: 'Ambuscade', skirmish: 'Skirmish', reive: 'Reive', geasfete: 'Geas Fete',
+  gearsets: 'Gearsets',
   settings: 'Settings',
 };
 
@@ -70,13 +78,17 @@ const GROUP_ICON = {
   tools:  (<svg viewBox="0 0 24 24" {...S}><path d="M5 21v-6" /><path d="M5 11V3" /><path d="M12 21v-9" /><path d="M12 8V3" /><path d="M19 21v-4" /><path d="M19 13V3" /><path d="M2 15h6" /><path d="M9 8h6" /><path d="M16 17h6" /></svg>),
 };
 
+export const GEARSETS_ENABLED = false;
+
 type NavGroup = { id: string; label: string; icon: ReactElement; primary?: Section; children: Section[] };
 const GROUPS: NavGroup[] = [
-  { id: 'inventory', label: 'Inventory', icon: ICONS.inventory, primary: 'inventory', children: ['recent', 'keyitems', 'currency', 'watch', 'drop'] },
-  { id: 'pool', label: 'Pool', icon: ICONS.pool, primary: 'pool', children: ['lotlist', 'passlist'] },
-  { id: 'market', label: 'Market', icon: GROUP_ICON.market, primary: 'auction', children: ['delivery', 'bazaar', 'shop', 'selllist'] },
-  { id: 'tools', label: 'Tools', icon: GROUP_ICON.tools, primary: 'organize', children: ['store', 'slips', 'resupply', 'sparks'] },
+  { id: 'inventory', label: 'Inventory', icon: ICONS.inventory, primary: 'inventory', children: ['recent', 'keyitems', 'currency', 'watch', 'drop', 'selllist'] },
+  { id: 'library', label: 'Library', icon: ICONS.library, primary: 'library', children: [] },
+  { id: 'pool', label: 'Pool', icon: ICONS.pool, primary: 'pool', children: ['lotlist', 'passlist', 'pricelist'] },
+  { id: 'market', label: 'Market', icon: GROUP_ICON.market, primary: 'auction', children: ['delivery', 'bazaar', 'shop', 'networth'] },
+  { id: 'tools', label: 'Tools', icon: GROUP_ICON.tools, primary: 'organize', children: ['tags', 'dupe', 'store', 'slips', 'resupply', 'vendors', 'sparks'] },
   { id: 'augment', label: 'Augment', icon: armor, primary: 'ambuscade', children: ['reive', 'skirmish', 'geasfete'] },
+  { id: 'gearsets', label: 'Gearsets', icon: ICONS.gearsets, primary: 'gearsets', children: [] },
 ];
 
 const railBtn = 'le-tap group relative w-[60px] h-[58px] @max-[460px]:w-11 @max-[460px]:h-11 rounded-xl flex flex-col items-center justify-center gap-1 transition-colors';
@@ -146,7 +158,9 @@ function GroupItem({ group, active, onSelect }: { group: NavGroup; active: Secti
 export default function NavRail({ active, onSelect }: { active: Section; onSelect: (s: Section) => void }) {
   return (
     <nav className="bg-nav relative z-40 w-[76px] @max-[460px]:w-14 shrink-0 h-full flex flex-col items-center gap-1 py-3 border-r border-line">
-      {GROUPS.map((g) => <GroupItem key={g.id} group={g} active={active} onSelect={onSelect} />)}
+      {GROUPS.filter((g) => GEARSETS_ENABLED || g.id !== 'gearsets').map((g) => (g.children.length === 0 && g.primary
+        ? <RailButton key={g.id} id={g.primary} label={g.label} icon={g.icon} active={active === g.primary} onSelect={onSelect} />
+        : <GroupItem key={g.id} group={g} active={active} onSelect={onSelect} />))}
 
       <div className="mt-auto w-full flex flex-col items-center gap-1 pt-1 border-t border-line">
         <RailButton id="settings" label={LABELS.settings} icon={ICONS.settings} active={active === 'settings'} onSelect={onSelect} />

@@ -1,39 +1,39 @@
 {
-  "name": "alexandria-desktop",
-  "private": true,
-  "version": "0.0.1",
-  "type": "module",
-  "scripts": {
-    "dev": "vite",
-    "build:icons": "node scripts/build-icons.mjs",
-    "build:catalog": "node scripts/build-catalog.mjs",
-    "build:itemnames": "node scripts/build-itemnames.mjs",
-    "build:atlas": "node scripts/build-atlas.mjs",
-    "build": "tsc --noEmit && vite build",
-    "preview": "vite preview",
-    "tauri": "tauri",
-    "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
-  },
-  "dependencies": {
-    "@tauri-apps/api": "^2.11.0",
-    "@tauri-apps/plugin-dialog": "^2.7.1",
-    "@tauri-apps/plugin-process": "^2",
-    "@tauri-apps/plugin-updater": "^2",
-    "motion": "^12.41.0",
-    "react": "19.2.3",
-    "react-dom": "19.2.3"
-  },
-  "devDependencies": {
-    "@tailwindcss/vite": "^4",
-    "@tauri-apps/cli": "^2.11.2",
-    "@types/node": "^20",
-    "@types/react": "^19",
-    "@types/react-dom": "^19",
-    "@vitejs/plugin-react": "^4.3.4",
-    "pngjs": "^7.0.0",
-    "tailwindcss": "^4",
-    "typescript": "^5",
-    "vite": "^6.0.7"
-  }
+    "name":  "alexandria-desktop",
+    "private":  true,
+    "version":  "0.0.22",
+    "type":  "module",
+    "scripts":  {
+                    "dev":  "vite",
+                    "build:icons":  "node scripts/build-icons.mjs",
+                    "build:catalog":  "node scripts/build-catalog.mjs",
+                    "build:itemnames":  "node scripts/build-itemnames.mjs",
+                    "build:atlas":  "node scripts/build-atlas.mjs",
+                    "build":  "tsc --noEmit \u0026\u0026 vite build",
+                    "preview":  "vite preview",
+                    "tauri":  "tauri",
+                    "tauri:dev":  "tauri dev",
+                    "tauri:build":  "tauri build"
+                },
+    "dependencies":  {
+                         "@tauri-apps/api":  "^2.11.0",
+                         "@tauri-apps/plugin-dialog":  "^2.7.1",
+                         "@tauri-apps/plugin-process":  "^2",
+                         "@tauri-apps/plugin-updater":  "^2",
+                         "motion":  "^12.41.0",
+                         "react":  "19.2.3",
+                         "react-dom":  "19.2.3"
+                     },
+    "devDependencies":  {
+                            "@tailwindcss/vite":  "^4",
+                            "@tauri-apps/cli":  "^2.11.2",
+                            "@types/node":  "^20",
+                            "@types/react":  "^19",
+                            "@types/react-dom":  "^19",
+                            "@vitejs/plugin-react":  "^4.3.4",
+                            "pngjs":  "^7.0.0",
+                            "tailwindcss":  "^4",
+                            "typescript":  "^5",
+                            "vite":  "^6.0.7"
+                        }
 }

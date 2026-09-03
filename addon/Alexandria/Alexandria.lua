@@ -1840,6 +1840,9 @@ end
 
 function dbox_pq_drain(now)
     if #dbox_pq == 0 then return end
+    -- Same guard as the AH queue: never fire delivery-box packets once we can no longer reach a Moogle
+    -- (walked away / zoned after queuing). Drop the queue instead of poking the server off-site.
+    if not dbox_allowed() then dbox_pq = {}; return end
     if now - dbox_pq_last < DBOX_PKT_GAP then return end
     local p = table.remove(dbox_pq, 1)
     if packets_ok then pcall(windower.packets.inject_outgoing, 0x4D, p) end
@@ -2471,6 +2474,9 @@ end
 
 local function shop_do_sell(id, slot, qty)
     if not packets_ok then return end
+    -- Only sell when a shop is actually open, or in the explicit sell-anywhere-in-town mode. Stops a pending
+    -- sell that resolves after the shop closed (or a stale command) from firing shop packets off-menu.
+    if not (shop_session or (sell_anywhere and in_town())) then return end
     pcall(windower.packets.inject_outgoing, 0x84, string.char(0x84, 0x06, 0, 0) .. le4(qty) .. le2(id) .. string.char(slot, 0))
     pcall(windower.packets.inject_outgoing, 0x85, string.char(0x85, 0x04, 0, 0, 1, 0, 0, 0))
 end
@@ -2484,6 +2490,7 @@ end
 
 function shop_buy(idx, qty)
     if not packets_ok then return false end
+    if not shop_session then return false end -- can't buy without an open shop
     qty = math.min(math.max(1, tonumber(qty) or 1), shop_stack_for_idx(idx))
     pcall(windower.packets.inject_outgoing, 0x83, shop_buy_packet(idx, qty))
     return true
@@ -4592,7 +4599,7 @@ function ah_handle_incoming(data)
                 local last = ah_last4e
                 local confirm = string.char(0x4E, 0x1E, 0, 0, 0x0B, slot, 0, 0) .. last:sub(9, 12) .. data:sub(13, 14) .. string.char(0, 0) .. last:sub(17)
                 ah_last4e = nil
-                coroutine.schedule(function() if packets_ok then pcall(windower.packets.inject_outgoing, 0x4E, confirm) end end, 1)
+                coroutine.schedule(function() if packets_ok and ah_usable() then pcall(windower.packets.inject_outgoing, 0x4E, confirm) end end, 1)
             elseif ah_last4e then
                 ah_last4e = nil
                 ah_busy = false
@@ -9011,16 +9018,25 @@ function alex_prerender()
         ah_busy = false
     end
     if #ah_queue > 0 and not ah_busy and now >= ah_t then
-        local fn = table.remove(ah_queue, 1)
-        if fn then
-            local ok, ran = pcall(fn)
-            if ok and ran then
-                ah_t = now + AH_DELAY
-                ah_busy = true
-                ah_busy_t = now
+        -- Hard gate at the single point every AH packet leaves the client: if we are no longer at an auction
+        -- house (walked away / zoned after queuing), DROP the queue instead of firing 0x4E packets that the
+        -- game answers with "auction house is temporarily closed". Never transmit an AH action off-site.
+        if not ah_usable() then
+            ah_queue = {}
+            ah_busy = false
+            ah_dirty = true
+        else
+            local fn = table.remove(ah_queue, 1)
+            if fn then
+                local ok, ran = pcall(fn)
+                if ok and ran then
+                    ah_t = now + AH_DELAY
+                    ah_busy = true
+                    ah_busy_t = now
+                end
             end
+            ah_dirty = true
         end
-        ah_dirty = true
     end
 
     if ah_dirty then

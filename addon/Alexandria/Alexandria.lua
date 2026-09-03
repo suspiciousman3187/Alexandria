@@ -5834,10 +5834,21 @@ local function dispatch(line)
     elseif msg.cmd == 'curioscan' then
         curio_scan_start()
     elseif msg.cmd == 'ahmenu' then
-        ah_open_menu()
-        ah_enqueue(function() return ah_request_status() end)
+        -- NEVER fire the AH menu/status packet away from an auction house: the game answers with
+        -- "auction house is temporarily closed for trading", which spams anyone standing in a normal zone
+        -- with the Market view open. Just report we are not at an AH so the UI stops asking.
+        if ah_usable() then
+            ah_open_menu()
+            ah_enqueue(function() return ah_request_status() end)
+        else
+            queue_send(build_ah())
+        end
     elseif msg.cmd == 'ahslots' then
-        ah_enqueue(function() return ah_request_status() end)
+        if ah_usable() then
+            ah_enqueue(function() return ah_request_status() end)
+        else
+            queue_send(build_ah())
+        end
     elseif msg.cmd == 'ahbuy' and msg.id then
         if not ah_usable() then
             queue_send('{"t":"ahmsg","ok":false,"text":"Not at an auction house"}\n')

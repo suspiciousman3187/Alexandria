@@ -1,11 +1,13 @@
 import { useSyncExternalStore } from 'react';
 
-export type ItemName = { id: number; n: string; st: number; l?: string; sl?: number };
+export type ItemName = { id: number; n: string; st: number; l?: string; sl?: number; jb?: number; lv?: number };
 
 let list: ItemName[] = [];
 let fullById = new Map<number, string>();
 let stackById = new Map<number, number>();
 let slotById = new Map<number, number>();
+let jobById = new Map<number, number>();
+let levelById = new Map<number, number>();
 let started = false;
 const subs = new Set<() => void>();
 
@@ -21,10 +23,14 @@ async function load() {
         fullById = new Map();
         stackById = new Map();
         slotById = new Map();
+        jobById = new Map();
+        levelById = new Map();
         for (const it of list) {
           if (it.l) fullById.set(it.id, it.l.toLowerCase());
           if (it.st > 1) stackById.set(it.id, it.st);
           if (it.sl) slotById.set(it.id, it.sl);
+          if (it.jb) jobById.set(it.id, it.jb);
+          if (it.lv) levelById.set(it.id, it.lv);
         }
       }
     }
@@ -34,6 +40,34 @@ async function load() {
 
 export function itemStack(id: number): number {
   return stackById.get(id) ?? 1;
+}
+
+// Job codes in jobId order (WAR = jobId 1 .. RUN = 22), matching the `jobs` bitmask bit = 1<<jobId.
+const JOB_NAMES = ['WAR', 'MNK', 'WHM', 'BLM', 'RDM', 'THF', 'PLD', 'DRK', 'BST', 'BRD', 'RNG', 'SAM', 'NIN', 'DRG', 'SMN', 'BLU', 'COR', 'PUP', 'DNC', 'SCH', 'GEO', 'RUN'];
+// Decode which jobs can equip an item. Returns null for items with no job data (consumables, key items, etc.).
+export function itemJobs(id: number): { jobs: string[]; all: boolean; level?: number } | null {
+  const jb = jobById.get(id);
+  if (!jb) return null;
+  const jobs: string[] = [];
+  for (let i = 0; i < JOB_NAMES.length; i++) if (jb & (1 << (i + 1))) jobs.push(JOB_NAMES[i]);
+  return { jobs, all: jobs.length >= JOB_NAMES.length, level: levelById.get(id) };
+}
+
+const JOB_BIT: Record<string, number> = Object.fromEntries(JOB_NAMES.map((c, i) => [c, 1 << (i + 1)]));
+export const JOB_LIST: readonly string[] = JOB_NAMES;
+// True if the given job can equip the item. Only equippable gear carries a job bitmask, so consumables/etc.
+// are never matched. An item with no job data (jb undefined) returns false.
+export function jobEquips(id: number, job: string): boolean {
+  const jb = jobById.get(id);
+  if (!jb) return false;
+  const bit = JOB_BIT[job.toUpperCase()];
+  return !!bit && (jb & bit) !== 0;
+}
+
+// The full (un-abbreviated) name for an item, lowercased -- FFXI truncates long names in-game (the `n`
+// shown name), so a search by the full name only matches via this. Undefined when there's no long form.
+export function itemFullName(id: number): string | undefined {
+  return fullById.get(id);
 }
 
 export type ItemCategory = 'main' | 'sub' | 'ranged' | 'ammo' | 'head' | 'body' | 'hands' | 'legs' | 'feet' | 'neck' | 'waist' | 'ears' | 'rings' | 'back' | 'other';
@@ -84,8 +118,9 @@ export function resolveItemName(name: string): ItemName | null {
   let partial: ItemName | null = null;
   for (const it of list) {
     const n = it.n.toLowerCase();
-    if (n === lc) return it;
-    if (!partial && n.includes(lc)) partial = it;
+    const l = it.l?.toLowerCase();               // full (un-abbreviated) name, if any
+    if (n === lc || l === lc) return it;
+    if (!partial && (n.includes(lc) || (l != null && l.includes(lc)))) partial = it;
   }
   return partial;
 }

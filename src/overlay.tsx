@@ -1,6 +1,7 @@
 import { useState, useEffect, useLayoutEffect, useCallback, type ReactNode, type CSSProperties, type RefObject } from 'react';
 import { createPortal } from 'react-dom';
 import { AnimatePresence, motion } from 'motion/react';
+import { logicalRect, logicalViewport, uiZoom } from './uiZoom';
 
 const EASE_OUT = [0.22, 1, 0.36, 1] as const;
 
@@ -9,6 +10,11 @@ export function Modal({
 }: { onClose: () => void; children: ReactNode | ((close: () => void) => ReactNode); panelClass?: string; backdropClose?: boolean }) {
   const [open, setOpen] = useState(true);
   const close = useCallback(() => setOpen(false), []);
+  // Under CSS `zoom` (uiScale > 1), a vh-sized panel (max-h-[88vh]/h-[82vh]) renders zoom-times too tall
+  // and overflows the screen, so its bottom (scrollbar, footer) becomes unreachable. Cap the panel to the
+  // real screen height by dividing the zoom back out. No-op at 100% so panelClass is untouched there.
+  const z = uiZoom();
+  const panelStyle = z > 1 ? ({ maxHeight: `calc(90vh / ${z})` } as CSSProperties) : undefined;
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
@@ -29,6 +35,7 @@ export function Modal({
         >
           <motion.div
             className={`rounded-xl border border-line bg-surface-raised shadow-xl flex flex-col ${panelClass}`}
+            style={panelStyle}
             initial={{ opacity: 0, y: 10, scale: 0.98 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: 8, scale: 0.98 }}
@@ -90,10 +97,13 @@ export function Popover({
     if (!anchor || !open) return;
     const measure = () => {
       const el = anchor.current; if (!el) return;
-      const r = el.getBoundingClientRect();
-      const below = window.innerHeight - r.bottom;
+      // Position in the popover's own (zoom-adjusted) coordinate space so a uiScale > 1 never throws the
+      // dropdown off-screen; see uiZoom.ts. No-op at 100%.
+      const r = logicalRect(el.getBoundingClientRect());
+      const vh = logicalViewport().h;
+      const below = vh - r.bottom;
       const flip = below < 248 && r.top > below; // no room under the input -> open upward
-      setPos({ left: r.left, width: r.width, top: flip ? undefined : r.bottom + 4, bottom: flip ? window.innerHeight - r.top + 4 : undefined });
+      setPos({ left: r.left, width: r.width, top: flip ? undefined : r.bottom + 4, bottom: flip ? vh - r.top + 4 : undefined });
     };
     measure();
     window.addEventListener('scroll', measure, true);

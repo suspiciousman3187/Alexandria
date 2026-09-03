@@ -3,6 +3,8 @@ import { useSyncExternalStore } from 'react';
 import { appDataPath, inTauri, type KnownChar } from './bridge';
 import { layoutFor, ALL_PLAYERS_KEY, type LayoutEntry } from './storagePrefs';
 import { getItemTags } from './itemTags';
+import { slotRulesMapFor } from './slotRules';
+import { itemCategory } from './itemNames';
 import { TEMPORARY_BAG } from './bagConstants';
 
 // Where a TAG goes: tag id -> bag priority order. Scoped like storage presets
@@ -86,7 +88,8 @@ export function resolveLayout(char: KnownChar | undefined): LayoutEntry[] {
   if (!char) return [];
   const explicit = layoutFor(char.name);
   const rules = tagRulesFor(char.name);
-  if (!rules.length) return explicit;
+  const slotMap = slotRulesMapFor(char.name); // equip-slot -> bags, lowest precedence
+  if (!rules.length && slotMap.size === 0) return explicit;
   const { tags, assign } = getItemTags();
   const rank = new Map(tags.map((t, i) => [t.id, i])); // lower index = higher priority
   const ruleByTag = new Map(rules.map((r) => [r.tag, r.bags]));
@@ -98,16 +101,23 @@ export function resolveLayout(char: KnownChar | undefined): LayoutEntry[] {
     for (const it of bag.items) {
       const key = it.n.toLowerCase();
       if (explicitNames.has(key) || seen.has(key)) continue;
+      // Tag rule first (beats a slot rule): among an item's tags, the highest-priority one with a rule wins.
       const tagIds = assign[it.id];
-      if (!tagIds || !tagIds.length) continue;
       let best: string | null = null;
       let bestRank = Infinity;
-      for (const tid of tagIds) {
+      if (tagIds) for (const tid of tagIds) {
         if (!ruleByTag.has(tid)) continue;
         const r = rank.get(tid) ?? Infinity;
         if (r < bestRank) { bestRank = r; best = tid; }
       }
-      if (best) { out.push({ item: it.n, bags: (ruleByTag.get(best) ?? []).slice() }); seen.add(key); }
+      if (best) { out.push({ item: it.n, bags: (ruleByTag.get(best) ?? []).slice() }); seen.add(key); continue; }
+      // Slot rule (lowest precedence): route by the item's equip slot. Only equipment has a slot category,
+      // so this never routes a non-equippable item -- and the addon refuses any junk->wardrobe move anyway.
+      if (slotMap.size) {
+        const cat = itemCategory(it.id);
+        const bags = cat !== 'other' ? slotMap.get(cat) : undefined;
+        if (bags && bags.length) { out.push({ item: it.n, bags: bags.slice() }); seen.add(key); }
+      }
     }
   }
   return out;

@@ -8,6 +8,7 @@ use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Emitter};
 
 mod ahsearch;
+mod sage_feed;
 
 const BOX_PORT: u16 = 24233;
 static CONN_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -416,6 +417,7 @@ fn recreate_main_window(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
         .resizable(true)
         .decorations(false)
         .build()?;
+    let _ = w.set_icon(tauri::include_image!("icons/taskbar.png"));
     let _ = w.show();
     let _ = w.set_focus();
     Ok(())
@@ -482,7 +484,24 @@ fn setup_tray(_app: &tauri::AppHandle) -> Result<(), tauri::Error> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Single-instance guard (release only, so a dev window can still run alongside a release build).
+    // Only the first instance can bind the box server port :24233; extra launches would spin forever in
+    // the bind-retry loop with a window that never connects (the "opened it 4 times, none connect" report).
+    // A second launch now just focuses the running window instead of opening a dead one. Must be registered
+    // before the other plugins.
+    #[cfg(not(debug_assertions))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        use tauri::Manager;
+        if let Some(w) = app.get_webview_window("main") {
+            let _ = w.unminimize();
+            let _ = w.show();
+            let _ = w.set_focus();
+        } else {
+            let _ = recreate_main_window(app);
+        }
+    }));
+    builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -495,7 +514,17 @@ pub fn run() {
                 )?;
             }
             start_box_server(app.handle().clone());
+            sage_feed::start(app.handle().clone());
             let _ = setup_tray(app.handle());
+            // Force a high-res window icon. Tauri's default_window_icon resolves to a small (32px) source,
+            // which Windows then upscales for the taskbar/alt-tab at higher DPI -> a blurry, mushy icon. Set
+            // the window icon explicitly to the hi-res face so Windows downscales cleanly instead.
+            {
+                use tauri::Manager;
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.set_icon(tauri::include_image!("icons/taskbar.png"));
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -515,6 +544,8 @@ pub fn run() {
             http_get,
             ahsearch::ah_history,
             ahsearch::ah_category,
+            sage_feed::sage_pool_prices,
+            sage_feed::sage_send,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

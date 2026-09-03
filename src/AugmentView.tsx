@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { useKnownCharacters, useAvailableIcons, useItemDescription, augCape, augCapeSeq, augGear, augStop, augKeep, augReroll, augStopAll, type InvBag, type AugState, type KnownChar, type CapeSeqStep } from './bridge';
+import { useKnownCharacters, useAvailableIcons, useItemDescription, augCape, augCapeSeq, augGear, augStop, augKeep, augReroll, augStepContinue, augStopAll, requestCurrency, type InvBag, type AugState, type KnownChar, type CapeSeqStep, type ConfirmMode, type Currency } from './bridge';
+
+// "Each Step" = confirm after each single roll; "Each Path" = confirm after each full path (sequence row).
+const CONFIRM_OPTS: { v: ConfirmMode; label: string }[] = [{ v: 'none', label: 'Off' }, { v: 'step', label: 'Each Step' }, { v: 'path', label: 'Each Path' }];
 import { useItemNames, itemNameMatches } from './itemNames';
 import { IconInner } from './atlasIcon';
-import { Group, Row, RowStacked, Segmented, Select, Slider, CharacterSelect, Stepper, SectionTabs, SearchInput } from './ui';
+import { Group, Row, RowStacked, Segmented, Select, Slider, Toggle, CharacterSelect, Stepper, SectionTabs, SearchInput, Button } from './ui';
 import { OpGlyph } from './OpCard';
 import { Crossfade, Modal } from './overlay';
 import { useStickyChar, useStickyPersisted } from './sticky';
@@ -145,7 +148,7 @@ function StatusCard({ status, attempts, total, active, results, manual, header, 
 }
 
 const VIEW_AUG_MODE: Record<string, string> = { ambuscade: 'Ambuscade', skirmish: 'Skirmish', reive: 'Cape', geasfete: 'Geas Fete' };
-function AugProgress({ aug, assets, viewMode, onKeep, onReroll, onStop }: { aug?: AugState | null; assets?: string; viewMode?: string; onKeep?: () => void; onReroll?: () => void; onStop?: () => void }) {
+function AugProgress({ aug, assets, viewMode, onKeep, onReroll, onStop, onStepContinue }: { aug?: AugState | null; assets?: string; viewMode?: string; onKeep?: () => void; onReroll?: () => void; onStop?: () => void; onStepContinue?: () => void }) {
   const res = useNameResolver();
   const active = !!aug?.active;
   const matches = !viewMode || aug?.mode === viewMode;
@@ -179,7 +182,23 @@ function AugProgress({ aug, assets, viewMode, onKeep, onReroll, onStop }: { aug?
           className="sticky top-0 z-20 -mx-4 -mt-4 px-4 pt-4 pb-1 bg-bg/95 backdrop-blur-sm"
         >
           <StatusCard status={aug?.status} attempts={aug?.attempts} total={aug?.total} active={aug?.active} results={aug?.results} manual={aug?.manual} header={header} bar={isAmb} />
-          {aug?.awaitDecision && onKeep && onReroll ? (
+          {aug?.awaitStep && onStepContinue ? (
+            <div className="mb-3 flex flex-col gap-2">
+              {aug.augs && aug.augs.some((s) => s && s.toLowerCase() !== 'none') && (
+                <div className="rounded-md border border-line bg-field/40 px-3 py-2 flex flex-col gap-0.5">
+                  {aug.augs.filter((s) => s && s.toLowerCase() !== 'none').map((s, i) => (
+                    <div key={i} className="text-[11px] font-medium text-fg-2">{s}</div>
+                  ))}
+                </div>
+              )}
+              <div className="flex gap-2">
+                <button onClick={onStepContinue} className="flex-1 px-3 py-2 text-[12px] font-bold rounded-md bg-emerald-500/15 text-emerald-300 border border-emerald-500/40 hover:bg-emerald-500/25 transition-colors">Continue</button>
+                {onStop && (
+                  <button onClick={onStop} className="flex-1 px-3 py-2 text-[12px] font-bold rounded-md bg-red-500/15 text-red-300 border border-red-500/40 hover:bg-red-500/25 transition-colors">Stop</button>
+                )}
+              </div>
+            </div>
+          ) : aug?.awaitDecision && onKeep && onReroll ? (
             <div className="flex gap-2 mb-3">
               <button onClick={onKeep} className="flex-1 px-3 py-2 text-[12px] font-bold rounded-md bg-emerald-500/15 text-emerald-300 border border-emerald-500/40 hover:bg-emerald-500/25 transition-colors">Keep</button>
               <button onClick={onReroll} className="flex-1 px-3 py-2 text-[12px] font-bold rounded-md bg-accent/15 text-accent border border-accent/40 hover:bg-accent/25 transition-colors">Reroll</button>
@@ -243,6 +262,7 @@ function AmbuscadePanel({ conn, assets, inv, zone, fixedNear, experimental }: { 
   const path = paths.includes(pathMap[material]) ? pathMap[material] : (paths[0] ?? '');
   const setPath = (p: string) => setPathMap((m) => ({ ...m, [material]: p }));
   const [repeats, setRepeats] = useStickyPersisted('aug.amb.repeats', 10);
+  const [confirmMode, setConfirmMode] = useStickyPersisted<ConfirmMode>('aug.amb.confirmMode', 'none');
   const [tab, setTab] = useStickyPersisted<'single' | 'multi'>('aug.amb.tab', 'single');
 
   const max = CAPE_MAX[material] ?? 20;
@@ -269,10 +289,11 @@ function AmbuscadePanel({ conn, assets, inv, zone, fixedNear, experimental }: { 
                 <RowStacked label="Repeats" desc={`Trades the material this many times (max ${max} for ${material.toLowerCase()})`}>
                   <Slider value={repeats} min={1} max={max} step={1} onChange={setRepeats} />
                 </RowStacked>
+                <Row label="Confirm" desc="Require confirmation of stats before proceeding to next step."><Segmented value={confirmMode === 'step' ? 'step' : 'none'} onChange={setConfirmMode} options={[{ v: 'none', label: 'Off' }, { v: 'step', label: 'Each Step' }]} /></Row>
               </Group>
               <div className="px-1">
                 <button
-                  onClick={() => { if (sel) augCape(conn, { job, material: material.toLowerCase(), path, repeats, bag: sel.bagId, slot: sel.slot }); }}
+                  onClick={() => { if (sel) augCape(conn, { job, material: material.toLowerCase(), path, repeats, bag: sel.bagId, slot: sel.slot, confirmMode: confirmMode === 'step' ? 'step' : 'none' }); }}
                   disabled={!inZone || !sel}
                   className="w-full px-3 py-2 text-[12px] font-bold rounded-md bg-accent text-on-accent hover:bg-accent-hover transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                 >
@@ -308,10 +329,12 @@ function AmbuscadeMulti({ conn, sel, job, inZone, inv, assets, res }: { conn: nu
   const [reps, setReps] = useState(Math.min(10, max));
   useEffect(() => { setReps((r) => Math.min(Math.max(1, r), max)); }, [max]);
   const [confirming, setConfirming] = useState(false);
+  const [confirmMode, setConfirmMode] = useStickyPersisted<ConfirmMode>('aug.amb.confirmMode', 'none');
 
   const addStep = () => { if (!mat || !path) return; setSteps((s) => [...s, { material: mat, path, repeats: Math.min(reps, max) }]); };
   const removeStep = (i: number) => setSteps((s) => s.filter((_, idx) => idx !== i));
-  const startSeq = () => { if (sel && job) { augCapeSeq(conn, { job, bag: sel.bagId, slot: sel.slot, steps }); setConfirming(false); } };
+  const editReps = (i: number, repeats: number) => setSteps((s) => s.map((st, idx) => idx === i ? { ...st, repeats } : st));
+  const startSeq = () => { if (sel && job) { augCapeSeq(conn, { job, bag: sel.bagId, slot: sel.slot, steps, confirmMode }); setConfirming(false); } };
 
   const canReview = inZone && !!sel && steps.length > 0;
 
@@ -346,8 +369,9 @@ function AmbuscadeMulti({ conn, sel, job, inZone, inv, assets, res }: { conn: nu
                 <span className="shrink-0 w-5 text-[11px] font-bold text-fg-4 tabular-nums">{i + 1}</span>
                 <div className="min-w-0 flex-1">
                   <div className="text-[12px] font-semibold text-fg-2 truncate">{s.material} → {augPathLabel(s.path)}</div>
-                  <div className={`text-[10px] ${short ? 'text-red-300' : 'text-fg-4'}`}>×{s.repeats} · have {have}{short ? ` (need ${need})` : ''}</div>
+                  <div className={`text-[10px] ${short ? 'text-red-300' : 'text-fg-4'}`}>have {have}{short ? ` (need ${need})` : ''}</div>
                 </div>
+                <Stepper value={s.repeats} onChange={(v) => editReps(i, v)} min={1} max={CAPE_MAX[s.material] ?? 20} title="Repeats" />
                 <button onClick={() => removeStep(i)} aria-label="Remove" className="shrink-0 grid place-items-center w-6 h-6 rounded text-fg-4 hover:text-red-300 hover:bg-red-500/10 transition-colors">
                   <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M6 6l12 12M18 6 6 18" /></svg>
                 </button>
@@ -386,6 +410,13 @@ function AmbuscadeMulti({ conn, sel, job, inZone, inv, assets, res }: { conn: nu
               {steps.some((s) => materialLocations(inv, `Abdhaljs ${s.material}`).total < stepNeed(steps, s.material)) && (
                 <div className="text-[11px] text-red-300">You are short on materials for one or more steps. The run will stop when a material runs out.</div>
               )}
+              <div className="flex flex-col gap-1.5 rounded-md border border-line bg-field/40 px-2.5 py-2">
+                <div className="flex items-center gap-2.5">
+                  <div className="shrink-0 text-[12px] font-semibold text-fg-2">Confirm</div>
+                  <div className="flex-1"><Segmented full value={confirmMode} onChange={setConfirmMode} options={CONFIRM_OPTS} /></div>
+                </div>
+                <div className="text-[10.5px] text-fg-4 leading-snug">Require confirmation of stats before proceeding to next step/path.</div>
+              </div>
               <div className="flex items-center gap-2">
                 <button onClick={close} className="flex-1 px-3 py-2 text-[12px] font-bold rounded-md bg-field border border-line text-fg-3 hover:text-fg-2 transition-colors">Cancel</button>
                 <button onClick={startSeq} className="flex-1 px-3 py-2 text-[12px] font-bold rounded-md bg-accent text-on-accent hover:bg-accent-hover transition-colors">Augment {steps.length} Step{steps.length === 1 ? '' : 's'}</button>
@@ -465,7 +496,7 @@ function EquipList({ items, selected, onSelect, res, assets }: {
   );
 }
 
-function GearPanel({ conn, charName, view, assets, inv, zone, fixedNear, experimental }: { conn: number; charName: string; view: string; assets?: string; inv?: InvBag[]; zone?: number; fixedNear?: string[]; experimental: boolean }) {
+function GearPanel({ conn, charName, view, assets, inv, cur, zone, fixedNear, experimental }: { conn: number; charName: string; view: string; assets?: string; inv?: InvBag[]; cur?: Currency; zone?: number; fixedNear?: string[]; experimental: boolean }) {
   const res = useNameResolver();
   const types = VIEW_TRADE_TYPES[view] ?? ['Cape'];
   const gearToType = useMemo(() => {
@@ -491,6 +522,7 @@ function GearPanel({ conn, charName, view, assets, inv, zone, fixedNear, experim
   // Delay is a global preference (shared across all characters), not a per-character key.
   const [delay, setDelay] = useStickyPersisted('aug.delay', 2);
   const [maxAttempts, setMaxAttempts] = useStickyPersisted(k('max'), 50);
+  const [dmOn, setDmOn] = useStickyPersisted(k('dmon'), false);
   const [dm, setDm] = useStickyPersisted(k('dm'), 1);
   const [dmAll, setDmAll] = useStickyPersisted(k('dmall'), false);
 
@@ -502,6 +534,20 @@ function GearPanel({ conn, charName, view, assets, inv, zone, fixedNear, experim
   }, [item, gearToType]);
 
   const matList = selType?.material ?? [];
+  // Skirmish rerolls each cost 50 Obsidian Fragments (a currency, same page as Gallimaufry/Escha Beads).
+  // Pull the live count and cap the attempts to what the fragments can pay for, so an auto-roll can't run
+  // dry mid-loop and wedge on Divainy-Gamainy (the "no obsidian check, locked up" report). Fetch fresh on
+  // open so the count is current. Only Skirmish consumes fragments; other modes keep the full 300 range.
+  const OBSIDIAN_PER_ROLL = 50;
+  useEffect(() => { requestCurrency(conn); }, [conn]);
+  const isSkirmish = selType?.mode === 'Skirmish';
+  const curLoaded = !!cur;
+  const obsidian = cur?.list.find((e) => e.n === 'Obsidian Fragments')?.v ?? 0;
+  const affordable = Math.floor(obsidian / OBSIDIAN_PER_ROLL);
+  const fragGated = isSkirmish && curLoaded;
+  const fragBlocked = fragGated && affordable < 1;
+  const attemptMax = fragGated ? Math.min(300, Math.max(1, affordable)) : 300;
+  const sentMax = fragGated ? Math.min(maxAttempts, affordable) : maxAttempts;
   const clean = (s: string) => (s === '(any)' ? '' : s);
   const richMenu = (n: string) => { const id = res.idOf(n); return <GearRow name={n} id={id} assets={assets} hasBmp={res.has(id)} showDesc />; };
   const richMenuCount = (n: string) => {
@@ -528,8 +574,8 @@ function GearPanel({ conn, charName, view, assets, inv, zone, fixedNear, experim
       style: selType.style ? style : undefined,
       augment_1: clean(a1), augment_2: clean(a2), augment_3: clean(a3),
       watch_1: v1, watch_2: v2, watch_3: v3,
-      augment_mode: augMode, delay, max: maxAttempts, manual,
-      ...(material === 'Dark Matter' ? { dm, dm_all: dmAll } : {}),
+      augment_mode: augMode, delay, max: sentMax, manual,
+      ...(material === 'Dark Matter' ? { dm: dmOn ? dm : 0, dm_all: dmOn && dmAll } : {}),
     });
   };
 
@@ -574,32 +620,42 @@ function GearPanel({ conn, charName, view, assets, inv, zone, fixedNear, experim
       </Group>
       <Group title="Limits">
         <RowStacked label="Delay" desc="Seconds between each reroll trade"><Slider value={delay} min={0} max={6} step={1} suffix="s" onChange={setDelay} /></RowStacked>
-        <RowStacked label="Max Attempts" desc="Stops after this many rerolls if no match is found"><Slider value={maxAttempts} min={1} max={300} step={1} onChange={setMaxAttempts} /></RowStacked>
+        <RowStacked label="Max Attempts" desc={fragGated ? `${obsidian.toLocaleString()} Obsidian Fragments · ${affordable} roll${affordable === 1 ? '' : 's'} affordable at 50 each` : 'Stops after this many rerolls if no match is found'}><Slider value={Math.max(1, Math.min(maxAttempts, attemptMax))} min={1} max={attemptMax} step={1} onChange={setMaxAttempts} /></RowStacked>
         {material === 'Dark Matter' && (
-          <RowStacked label="Dark Matter To Use" desc="Free daily rolls run first; after those, one Dark Matter is traded per roll">
-            <div className="flex items-center gap-3">
-              <div className="flex-1 min-w-0"><Slider value={dmAll ? Math.max(1, dmHave) : Math.min(dm, Math.max(1, dmHave))} min={1} max={Math.max(1, dmHave)} step={1} onChange={(v) => { setDm(v); setDmAll(false); }} /></div>
-              <button onClick={() => setDmAll((a) => !a)} className={`shrink-0 px-2.5 py-1 text-[11px] font-semibold rounded-md border transition-colors ${dmAll ? 'bg-accent/15 border-accent/40 text-accent' : 'bg-field border-line text-fg-3 hover:text-fg-2'}`}>All{dmHave ? ` · ${dmHave}` : ''}</button>
-            </div>
-          </RowStacked>
+          <>
+            <Row label="Use Dark Matter" desc="Uses the Dark Matter item to augment after daily rolls complete.">
+              <Toggle on={dmOn} onChange={setDmOn} />
+            </Row>
+            {dmOn && (
+              <RowStacked label="Dark Matter To Use" desc={dmHave <= 0 ? 'You have no Dark Matter in storage. Nothing will be traded.' : dmAll ? `Trades every Dark Matter you have (${dmHave}), one per roll` : `Trades up to ${Math.min(Math.max(1, dm), dmHave)} of your ${dmHave} Dark Matter, one per roll`}>
+                <div className="flex items-center gap-3">
+                  <div className="flex-1 min-w-0"><Slider value={dmAll ? Math.max(1, dmHave) : Math.min(Math.max(1, dm), Math.max(1, dmHave))} min={1} max={Math.max(1, dmHave)} step={1} onChange={(v) => { setDm(v); setDmAll(false); }} /></div>
+                  <button onClick={() => setDmAll((a) => !a)} className={`shrink-0 px-2.5 py-1 text-[11px] font-semibold rounded-md border transition-colors ${dmAll ? 'bg-accent/15 border-accent/40 text-accent' : 'bg-field border-line text-fg-3 hover:text-fg-2'}`}>All{dmHave ? ` · ${dmHave}` : ''}</button>
+                </div>
+              </RowStacked>
+            )}
+          </>
         )}
       </Group>
       <div className="px-1 flex gap-2">
         <button
           onClick={() => start(false)}
-          disabled={!readyAuto}
+          disabled={!readyAuto || fragBlocked}
           className="flex-1 px-3 py-2 text-[12px] font-bold rounded-md bg-accent text-on-accent enabled:hover:bg-accent-hover disabled:opacity-40 transition-colors"
         >
           Auto Roll
         </button>
         <button
           onClick={() => start(true)}
-          disabled={!baseReady}
+          disabled={!baseReady || fragBlocked}
           className="flex-1 px-3 py-2 text-[12px] font-bold rounded-md bg-field border border-line text-fg-2 enabled:hover:bg-accent/10 enabled:hover:text-accent disabled:opacity-40 transition-colors"
         >
           Manual Roll
         </button>
       </div>
+      {fragBlocked && (
+        <div className="px-1 mt-1.5 text-[11px] text-amber-300">Out of Obsidian Fragments (50 needed per roll) — you have {obsidian.toLocaleString()}.</div>
+      )}
       {selType && item !== '' && !locOk && npcName && (
         <div className="px-1 mt-1.5 text-[11px] text-amber-300">{experimental ? `Travel to ${npcName}'s zone to augment.` : `Stand next to ${npcName} to augment.`}</div>
       )}
@@ -659,8 +715,8 @@ function BatchRollPanel({ view, online, experimental }: { view: string; online: 
       <div className="flex items-center justify-between gap-2 px-3 py-2 text-[11px]">
         <span className="text-fg-4 tabular-nums">{selected.length}/{includable.length} selected</span>
         <span className="flex items-center gap-2">
-          <button onClick={() => setAll(true)} className="le-tap font-semibold text-fg-4 hover:text-fg-2">All</button>
-          <button onClick={() => setAll(false)} className="le-tap font-semibold text-fg-4 hover:text-fg-2">None</button>
+          <Button variant="ghost" size="xs" onClick={() => setAll(true)}>All</Button>
+          <Button variant="ghost" size="xs" onClick={() => setAll(false)}>None</Button>
         </span>
       </div>
       {rows.map(({ c, cfg, ready, readyAuto, inRange, eligible, included }) => (
@@ -723,7 +779,7 @@ function GearRoll({ view, online, active, experimental, tab, setTab }: { view: s
         />
       </div>
       {tab === 'single'
-        ? <GearPanel key={active.name} conn={conn} charName={active.name} view={view} assets={active.assets} inv={active.inv} zone={active.zone} fixedNear={active.fixedNear} experimental={experimental} />
+        ? <GearPanel key={active.name} conn={conn} charName={active.name} view={view} assets={active.assets} inv={active.inv} cur={active.cur} zone={active.zone} fixedNear={active.fixedNear} experimental={experimental} />
         : <BatchRollPanel view={view} online={online} experimental={experimental} />}
     </div>
   );
@@ -769,6 +825,7 @@ export default function AugmentView({ view = 'ambuscade' }: { view?: 'ambuscade'
             onKeep={conn != null ? () => augKeep(conn) : undefined}
             onReroll={conn != null ? () => augReroll(conn) : undefined}
             onStop={conn != null ? () => augStop(conn) : undefined}
+            onStepContinue={conn != null ? () => augStepContinue(conn) : undefined}
           />
         )}
         {conn != null && (

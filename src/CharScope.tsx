@@ -3,6 +3,7 @@ import type { KnownChar } from './bridge';
 import { useSticky } from './sticky';
 import { Collapse } from './overlay';
 import { useAnon } from './anonymize';
+import { Button } from './ui';
 
 export function useCharScope(key: string, chars: KnownChar[]) {
   const [excluded, setExcluded] = useSticky<string[]>(key, []);
@@ -38,7 +39,7 @@ export function CharScopeBar({ chars, exSet, toggle, reset, accessory }: { chars
               </button>
             );
           })}
-          {exSet.size > 0 && <button onClick={reset} className="le-tap px-2 py-1 text-[11px] font-semibold text-fg-4 hover:text-accent transition-colors">Reset</button>}
+          {exSet.size > 0 && <Button variant="ghost" size="xs" onClick={reset}>Reset</Button>}
         </div>
       </Collapse>
     </div>

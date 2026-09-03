@@ -7,9 +7,11 @@ import App from './App';
 import PoolOverlay from './PoolOverlay';
 import GearsetWindow from './GearsetWindow';
 import { isPoolOverlay, isGearsetWindow } from './overlayWindow';
+import { startDebugLog } from './debugLog';
 
 const overlayMode = isPoolOverlay();
 const gearsetMode = isGearsetWindow();
+if (!overlayMode && !gearsetMode) startDebugLog(); // main window only -- rolling diagnostic log to disk
 if (overlayMode) {
   document.documentElement.style.background = 'transparent';
   document.body.style.background = 'transparent';

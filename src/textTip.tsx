@@ -1,6 +1,7 @@
 import { useSyncExternalStore, type ReactNode, type MouseEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { AnimatePresence, motion } from 'motion/react';
+import { logicalRect, logicalViewport } from './uiZoom';
 
 // A small themed hover tooltip to replace native `title=` attributes. Store-driven (one bubble,
 // no per-element portals), so spreading tipAttrs onto an element adds a styled tooltip without a
@@ -29,9 +30,12 @@ export function TextTipHost() {
 }
 
 function TipBubble({ tip }: { tip: Tip }) {
-  const { rect, content } = tip;
+  const { content } = tip;
+  // Position in the bubble's own (zoom-adjusted) coordinate space so a uiScale > 1 never throws it off-screen;
+  // see uiZoom.ts. No-op at 100%.
+  const rect = logicalRect(tip.rect);
   const above = rect.top > 40;
-  const cx = Math.min(Math.max(8, rect.left + rect.width / 2), window.innerWidth - 8);
+  const cx = Math.min(Math.max(8, rect.left + rect.width / 2), logicalViewport().w - 8);
   const top = above ? Math.max(6, rect.top - 6) : rect.bottom + 6;
   return (
     <motion.div

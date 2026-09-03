@@ -6,7 +6,7 @@ import { logPriceSnapshot } from './priceStore';
 
 export const inTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
-export type InvItem = { s: number; id: number; c: number; n: string; u?: number; f?: number; ms?: number; aug?: string[]; bz?: number };
+export type InvItem = { s: number; id: number; c: number; n: string; u?: number; f?: number; ms?: number; aug?: string[]; bz?: number; lk?: number };
 export type InvBag = { b: string; id: number; max: number; used: number; items: InvItem[] };
 export type SelItem = InvItem & { bag: number };
 export type PoolItem = { i: number; id: number; n: string; ts: number; lotter: string | null; lot: number; mylot: number | null };
@@ -41,6 +41,7 @@ export const nomadReachable = (char: { zone?: number; nomadNear?: boolean } | un
   !!char && (experimental ? inNomadZone(char.zone) : !!char.nomadNear);
 export type StoreProgress = { active: boolean; item: number; done: number; total: number; phase: string };
 export type OrgStep = { i: number; id: number; n: string; c: number; from: string; to: string };
+export type OrgOverflow = { id: number; n: string; c: number };
 export type CurrencyEntry = { n: string; v: number };
 export type Currency = { gil: number; list: CurrencyEntry[] };
 export type AhSlot = { s: number; st: string; id: number; n: string; c: number; p: number; ts: number };
@@ -58,7 +59,8 @@ export type ShopState = { items: ShopItem[] };
 export type NpcNear = { name: string | null; id?: number; index?: number };
 export type NpcLearn = { conn: number; npc: string; option: number; at: number };
 
-export type AugState = { active: boolean; mode?: string; attempts?: number; total?: number; status?: string; results?: Record<string, number>; manual?: boolean; awaitDecision?: boolean; item?: string; id?: number; multi?: boolean; step?: number; stepCount?: number; augs?: string[] };
+export type AugState = { active: boolean; mode?: string; attempts?: number; total?: number; status?: string; results?: Record<string, number>; manual?: boolean; awaitDecision?: boolean; awaitStep?: boolean; item?: string; id?: number; multi?: boolean; step?: number; stepCount?: number; augs?: string[] };
+export type ReforgeState = { active: boolean; phase?: string; step?: number; steps?: number; status?: string; readyAt?: number; awaitStep?: boolean; timing?: string; output?: number; outputs?: number[]; paused?: { steps: number; npc: string } };
 export type AugInfo = { cape: string | null; augments?: string[] };
 
 export type BazaarSeller = { name: string; id: number; index: number; dist: number; inrange: boolean };
@@ -109,6 +111,7 @@ export type Box = {
   storeZone?: StoreNpc[];
   store?: StoreProgress;
   aug?: AugState;
+  reforge?: ReforgeState;
   augInfo?: AugInfo;
   bzSellers?: BazaarSeller[];
   bzListings?: Record<number, BazaarListing>;
@@ -124,6 +127,7 @@ export type Box = {
   org?: OrgStatus;
   orgPlan?: OrgStep[];
   orgPreview?: OrgStep[];
+  orgOverflow?: OrgOverflow[];
   orgDone?: number[];
   orgOk?: number[];
   cur?: Currency;
@@ -169,6 +173,7 @@ export type KnownChar = {
   org?: OrgStatus;
   orgPlan?: OrgStep[];
   orgPreview?: OrgStep[];
+  orgOverflow?: OrgOverflow[];
   orgDone?: number[];
   orgOk?: number[];
   cur?: Currency;
@@ -196,6 +201,7 @@ export type KnownChar = {
   storeZone?: StoreNpc[];
   store?: StoreProgress;
   aug?: AugState;
+  reforge?: ReforgeState;
   augInfo?: AugInfo;
   bzSellers?: BazaarSeller[];
   bzListings?: Record<number, BazaarListing>;
@@ -218,7 +224,7 @@ type Frame =
   | { t: 'slips'; slips: Slip[] }
   | { t: 'orgstatus'; active: boolean; total: number; done: number }
   | { t: 'orgplan'; steps: OrgStep[] }
-  | { t: 'orgpreview'; steps: OrgStep[] }
+  | { t: 'orgpreview'; steps: OrgStep[]; overflow?: OrgOverflow[] }
   | { t: 'orgstep'; i: number; ok: boolean }
   | { t: 'dropmap'; map: Record<string, number> }
   | { t: 'currency'; gil: number; list: CurrencyEntry[] }
@@ -243,7 +249,8 @@ type Frame =
   | { t: 'npcnear'; name: string | null; id?: number; index?: number }
   | { t: 'fixednear'; names: string[] }
   | { t: 'npclearn'; npc: string; option: number }
-  | { t: 'aug'; active: boolean; mode?: string; attempts?: number; total?: number; status?: string; results?: Record<string, number>; multi?: boolean; step?: number; stepCount?: number; augs?: string[]; item?: string; id?: number }
+  | { t: 'aug'; active: boolean; mode?: string; attempts?: number; total?: number; status?: string; results?: Record<string, number>; manual?: boolean; awaitDecision?: boolean; awaitStep?: boolean; multi?: boolean; step?: number; stepCount?: number; augs?: string[]; item?: string; id?: number }
+  | { t: 'reforge'; active: boolean; phase?: string; step?: number; steps?: number; status?: string; readyAt?: number; awaitStep?: boolean; timing?: string; output?: number; outputs?: number[]; paused?: { steps: number; npc: string } }
   | { t: 'auginfo'; cape: string | null; augments?: string[] }
   | { t: 'bzsellers'; list: BazaarSeller[]; mem?: boolean }
   | { t: 'bzitems'; seller: string | null; id?: number; index?: number; items: BazaarItem[] }
@@ -278,7 +285,7 @@ function rebuild() {
     known.set(b.name, {
       name: b.name, id: b.id, online: true, conn: b.conn,
       main: b.main, sub: b.sub, zone: b.zone, zoneName: b.zoneName, px: b.px, py: b.py, assets: b.assets,
-      inv: b.inv ?? pc?.inv, keyItems: b.keyItems ?? pc?.keyItems, keyAt: b.keyAt ?? pc?.keyAt, pool: b.pool, party: b.party, slips: b.slips, org: b.org, orgPlan: b.orgPlan, orgPreview: b.orgPreview, orgDone: b.orgDone, orgOk: b.orgOk, cur: b.cur ?? pc?.cur, curAt: b.curAt ?? pc?.curAt, atah: b.atah, inTown: b.inTown, server: b.server, gil: b.gil, mog: b.mog, nomadNear: b.nomadNear, ah: b.ah, dbox: b.dbox, dboxStatus: b.dboxStatus, tradeStatus: b.tradeStatus, shop: b.shop, npcNear: b.npcNear, fixedNear: b.fixedNear, porter: b.porter, porterNear: b.porterNear, vendorNear: b.vendorNear, convert: b.convert, resupply: b.resupply, pvendor: b.pvendor, pvendorNear: b.pvendorNear, useProg: b.useProg, storeZone: b.storeZone, store: b.store, aug: b.aug, augInfo: b.augInfo, bzSellers: b.bzSellers, bzListings: b.bzListings, bzMy: b.bzMy, bzScan: b.bzScan, bzMem: b.bzMem, savedAt: pc?.savedAt,
+      inv: b.inv ?? pc?.inv, keyItems: b.keyItems ?? pc?.keyItems, keyAt: b.keyAt ?? pc?.keyAt, pool: b.pool, party: b.party, slips: b.slips, org: b.org, orgPlan: b.orgPlan, orgPreview: b.orgPreview, orgDone: b.orgDone, orgOk: b.orgOk, cur: b.cur ?? pc?.cur, curAt: b.curAt ?? pc?.curAt, atah: b.atah, inTown: b.inTown, server: b.server, gil: b.gil, mog: b.mog, nomadNear: b.nomadNear, ah: b.ah, dbox: b.dbox, dboxStatus: b.dboxStatus, tradeStatus: b.tradeStatus, shop: b.shop, npcNear: b.npcNear, fixedNear: b.fixedNear, porter: b.porter, porterNear: b.porterNear, vendorNear: b.vendorNear, convert: b.convert, resupply: b.resupply, pvendor: b.pvendor, pvendorNear: b.pvendorNear, useProg: b.useProg, storeZone: b.storeZone, store: b.store, aug: b.aug, reforge: b.reforge, augInfo: b.augInfo, bzSellers: b.bzSellers, bzListings: b.bzListings, bzMy: b.bzMy, bzScan: b.bzScan, bzMem: b.bzMem, savedAt: pc?.savedAt,
     });
   }
   knownSnapshot = [...known.values()].sort((a, b) => (a.online === b.online ? a.name.localeCompare(b.name) : a.online ? -1 : 1));
@@ -379,10 +386,18 @@ export async function removeChar(name: string): Promise<void> {
   rebuild();
 }
 
+// Mog House storage bags -- Safe (1), Storage (2), Temporary (3), Locker (4), Safe 2 (9) -- only load at a
+// Moogle and read empty in the field, so a live field report omits them; keep the last-known contents across
+// reports so they don't vanish. This is the addon's own read-empty-in-field set (build_inventory fallback_bag).
+const KEEP_WHEN_ABSENT = new Set([1, 2, 3, 4, 9]);
 function mergeInv(prev: InvBag[] | undefined, next: InvBag[]): InvBag[] {
   if (!prev || prev.length === 0) return next;
   const have = new Set(next.map((b) => b.id));
-  const kept = prev.filter((b) => !have.has(b.id));
+  // Carry bags (Satchel/Sack/Case/Wardrobes) are ALWAYS reported when the character actually has them, so a
+  // carry bag missing from the report means the character does not have it -- never graft it back. Only Mog
+  // storage bags are preserved. Without this, a stale carry bag left by a shared-client swap (or an old
+  // corrupted snapshot) sticks to the wrong character forever and shows up in find as a phantom location.
+  const kept = prev.filter((b) => !have.has(b.id) && KEEP_WHEN_ABSENT.has(b.id));
   return kept.length ? [...next, ...kept] : next;
 }
 
@@ -465,6 +480,7 @@ function onLine(conn: number, line: string) {
       pvendorNear: carry?.pvendorNear,
       useProg: carry?.useProg,
       aug: carry?.aug,
+      reforge: carry?.reforge,
       augInfo: carry?.augInfo,
       bzSellers: carry?.bzSellers,
       bzListings: carry?.bzListings,
@@ -532,7 +548,7 @@ function onLine(conn: number, line: string) {
     byConn.set(conn, { ...prev, orgPlan: f.steps, orgDone: [], orgOk: [], lastSeen: Date.now() });
     scheduleRebuild();
   } else if (f.t === 'orgpreview' && prev) {
-    byConn.set(conn, { ...prev, orgPreview: f.steps, lastSeen: Date.now() });
+    byConn.set(conn, { ...prev, orgPreview: f.steps, orgOverflow: f.overflow ?? [], lastSeen: Date.now() });
     scheduleRebuild();
   } else if (f.t === 'orgstep' && prev) {
     byConn.set(conn, {
@@ -597,7 +613,10 @@ function onLine(conn: number, line: string) {
     byConn.set(conn, { ...prev, fixedNear: f.names, lastSeen: Date.now() });
     scheduleRebuild();
   } else if (f.t === 'aug' && prev) {
-    byConn.set(conn, { ...prev, aug: { active: f.active, mode: f.mode, attempts: f.attempts, total: f.total, status: f.status, results: f.results, multi: f.multi, step: f.step, stepCount: f.stepCount, augs: f.augs, item: f.item, id: f.id }, lastSeen: Date.now() });
+    byConn.set(conn, { ...prev, aug: { active: f.active, mode: f.mode, attempts: f.attempts, total: f.total, status: f.status, results: f.results, manual: f.manual, awaitDecision: f.awaitDecision, awaitStep: f.awaitStep, multi: f.multi, step: f.step, stepCount: f.stepCount, augs: f.augs, item: f.item, id: f.id }, lastSeen: Date.now() });
+    scheduleRebuild();
+  } else if (f.t === 'reforge' && prev) {
+    byConn.set(conn, { ...prev, reforge: { active: f.active, phase: f.phase, step: f.step, steps: f.steps, status: f.status, readyAt: f.readyAt, awaitStep: f.awaitStep, timing: f.timing, output: f.output, outputs: f.outputs, paused: f.paused }, lastSeen: Date.now() });
     scheduleRebuild();
   } else if (f.t === 'auginfo' && prev) {
     byConn.set(conn, { ...prev, augInfo: { cape: f.cape, augments: f.augments }, lastSeen: Date.now() });
@@ -1300,8 +1319,11 @@ export function npcSelect(conn: number, option: number) {
   sendBoxCommand(conn, JSON.stringify({ cmd: 'npcselect', option }));
 }
 
-export function tradeTo(conn: number, target: string, items: { id: number; count: number; slot?: number }[], gil = 0) {
-  sendBoxCommand(conn, JSON.stringify({ cmd: 'trade', target, items, gil }));
+// `targetId` is the recipient's server id. The addon resolves the trade target by id first (name second), so a
+// display-name change (Sage's Witness Protection renames the char on the sender's client) no longer breaks the
+// lookup -- the entity id is never rewritten. Pass it whenever the recipient's id is known.
+export function tradeTo(conn: number, target: string, items: { id: number; count: number; slot?: number }[], gil = 0, targetId?: number) {
+  sendBoxCommand(conn, JSON.stringify({ cmd: 'trade', target, items, gil, ...(targetId != null ? { id: targetId } : {}) }));
 }
 
 export function armTradeReceiver(conn: number, from: string, fromId?: number) {
@@ -1467,18 +1489,35 @@ export function tradePcOffer(conn: number, a: { target?: string; items: { item: 
 export function slipStore(conn: number, ids: number[]) { sendBoxCommand(conn, JSON.stringify({ cmd: 'slipstore', ids })); }
 export function slipRetrieve(conn: number, ids: number[]) { sendBoxCommand(conn, JSON.stringify({ cmd: 'slipretrieve', ids })); }
 
-export type CapeAugArg = { job: string; material: string; path: string; repeats: number; bag: number; slot: number };
-export function augCape(conn: number, a: CapeAugArg) { sendBoxCommand(conn, JSON.stringify({ cmd: 'augcape', ...a })); }
+export type ConfirmMode = 'none' | 'step' | 'path';
+export type CapeAugArg = { job: string; material: string; path: string; repeats: number; bag: number; slot: number; confirmMode?: ConfirmMode };
+export function augCape(conn: number, a: CapeAugArg) { const { confirmMode, ...rest } = a; sendBoxCommand(conn, JSON.stringify({ cmd: 'augcape', ...rest, confirm_mode: confirmMode ?? 'none' })); }
 export type CapeSeqStep = { material: string; path: string; repeats: number };
-export function augCapeSeq(conn: number, a: { job: string; bag: number; slot: number; steps: CapeSeqStep[] }) { sendBoxCommand(conn, JSON.stringify({ cmd: 'augcapeseq', ...a })); }
+export function augCapeSeq(conn: number, a: { job: string; bag: number; slot: number; steps: CapeSeqStep[]; confirmMode?: ConfirmMode }) { sendBoxCommand(conn, JSON.stringify({ cmd: 'augcapeseq', job: a.job, bag: a.bag, slot: a.slot, steps: a.steps, confirm_mode: a.confirmMode ?? 'none' })); }
 export type GearAugArg = { mode: string; item: string; bag?: number; slot?: number; material?: string; style?: string; augment_1?: string; augment_2?: string; augment_3?: string; watch_1?: number; watch_2?: number; watch_3?: number; augment_mode?: 'and' | 'or'; delay?: number; max?: number; manual?: boolean; dm?: number; dm_all?: boolean };
 export function augGear(conn: number, a: GearAugArg) { sendBoxCommand(conn, JSON.stringify({ cmd: 'auggear', ...a })); }
 export function augStop(conn: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'augstop' })); }
 export function augKeep(conn: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'augkeep' })); }
 export function augReroll(conn: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'augreroll' })); }
+export function augStepContinue(conn: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'augstep' })); }
+
+// Reforge (Monisette): a sequential plan of upgrade steps. The addon engine (trade -> ~1h wait ->
+// poke-collect -> next, suspend when out of range) consumes this; it is stubbed until packet capture.
+export type ReforgeStepPlan = { npc: string; input_id: number; output_id: number; ingredients: { id: number; qty: number }[]; currency?: { name: string; qty: number }[]; pending?: boolean; resume_after?: number; advance?: boolean };
+export function reforgeStart(conn: number, plan: { steps: ReforgeStepPlan[] }) { sendBoxCommand(conn, JSON.stringify({ cmd: 'reforge', ...plan })); }
+export function reforgeStop(conn: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'reforgestop' })); }
+export function reforgeStep(conn: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'reforgestep' })); }
+// Collect a reforge that was already traded (the piece is in flight at the NPC) but whose queue was lost.
+export function reforgeCollect(conn: number, npc: string, outputId?: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'reforgecollect', npc, ...(outputId ? { output_id: outputId } : {}) })); }
+// Pause a running reforge -- saves the remaining steps (the in-flight piece becomes a pending collect) to
+// disk so it survives leaving the NPC/zone and even an addon reload; reforgeResume picks it back up.
+export function reforgePause(conn: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'reforgepause' })); }
+export function reforgeResume(conn: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'reforgeresume' })); }
+// Retrieve `count` Rem's Tale Ch.`chapter` (1-10) from Monisette's storage into inventory.
+export function reforgeRemGet(conn: number, chapter: number, count: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'remget', chapter, count })); }
 export function augStopAll(): Promise<number> { return broadcastBoxCommand(JSON.stringify({ cmd: 'augstop' })); }
 
-export function storeRequest(conn: number, npc: string, id: number, want: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'store', npc, id, want })); }
+export function storeRequest(conn: number, npc: string, id: number, want: number, drop = false) { sendBoxCommand(conn, JSON.stringify({ cmd: 'store', npc, id, want, ...(drop ? { drop: true } : {}) })); }
 export function storeStop(conn: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'storestop' })); }
 
 export function bzOpen(conn: number, id: number, index: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'bzopen', id, index })); }

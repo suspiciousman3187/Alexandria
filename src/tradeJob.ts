@@ -66,8 +66,8 @@ function kick(idx: number) {
   if (idx === 0) globalBase = base;
   armTradeReceiver(dest.conn, live.name, live.id);
   const jid = job.id;
-  const conn = live.conn, target = dest.name, batch = job.batches[idx], gil = idx === 0 ? job.gil : 0;
-  window.setTimeout(() => { if (job && job.id === jid) tradeTo(conn, target, batch, gil); }, 400);
+  const conn = live.conn, target = dest.name, targetId = dest.id, batch = job.batches[idx], gil = idx === 0 ? job.gil : 0;
+  window.setTimeout(() => { if (job && job.id === jid) tradeTo(conn, target, batch, gil, targetId); }, 400);
   deadline = Date.now() + 15400;
 }
 

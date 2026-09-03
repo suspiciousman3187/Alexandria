@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { useKnownCharacters, useAvailableIcons, storeRequest, storeStop, type KnownChar } from './bridge';
 import { IconInner } from './atlasIcon';
-import { Group, Stepper } from './ui';
+import { Group, Stepper, Toggle, Button } from './ui';
 import { useSettings } from './settings';
 import { useAnon } from './anonymize';
 import { OpGlyph } from './OpCard';
@@ -17,6 +17,10 @@ const WAYPOINT_ZONES = new Set([243, 245, 247, 248, 249, 252, 256, 257, 260, 261
 // caps how many it uses by free inventory slots since each reward drops an item.
 const USE_IDS = new Set([8973]);
 const isUse = (id: number) => USE_IDS.has(id);
+
+// Rem's Tale Chapters (Ch.1 = 4064 ... Ch.10 = 4073): the only items Monisette caps at 255 stored, so
+// "Drop Extra" discards the surplus that won't fit rather than leaving it clogging your bags.
+const isRemTale = (id: number) => id >= 4064 && id <= 4073;
 
 type Holder = { c: KnownChar; count: number };
 type ItemAgg = { id: number; n: string; holders: Holder[]; total: number };
@@ -63,6 +67,7 @@ export default function StoreView() {
   const assetsAny = useMemo(() => online.find((c) => c.assets)?.assets, [online]);
 
   const [amounts, setAmounts] = useState<Record<string, number>>({});
+  const [dropExtra, setDropExtra] = useState(false);
 
   const npcs = useMemo<NpcAgg[]>(() => {
     const m = new Map<string, { chars: Set<KnownChar>; items: Map<number, ItemAgg>; batch?: number }>();
@@ -96,17 +101,19 @@ export default function StoreView() {
   const inWpZone = useMemo(() => online.some((c) => c.zone != null && WAYPOINT_ZONES.has(c.zone)), [online]);
 
   // Store up to `amount` of the item across the holders (fleet pool), capped per holder.
-  const storeAmount = (npc: string, ia: ItemAgg, amount: number, batch?: number) => {
+  const storeAmount = (npc: string, ia: ItemAgg, amount: number, batch?: number, drop?: boolean) => {
     let remaining = snapAmt(amount, ia.total, batch);
     for (const h of ia.holders) {
       if (remaining <= 0) break;
       const n = Math.min(remaining, h.count);
-      if (h.c.conn != null && n > 0) storeRequest(h.c.conn, npc, ia.id, n);
+      if (h.c.conn != null && n > 0) storeRequest(h.c.conn, npc, ia.id, n, drop);
       remaining -= n;
     }
   };
+  // Drop Extra only applies to Rem's Tale at Monisette (the one item with a 255 storage cap).
+  const dropIt = (npc: string, id: number) => npc === 'Monisette' && dropExtra && isRemTale(id);
   const amtOf = (ia: ItemAgg, batch?: number) => snapAmt(amounts[`${ia.id}`] ?? ia.total, ia.total, batch);
-  const storeNpcAll = (n: NpcAgg) => { for (const ia of n.items) if (!isUse(ia.id)) storeAmount(n.npc, ia, ia.total, n.batch); };
+  const storeNpcAll = (n: NpcAgg) => { for (const ia of n.items) if (!isUse(ia.id)) storeAmount(n.npc, ia, ia.total, n.batch, dropIt(n.npc, ia.id)); };
   const stopAll = () => { for (const c of online) if (c.conn != null) storeStop(c.conn); };
 
   if (online.length === 0) {
@@ -159,7 +166,13 @@ export default function StoreView() {
               <Group key={n.npc} title={`${n.npc}`} right={
                 <span className="flex items-center gap-2 text-[11px]">
                   <span className="text-fg-4">{n.chars.length} char{n.chars.length === 1 ? '' : 's'} in zone</span>
-                  <button onClick={() => storeNpcAll(n)} className="le-tap font-semibold text-accent hover:text-accent-hover">Store All</button>
+                  {n.npc === 'Monisette' && (
+                    <label className="flex items-center gap-1.5 cursor-pointer select-none" title="When a Rem's Tale chapter is maxed at 255 stored, discard the surplus you can't store instead of leaving it in your bags.">
+                      <Toggle on={dropExtra} onChange={setDropExtra} />
+                      <span className="font-semibold text-fg-3">Drop Extra</span>
+                    </label>
+                  )}
+                  <Button variant="primary" size="sm" onClick={() => storeNpcAll(n)}>Store All</Button>
                 </span>
               }>
                 {n.items.map((ia) => {
@@ -191,7 +204,7 @@ export default function StoreView() {
                       {has ? (
                         <>
                           <Stepper value={amtOf(ia, batch)} min={batch ?? 1} max={maxStore} step={batch ?? 1} onChange={(v) => setAmounts((a) => ({ ...a, [`${ia.id}`]: v }))} className="shrink-0" />
-                          <button onClick={() => storeAmount(n.npc, ia, amtOf(ia, batch), batch)} className="le-tap shrink-0 px-3 py-1.5 text-[11px] font-bold rounded-md bg-accent text-on-accent hover:bg-accent-hover transition-colors">{isUse(ia.id) ? 'Use' : 'Store'}</button>
+                          <button onClick={() => storeAmount(n.npc, ia, amtOf(ia, batch), batch, dropIt(n.npc, ia.id))} className="le-tap shrink-0 px-3 py-1.5 text-[11px] font-bold rounded-md bg-accent text-on-accent hover:bg-accent-hover transition-colors">{isUse(ia.id) ? 'Use' : 'Store'}</button>
                         </>
                       ) : (
                         <span className="shrink-0 text-[10px] text-fg-4">none</span>

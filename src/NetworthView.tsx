@@ -167,7 +167,7 @@ export default function NetworthView() {
                 <div className="divide-y divide-line">
                   {filtered.map((h) => (
                     <div key={h.id} className="group le-tap w-full flex items-center gap-1 pr-2 hover:bg-field transition-colors">
-                      <button onClick={() => openAhDetail({ id: h.id, n: h.n, st: itemStack(h.id), back: 'networth' })} className="min-w-0 flex-1 flex items-center gap-3 px-3 py-2 text-left">
+                      <button onClick={() => openAhDetail({ id: h.id, n: h.n, st: itemStack(h.id), back: 'networth' })} className="min-w-0 flex-1 flex items-center gap-3 px-3 py-2 text-left overflow-hidden">
                         <SmallIcon id={h.id} n={h.n} assets={assetsAny} iconSet={iconSet} />
                         <div className="min-w-0 flex-1">
                           <div className="flex items-center gap-1.5">
@@ -182,9 +182,9 @@ export default function NetworthView() {
                             <span className="text-[8px] font-bold uppercase tracking-wide opacity-80">listed</span>
                           </span>
                         )}
-                        <span className="shrink-0 w-20 text-right text-[14px] font-bold tabular-nums" style={{ color: valueColor(h.total) }}>{h.total.toLocaleString()}<span className="text-[9px] text-fg-4 ml-0.5">G</span></span>
+                        <span className="shrink-0 w-28 text-right text-[14px] font-bold tabular-nums" style={{ color: valueColor(h.total) }}>{h.total.toLocaleString()}<span className="text-[9px] text-fg-4 ml-0.5">G</span></span>
                       </button>
-                      <button onClick={() => addBlacklist(h.id)} title="Exclude from net worth" aria-label="Exclude from net worth" className="shrink-0 grid place-items-center w-7 h-7 rounded-md text-fg-4 hover:text-red-300 hover:bg-red-500/10 transition-colors">
+                      <button onClick={() => addBlacklist(h.id)} title="Exclude from net worth" aria-label="Exclude from net worth" className="relative z-10 shrink-0 grid place-items-center w-7 h-7 rounded-md text-fg-4 hover:text-red-300 hover:bg-red-500/10 transition-colors">
                         <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><circle cx="12" cy="12" r="9" /><path d="m5.6 5.6 12.8 12.8" /></svg>
                       </button>
                     </div>

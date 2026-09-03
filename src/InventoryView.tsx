@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState, useTransition, useDeferredValue, type ReactElement, type ReactNode } from 'react';
+import { memo, useEffect, useMemo, useRef, useState, useTransition, useDeferredValue, type ReactElement, type ReactNode, type CSSProperties, type RefObject } from 'react';
 import { createPortal } from 'react-dom';
 import { AnimatePresence, motion } from 'motion/react';
 import { Modal, Popover, Collapse } from './overlay';
@@ -10,6 +10,7 @@ import { useShopSell, setShopSell } from './shop';
 import { getCachedValue } from './priceStore';
 import { BazaarPriceModal } from './BazaarPriceModal';
 import { tipAttrs } from './textTip';
+import { logicalRect, logicalViewport } from './uiZoom';
 import { IconInner } from './atlasIcon';
 import { useSticky, useStickyChar, useStickyPersisted } from './sticky';
 import { getMovedAt } from './movedTracker';
@@ -26,11 +27,14 @@ import { SellDrawer } from './SellDrawer';
 import { useAnimatedList } from './useAnimatedList';
 import { useItemHover } from './ItemTooltip';
 import { openUseAll } from './useAllHost';
-import { Select, Stepper, Slider, GilInput, CharacterSelect, BagTag, SearchInput, Chip } from './ui';
+import { Select, Stepper, Slider, GilInput, CharacterSelect, BagTag, SearchInput, Chip, Button } from './ui';
 import { bagColor } from './bagColors';
-import { itemNameMatches, itemCategory, itemCategoryRank, ITEM_CATEGORIES, type ItemCategory } from './itemNames';
+import { itemNameMatches, itemCategory, itemCategoryRank, itemStack, ITEM_CATEGORIES, type ItemCategory } from './itemNames';
+import { useMedianStack, toggleMedianStack } from './medianMode';
 import { SORTS, tagSorts, sortBy, type SortMode } from './itemSort';
 import { useTagFilter, TagFilterSelect } from './tagFilter';
+import { useJobFilter, JobFilterSelect } from './jobFilter';
+import PullButton from './PullMenu';
 import { acLeaf, acPathLabel } from './ahCategories';
 import { useConsolidate, runConsolidateSelection, stopConsolidate, clearConsolidate, consolidableTotal, bagConsolidatable } from './consolidate';
 import { useAnon } from './anonymize';
@@ -79,11 +83,36 @@ function bagReachable(bagId: number, atMog: boolean, nomadOk: boolean): boolean 
   return false;
 }
 const bagName = (id: number, fallback: string) => BAG_META[id]?.name ?? fallback;
-export const ItemRow = memo(function ItemRow({ item, bag, bagId, assets, selected, onClick, onPointerDown, onPointerEnter, dense, actions, cat }: { item: InvItem; bag?: string; bagId?: number; assets?: string; selected?: boolean; onClick?: () => void; onPointerDown?: () => void; onPointerEnter?: () => void; dense?: boolean; actions?: ReactNode; cat?: { leaf: string; path: string } }) {
+// One-shot "did this element scroll into view" via IntersectionObserver, so a per-row market fetch fires
+// only for rows the user actually sees (never a whole-inventory burst against the AH). Latches true on
+// first sighting and disconnects; disabled = no observer at all (the common ItemRow uses without a server).
+function useOnScreen(enabled: boolean): [RefObject<HTMLDivElement | null>, boolean] {
+  const ref = useRef<HTMLDivElement>(null);
+  const [on, setOn] = useState(false);
+  useEffect(() => {
+    if (!enabled || on) return;
+    const el = ref.current;
+    if (!el || typeof IntersectionObserver === 'undefined') { setOn(true); return; }
+    const io = new IntersectionObserver((es) => { if (es.some((e) => e.isIntersecting)) { setOn(true); io.disconnect(); } }, { rootMargin: '250px' });
+    io.observe(el);
+    return () => io.disconnect();
+  }, [enabled, on]);
+  return [ref, on];
+}
+
+export const ItemRow = memo(function ItemRow({ item, bag, bagId, assets, selected, onClick, onPointerDown, onPointerEnter, dense, actions, cat, server }: { item: InvItem; bag?: string; bagId?: number; assets?: string; selected?: boolean; onClick?: () => void; onPointerDown?: () => void; onPointerEnter?: () => void; dense?: boolean; actions?: ReactNode; cat?: { leaf: string; path: string }; server?: string }) {
   const icons = useAvailableIcons();
   const hover = useItemHover(item);
+  // AH median inline, fetched lazily once the row is on screen. Only for auctionable items in non-dense
+  // rows when an AH server is configured; off-AH gear and the compact view skip it entirely.
+  const auctionable = !((item.f ?? 0) & 0x08);
+  const wantMarket = !!server && !dense && auctionable;
+  const [rowRef, onScreen] = useOnScreen(wantMarket);
+  const stackable = itemStack(item.id) > 1;
+  const medStack = useMedianStack(item.id);
+  const market = useRowMarket(item.id, stackable && medStack, server, wantMarket && onScreen);
   return (
-    <div className={`relative group flex items-center transition-colors ${selected ? 'bg-accent/15' : 'hover:bg-field'}`}>
+    <div ref={rowRef} className={`relative group flex items-center transition-colors ${selected ? 'bg-accent/15' : 'hover:bg-field'}`}>
       <button
         onClick={onClick ?? hover.onClick}
         onPointerDown={onPointerDown}
@@ -93,12 +122,32 @@ export const ItemRow = memo(function ItemRow({ item, bag, bagId, assets, selecte
         <div className={`relative shrink-0 rounded bg-field grid place-items-center overflow-hidden ${dense ? 'w-5 h-5' : 'w-7 h-7'}`}>
           <IconInner id={item.id} size={dense ? 20 : 28} name={item.n} assets={assets} bmpHas={item.id > 0 && icons.has(item.id)} />
         </div>
-        <div className="min-w-0 flex-1 flex items-baseline gap-2">
-          <span className={`min-w-0 truncate text-fg-2 ${dense ? 'text-[11px]' : 'text-[12px]'}`}>{item.n}</span>
-          {item.c > 1 && <span className={`shrink-0 tabular-nums font-bold text-accent rounded bg-accent/15 leading-none ${dense ? 'text-[10px] px-1 py-0.5' : 'text-[12px] px-1.5 py-0.5'}`}>×{item.c}</span>}
-          {item.aug && item.aug.length > 0 && <span title="Augmented" className={`shrink-0 font-bold rounded leading-none border border-amber-500/40 bg-amber-500/10 text-amber-300 ${dense ? 'text-[8px] px-1 py-0.5' : 'text-[9px] px-1.5 py-0.5'}`}>AUG</span>}
-          {item.bz != null && <span {...tipAttrs(`On bazaar · ${(item.bz || 0).toLocaleString()} gil`)} className={`shrink-0 font-bold rounded leading-none border border-yellow-400/60 bg-yellow-400/15 text-yellow-200 cursor-help ${dense ? 'text-[8px] px-1 py-0.5' : 'text-[9px] px-1.5 py-0.5'}`}>BAZAAR</span>}
+        <div className="min-w-0 flex-1">
+          {/* BAZAAR sits above the name (non-dense) so the badge stops eating the name's horizontal room;
+              dense rows keep it inline to stay single-line compact. */}
+          {!dense && item.bz != null && (
+            <span {...tipAttrs(`On bazaar · ${(item.bz || 0).toLocaleString()} gil`)} className="flex items-baseline gap-1 leading-none mb-0.5 cursor-help">
+              <span className="text-[9px] font-bold uppercase tracking-wide text-yellow-200">Bazaar</span>
+              <span className="text-[10px] font-semibold tabular-nums text-yellow-300">{(item.bz || 0).toLocaleString()}<span className="text-[8px] font-medium text-yellow-200/70 ml-0.5">g</span></span>
+            </span>
+          )}
+          <div className="flex items-baseline gap-2">
+            <span className={`min-w-0 truncate text-fg-2 ${dense ? 'text-[11px]' : 'text-[12px]'}`}>{item.n}</span>
+            {item.c > 1 && <span className={`shrink-0 tabular-nums font-bold text-accent rounded bg-accent/15 leading-none ${dense ? 'text-[10px] px-1 py-0.5' : 'text-[12px] px-1.5 py-0.5'}`}>×{item.c}</span>}
+            {item.aug && item.aug.length > 0 && <span title="Augmented" className={`shrink-0 font-bold rounded leading-none border border-amber-500/40 bg-amber-500/10 text-amber-300 ${dense ? 'text-[8px] px-1 py-0.5' : 'text-[9px] px-1.5 py-0.5'}`}>AUG</span>}
+            {dense && item.bz != null && <span {...tipAttrs(`On bazaar · ${(item.bz || 0).toLocaleString()} gil`)} className="shrink-0 font-bold rounded leading-none border border-yellow-400/60 bg-yellow-400/15 text-yellow-200 cursor-help text-[8px] px-1 py-0.5">BAZAAR</span>}
+          </div>
         </div>
+        {!dense && market?.median && (
+          <div
+            {...tipAttrs(stackable ? `AH ${medStack ? 'stack' : 'single'} median · ${market.stock ?? '0'} listed · click to toggle stack/single` : `AH median · ${market.stock ?? '0'} listed`)}
+            onClick={stackable ? (e) => { e.stopPropagation(); e.preventDefault(); toggleMedianStack(item.id); } : undefined}
+            className={`shrink-0 flex flex-col items-end leading-tight ${stackable ? 'cursor-pointer hover:opacity-80 transition-opacity' : 'cursor-help'}`}
+          >
+            <span className="text-[9px] font-bold uppercase tracking-wide text-fg-4">Median{stackable ? (medStack ? ' · Stack' : ' · Each') : ''}</span>
+            <span className="text-[12.5px] font-semibold tabular-nums text-yellow-300">{market.median}<span className="text-[9px] font-medium text-yellow-200/70 ml-0.5">g</span></span>
+          </div>
+        )}
         {!dense && cat && <span title={`Auction House: ${cat.path}`} className="shrink-0 text-[9px] leading-none px-1.5 py-0.5 rounded bg-field border border-line text-fg-4 max-w-[96px] truncate">{cat.leaf}</span>}
         {bag && (bagId != null ? <BagTag id={bagId} label={bag} className="max-w-[110px]" /> : <span className="shrink-0 truncate max-w-[110px] text-[10px] text-fg-4">{bag}</span>)}
       </button>
@@ -116,9 +165,13 @@ export const ItemRow = memo(function ItemRow({ item, bag, bagId, assets, selecte
 
 const entryKey = (e: Entry) => `${e.bag ?? ''}:${e.item.s}:${e.item.id}`;
 const NO_ENTRIES: Entry[] = [];
+// content-visibility:auto lets the WebView2 compositor skip layout/paint for off-screen rows, so a long,
+// icon-dense inventory (hundreds of items) can't flood the GPU on mount and trip a display-driver TDR. The
+// intrinsic-size fallback keeps the scrollbar stable for never-yet-rendered rows.
+const ROW_CV: CSSProperties = { contentVisibility: 'auto', containIntrinsicSize: 'auto 44px' };
 
 const noop = () => {};
-function ItemCollection({ entries, mode, assets, isSel, onSelect, onSelectDown, onSelectEnter, renderActions, animate, dimEntry, catOf }: { entries: Entry[]; mode: ViewMode; assets?: string; isSel?: (slot: number, entry: Entry) => boolean; onSelect?: (slot: number, entry: Entry) => void; onSelectDown?: (slot: number, entry: Entry) => void; onSelectEnter?: (slot: number, entry: Entry) => void; renderActions?: (item: InvItem, entry: Entry) => ReactNode; animate?: boolean; dimEntry?: (slot: number, entry: Entry) => boolean; catOf?: (id: number) => { leaf: string; path: string } | undefined }) {
+function ItemCollection({ entries, mode, assets, isSel, onSelect, onSelectDown, onSelectEnter, renderActions, animate, dimEntry, catOf, server }: { entries: Entry[]; mode: ViewMode; assets?: string; isSel?: (slot: number, entry: Entry) => boolean; onSelect?: (slot: number, entry: Entry) => void; onSelectDown?: (slot: number, entry: Entry) => void; onSelectEnter?: (slot: number, entry: Entry) => void; renderActions?: (item: InvItem, entry: Entry) => ReactNode; animate?: boolean; dimEntry?: (slot: number, entry: Entry) => boolean; catOf?: (id: number) => { leaf: string; path: string } | undefined; server?: string }) {
   const animated = useAnimatedList(animate ? entries : NO_ENTRIES, entryKey, 240);
   const nodes = animate ? animated : entries.map((e) => ({ key: entryKey(e), item: e, leaving: false }));
   const drag = !!onSelectDown;
@@ -130,7 +183,7 @@ function ItemCollection({ entries, mode, assets, isSel, onSelect, onSelectDown, 
         const dimmed = !n.leaving && !!dimEntry && dimEntry(slot, n.item);
         const cls = [animate ? (n.leaving ? 'le-row-out' : 'le-row-in') : '', dimmed ? 'opacity-40 pointer-events-none' : ''].filter(Boolean).join(' ');
         return (
-        <div key={n.key} className={cls || undefined}>
+        <div key={n.key} className={cls || undefined} style={ROW_CV}>
           <ItemRow
             item={n.item.item}
             bag={n.item.bag}
@@ -143,6 +196,7 @@ function ItemCollection({ entries, mode, assets, isSel, onSelect, onSelectDown, 
             onPointerEnter={!n.leaving && onSelectEnter ? () => onSelectEnter(slot, n.item) : undefined}
             actions={n.leaving ? undefined : renderActions?.(n.item.item, n.item)}
             cat={catOf?.(n.item.item.id)}
+            server={server}
           />
         </div>
         );
@@ -183,15 +237,19 @@ function ViewModeToggle({ mode, onChange }: { mode: ViewMode; onChange: (m: View
   );
 }
 
-function ActBtn({ onClick, title, active, tone = 'neutral', sm, disabled, children }: { onClick: () => void; title: string; active?: boolean; tone?: 'accent' | 'amber' | 'red' | 'neutral'; sm?: boolean; disabled?: boolean; children: ReactNode }) {
+function ActBtn({ onClick, title, active, tone = 'neutral', sm, disabled, className, children }: { onClick: () => void; title: string; active?: boolean; tone?: 'accent' | 'amber' | 'red' | 'neutral'; sm?: boolean; disabled?: boolean; className?: string; children: ReactNode }) {
   const on = { accent: 'border-accent bg-accent/15 text-accent', amber: 'border-amber-500/60 bg-amber-500/15 text-amber-300', red: 'border-red-500/60 bg-red-500/15 text-red-300', neutral: 'border-line-2 bg-field text-fg' }[tone];
   const off = tone === 'red' ? 'border-red-500/40 text-red-400 hover:bg-red-500/10 hover:text-red-300' : 'border-line text-fg-3 hover:text-fg hover:border-line-2';
   return (
-    <button type="button" onClick={onClick} title={title} aria-label={title} aria-pressed={active} disabled={disabled} className={`shrink-0 grid place-items-center rounded-md border transition-colors disabled:opacity-30 disabled:cursor-not-allowed ${sm ? 'w-7 h-7' : 'w-8 h-8'} ${active ? on : off}`}>
+    <button type="button" onClick={onClick} title={title} aria-label={title} aria-pressed={active} disabled={disabled} className={`shrink-0 grid place-items-center rounded-md border transition-colors disabled:opacity-30 disabled:cursor-not-allowed ${sm ? 'w-7 h-7' : 'w-8 h-8'} ${active ? on : off} ${className ?? ''}`}>
       {children}
     </button>
   );
 }
+
+// Hide at rest, show when the row (a .group) is hovered. Base ActBtn is display:grid; `hidden` is emitted
+// after `grid` in Tailwind so it wins at rest, and the group-hover variant wins on hover.
+const REVEAL_ON_HOVER = 'hidden group-hover:grid';
 
 const SVG = { width: 15, height: 15, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round' as const, strokeLinejoin: 'round' as const };
 
@@ -377,10 +435,14 @@ function ActionMenu({ actions }: { actions: MenuAction[] }) {
   const W = 188;
   let left = 8, top = 0, up = false;
   if (rect) {
-    left = Math.max(8, rect.right - W);
+    // Position in the menu's own (zoom-adjusted) coordinate space so a uiScale > 1 never throws it off-screen;
+    // see uiZoom.ts. No-op at 100%.
+    const r = logicalRect(rect);
+    const vh = logicalViewport().h;
+    left = Math.max(8, r.right - W);
     const estH = actions.length * 32 + 8;
-    if (rect.bottom + 4 + estH > window.innerHeight && rect.top - estH - 4 > 8) { top = rect.top - estH - 4; up = true; }
-    else top = rect.bottom + 4;
+    if (r.bottom + 4 + estH > vh && r.top - estH - 4 > 8) { top = r.top - estH - 4; up = true; }
+    else top = r.bottom + 4;
   }
 
   return (
@@ -532,11 +594,14 @@ export function RowActions({ char, bag, item, canAct, bags }: { char: KnownChar;
 
   return (
     <>
-      <ActBtn sm tone="accent" active={watched} onClick={() => setWatchOpen(true)} title="Add To Watchlist">{ICN.watch}</ActBtn>
-      <ActBtn sm tone="accent" active={wished} disabled={!auctionable} onClick={() => (wished ? removeWish(item.id) : addWish({ id: item.id, n: item.n }, (item.ms ?? 1) > 1))} title={!auctionable ? 'Cannot Be Auctioned' : wished ? 'On AH Wishlist' : 'Add to AH Wishlist'}>{ICN.wishlist}</ActBtn>
-      <ActBtn sm tone="amber" active={inDrop} onClick={toggleDrop} title={inDrop ? 'On Drop List' : 'Add to Drop List'}>{ICN.ban}</ActBtn>
-      <ActBtn sm tone="accent" active={inSell} onClick={() => setShopSell({ ...sell, items: inSell ? sell.items.filter((n) => n.toLowerCase() !== item.n.toLowerCase()) : [...sell.items, item.n] })} title={inSell ? 'On Sell List' : 'Add To Sell List'}>{ICN.sell}</ActBtn>
-      <ActBtn sm tone="accent" active={inLot} onClick={toggleLot} title={inLot ? 'On Lot List' : 'Add To Lot List'}>{ICN.lot}</ActBtn>
+      {/* Inactive quick-actions hide at rest and reveal on row hover, so item names get the full row width
+          instead of being crushed by six always-on buttons. Active ones stay visible so their state (on
+          the watch/wishlist/drop/sell/lot list) is never lost at a glance, and the ⋯ menu is always there. */}
+      <ActBtn sm tone="accent" active={watched} className={watched ? undefined : REVEAL_ON_HOVER} onClick={() => setWatchOpen(true)} title="Add To Watchlist">{ICN.watch}</ActBtn>
+      <ActBtn sm tone="accent" active={wished} className={wished ? undefined : REVEAL_ON_HOVER} disabled={!auctionable} onClick={() => (wished ? removeWish(item.id) : addWish({ id: item.id, n: item.n }, (item.ms ?? 1) > 1))} title={!auctionable ? 'Cannot Be Auctioned' : wished ? 'On AH Wishlist' : 'Add to AH Wishlist'}>{ICN.wishlist}</ActBtn>
+      <ActBtn sm tone="amber" active={inDrop} className={inDrop ? undefined : REVEAL_ON_HOVER} onClick={toggleDrop} title={inDrop ? 'On Drop List' : 'Add to Drop List'}>{ICN.ban}</ActBtn>
+      <ActBtn sm tone="accent" active={inSell} className={inSell ? undefined : REVEAL_ON_HOVER} onClick={() => setShopSell({ ...sell, items: inSell ? sell.items.filter((n) => n.toLowerCase() !== item.n.toLowerCase()) : [...sell.items, item.n] })} title={inSell ? 'On Sell List' : 'Add To Sell List'}>{ICN.sell}</ActBtn>
+      <ActBtn sm tone="accent" active={inLot} className={inLot ? undefined : REVEAL_ON_HOVER} onClick={toggleLot} title={inLot ? 'On Lot List' : 'Add To Lot List'}>{ICN.lot}</ActBtn>
       {verbs.length > 0 && <ActionMenu actions={verbs} />}
       {confirm && <DropConfirmModal kind={confirm} item={item} charName={char.name} fromBag={bag.id !== 0 ? bagName(bag.id, bag.b) : undefined} allCount={confirm === 'all' || confirm === 'party' ? allMatches : undefined} onCancel={() => setConfirm(null)} onConfirm={confirm === 'now' ? doDropNow : confirm === 'all' ? dropEverywhere : confirm === 'party' ? dropOnParty : confirmAddList} />}
       {moving && <MoveModal char={char} fromBag={bag} item={item} bags={bags} onClose={() => setMoving(false)} />}
@@ -1402,8 +1467,8 @@ function AddToWatchModal({ item, assets, iconSet, onClose }: { item: InvItem; as
               </div>
               <div className="flex items-center gap-2">
                 <span className="text-[10px] uppercase tracking-wide font-semibold text-fg-4 flex-1">Characters</span>
-                <button onClick={() => setSel(new Set(chars.map((c) => c.name)))} className="le-tap text-[10px] font-semibold text-fg-4 hover:text-fg-2">All</button>
-                <button onClick={() => setSel(new Set())} className="le-tap text-[10px] font-semibold text-fg-4 hover:text-fg-2">None</button>
+                <Button variant="ghost" size="xs" onClick={() => setSel(new Set(chars.map((c) => c.name)))}>All</Button>
+                <Button variant="ghost" size="xs" onClick={() => setSel(new Set())}>None</Button>
               </div>
               <div className="flex flex-col gap-1 max-h-[40vh] overflow-y-auto">
                 {chars.map((c) => {
@@ -1450,12 +1515,14 @@ export default function InventoryView() {
   const catOf = useMemo(() => (id: number) => catObjs.get(id), [catObjs]);
   const sell = useShopSell();
   const experimental = useSettings().experimentalFeatures;
+  const server = useSettings().ahServer;
   const [name, setName] = useStickyChar();
   const [bagId, setBagId] = useSticky<number | null>('inv.bag', null);
   const [q, setQ] = useSticky('inv.q', '');
   const [globalFind, setGlobalFind] = useSticky('inv.global', false);
   const [sort, setSort] = useStickyPersisted('inv.sort', 'slot' as SortMode);
   const tf = useTagFilter('inventory.tagfilter');
+  const jf = useJobFilter('inventory.jobfilter');
   const sortOpts = useMemo(() => [...SORTS, ...tagSorts(tf.tags)], [tf.tags]);
   const [collapsed, setCollapsed] = useSticky<string[]>('inv.collapsed', []);
   const toggleCollapse = (nm: string) => setCollapsed((c) => (c.includes(nm) ? c.filter((x) => x !== nm) : [...c, nm]));
@@ -1590,14 +1657,15 @@ export default function InventoryView() {
   const viewBusy = isPending || (globalFind && search !== dSearch);
 
   const localResults = useMemo(() => {
-    if ((!search && !tf.active) || globalFind) return null;
+    if ((!search && !tf.active && !jf.active) || globalFind) return null;
     const out: Entry[] = [];
     for (const bg of bags) for (const it of bg.items) {
       if (tf.matches && !tf.matches(it.id)) continue;
+      if (jf.matches && !jf.matches(it.id)) continue;
       if (!search || itemNameMatches(it.id, it.n, search) || (SHOW_INV_AH_CATEGORY && search.length >= 3 && acPathLabel(acMap.get(it.id)).toLowerCase().includes(search))) out.push({ bag: bg.b, bagObj: bg, item: it });
     }
     return out;
-  }, [search, globalFind, bags, acMap, tf.active, tf.matches]);
+  }, [search, globalFind, bags, acMap, tf.active, tf.matches, jf.active, jf.matches]);
 
   const selItems = useMemo<SelItem[]>(() => {
     if (localResults) return localResults.filter((e) => lsel.has(lKey(e))).map((e) => ({ ...e.item, bag: e.bagObj?.id ?? 0 }));
@@ -1606,22 +1674,23 @@ export default function InventoryView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [localResults, lsel, bag, selSlots]);
   const lSelectAll = () => { if (localResults) setLsel(new Set(localResults.map(lKey))); };
-  useEffect(() => { setLsel(new Set()); }, [name, globalFind, search]);
+  useEffect(() => { setLsel(new Set()); }, [name, globalFind, search, tf.value, jf.value]);
 
   const globalResults = useMemo(() => {
-    if ((!dSearch && !tf.active) || !globalFind) return null;
+    if ((!dSearch && !tf.active && !jf.active) || !globalFind) return null;
     const groups: { char: KnownChar; hits: Entry[]; total: number }[] = [];
     for (const c of known) {
       const hits: Entry[] = [];
       let total = 0;
       for (const bg of c.inv ?? []) for (const it of bg.items) {
         if (tf.matches && !tf.matches(it.id)) continue;
+        if (jf.matches && !jf.matches(it.id)) continue;
         if (!dSearch || itemNameMatches(it.id, it.n, dSearch) || (SHOW_INV_AH_CATEGORY && dSearch.length >= 3 && acPathLabel(acMap.get(it.id)).toLowerCase().includes(dSearch))) { hits.push({ bag: bg.b, bagObj: bg, item: it }); total += it.c; }
       }
       if (hits.length) groups.push({ char: c, hits, total });
     }
     return groups;
-  }, [dSearch, globalFind, known, acMap, tf.active, tf.matches]);
+  }, [dSearch, globalFind, known, acMap, tf.active, tf.matches, jf.active, jf.matches]);
 
   const consoRun = useConsolidate();
   const gplan = useMemo(() => {
@@ -1695,14 +1764,7 @@ export default function InventoryView() {
           </div>
 
           <div className="flex items-center gap-2">
-            <SearchInput
-              value={q}
-              onChange={setQ}
-              placeholder={globalFind ? `Find an item across all ${known.length} character${known.length === 1 ? '' : 's'}…` : 'Search...'}
-              className="bg-field border border-line rounded-md px-3 py-1.5 text-xs text-fg-2 placeholder-fg-4 outline-none focus:border-accent/50 transition-colors"
-            />
-            {viewBusy && <svg viewBox="0 0 24 24" className="shrink-0 w-4 h-4 text-accent animate-spin" fill="none" stroke="currentColor" strokeWidth={2.4} strokeLinecap="round"><path d="M21 12a9 9 0 1 1-6.2-8.5" /></svg>}
-            <div className="shrink-0 w-[128px]">
+            <div className="flex-1 min-w-0">
               <Select
                 value={sort}
                 onChange={(v) => setSort(v as SortMode)}
@@ -1712,7 +1774,9 @@ export default function InventoryView() {
                 full
               />
             </div>
-            {tf.tags.length > 0 && <div className="shrink-0 w-[104px]"><TagFilterSelect value={tf.value} onChange={tf.setValue} tags={tf.tags} /></div>}
+            {tf.tags.length > 0 && <div className="flex-1 min-w-0"><TagFilterSelect value={tf.value} onChange={tf.setValue} tags={tf.tags} /></div>}
+            <div className="flex-1 min-w-0"><JobFilterSelect value={jf.value} onChange={jf.setValue} /></div>
+            {!globalFind && <PullButton char={active} conn={active?.conn ?? undefined} />}
             {((!globalFind && !localResults && bag && bag.items.length > 0) || (!globalFind && localResults && localResults.length > 0) || (globalFind && globalResults && globalResults.length > 0)) && (
               <button
                 onClick={selMode ? exitSelect : enterSelect}
@@ -1723,6 +1787,17 @@ export default function InventoryView() {
                 MULTI
               </button>
             )}
+          </div>
+
+          <div className="flex items-center gap-2">
+            <SearchInput
+              value={q}
+              onChange={setQ}
+              wrap="flex-1 min-w-0"
+              placeholder={globalFind ? `Find an item across all ${known.length} character${known.length === 1 ? '' : 's'}…` : 'Search...'}
+              className="w-full bg-field border border-line rounded-md px-3 py-1.5 text-xs text-fg-2 placeholder-fg-4 outline-none focus:border-accent/50 transition-colors"
+            />
+            {viewBusy && <svg viewBox="0 0 24 24" className="shrink-0 w-4 h-4 text-accent animate-spin" fill="none" stroke="currentColor" strokeWidth={2.4} strokeLinecap="round"><path d="M21 12a9 9 0 1 1-6.2-8.5" /></svg>}
           </div>
 
           {!globalFind && active?.inv && !localResults && bags.length > 0 && (
@@ -1753,8 +1828,8 @@ export default function InventoryView() {
                 </span>
                 {globalResults.length > 1 && (
                   <>
-                    <button onClick={() => setCollapsed([])} className="hover:text-fg-2 transition-colors">Expand All</button>
-                    <button onClick={() => setCollapsed(globalResults.map((g) => g.char.name))} className="hover:text-fg-2 transition-colors">Collapse All</button>
+                    <Button variant="ghost" size="xs" onClick={() => setCollapsed([])}>Expand All</Button>
+                    <Button variant="ghost" size="xs" onClick={() => setCollapsed(globalResults.map((g) => g.char.name))}>Collapse All</Button>
                   </>
                 )}
               </div>
@@ -1779,6 +1854,7 @@ export default function InventoryView() {
                       onSelectEnter={selMode ? (_, e) => gSelEnter(g.char.name, e) : undefined}
                       renderActions={!selMode ? (it, e) => (e.bagObj ? <RowActions char={g.char} bag={e.bagObj} item={it} canAct={!!g.char.online && g.char.conn != null} bags={[...(g.char.inv ?? [])].sort((a, b) => bagRank(a.id) - bagRank(b.id))} /> : null) : undefined}
                       catOf={catOf}
+                      server={server}
                     />
                   )}
                 </div>
@@ -1805,6 +1881,7 @@ export default function InventoryView() {
                 onSelectEnter={selMode ? (_, e) => lSelEnter(e) : undefined}
                 renderActions={!selMode && active ? (it, e) => (e.bagObj ? <RowActions char={active} bag={e.bagObj} item={it} canAct={canAct} bags={bags} /> : null) : undefined}
                 catOf={catOf}
+                server={server}
               />
             </>
           )
@@ -1824,6 +1901,7 @@ export default function InventoryView() {
                   onSelectEnter={selMode ? onSelEnter : undefined}
                   renderActions={!selMode && active && bag ? (it) => <RowActions char={active} bag={bag} item={it} canAct={canAct} bags={bags} /> : undefined}
                   catOf={catOf}
+                  server={server}
                   animate
                 />
               </div>

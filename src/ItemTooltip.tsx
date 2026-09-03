@@ -8,14 +8,21 @@ import { openAhDetail } from './ahNav';
 import { bagColor } from './bagColors';
 import { Collapse } from './overlay';
 import { useSettings } from './settings';
+import { logicalRect, logicalViewport } from './uiZoom';
+import { itemJobs } from './itemNames';
+import { Button } from './ui';
 
 export type HoverMeta = { id: number; n?: string; c?: number; ms?: number; f?: number; aug?: string[] };
-type HoverState = { meta: HoverMeta; rect: DOMRect } | null;
+type HoverState = { meta: HoverMeta; rect: DOMRect; anchor: Element } | null;
 
-const Ctx = createContext<{
-  open: (m: HoverMeta, rect: DOMRect) => void;
+type CardApi = {
+  open: (m: HoverMeta, rect: DOMRect, anchor: Element) => void;
   hide: () => void;
-} | null>(null);
+  hoverOpen: (m: HoverMeta, rect: DOMRect, anchor: Element) => void;
+  hoverHide: () => void;
+  cancelHide: () => void;
+};
+const Ctx = createContext<CardApi | null>(null);
 
 export function useItemHover(meta: HoverMeta | null | undefined) {
   const ctx = useContext(Ctx);
@@ -24,10 +31,14 @@ export function useItemHover(meta: HoverMeta | null | undefined) {
     onClick: (e: MouseEvent) => {
       if (!ctx || id <= 0 || !meta) return;
       e.stopPropagation();
-      ctx.open(meta, e.currentTarget.getBoundingClientRect());
+      // Clicking the same icon again closes it; clicking a different one moves the card there.
+      ctx.open(meta, e.currentTarget.getBoundingClientRect(), e.currentTarget);
     },
   }), [ctx, id, meta?.n, meta?.c, meta?.ms, meta?.f, meta?.aug?.join('|')]);
 }
+
+// Raw card controls, for callers that open the card on HOVER (grace-delayed) rather than click.
+export function useItemCard(): CardApi | null { return useContext(Ctx); }
 
 export function ItemHoverTarget({ meta, children }: { meta: HoverMeta; children: ReactElement }) {
   const hover = useItemHover(meta);
@@ -37,10 +48,17 @@ export function ItemHoverTarget({ meta, children }: { meta: HoverMeta; children:
 export function ItemHoverProvider({ children }: { children: ReactNode }) {
   const [st, setSt] = useState<HoverState>(null);
   const cardRef = useRef<HTMLDivElement | null>(null);
-  const api = useMemo(() => ({
-    open: (meta: HoverMeta, rect: DOMRect) => setSt({ meta, rect }),
-    hide: () => setSt(null),
-  }), []);
+  const hideT = useRef<number | undefined>(undefined);
+  const api = useMemo<CardApi>(() => {
+    const clear = () => { if (hideT.current) { clearTimeout(hideT.current); hideT.current = undefined; } };
+    return {
+      open: (meta, rect, anchor) => { clear(); setSt((cur) => (cur && cur.anchor === anchor ? null : { meta, rect, anchor })); },
+      hide: () => { clear(); setSt(null); },
+      hoverOpen: (meta, rect, anchor) => { clear(); setSt({ meta, rect, anchor }); },
+      hoverHide: () => { clear(); hideT.current = window.setTimeout(() => setSt(null), 160); },
+      cancelHide: clear,
+    };
+  }, []);
 
   useEffect(() => {
     if (!st) return;
@@ -53,11 +71,19 @@ export function ItemHoverProvider({ children }: { children: ReactNode }) {
     <Ctx.Provider value={api}>
       {children}
       <AnimatePresence>
-        {st && <Card key={st.meta.id} meta={st.meta} rect={st.rect} cardRef={cardRef} onClose={api.hide} />}
+        {st && <Card key={st.meta.id} meta={st.meta} rect={st.rect} cardRef={cardRef} onClose={api.hide} onCardEnter={api.cancelHide} onCardLeave={api.hoverHide} />}
       </AnimatePresence>
     </Ctx.Provider>
   );
 }
+
+// Job palette shared with Sage (BoT JobIcon.tsx) so job codes read the same across the tools.
+const JOB_COLORS: Record<string, string> = {
+  WAR: '#e05545', MNK: '#e0913f', WHM: '#d8d0c0', BLM: '#9a6fd6', RDM: '#e0607e', THF: '#67b04f',
+  PLD: '#6fb2e6', DRK: '#a24e78', BST: '#b98f57', BRD: '#d96ac8', RNG: '#3f9e6f', SAM: '#d95f38',
+  NIN: '#8790cc', DRG: '#5772d6', SMN: '#4fb59a', BLU: '#4f9be0', COR: '#e0b64a', PUP: '#b3763c',
+  DNC: '#ef9ab6', SCH: '#74c0a0', GEO: '#aac24f', RUN: '#57c4cc',
+};
 
 function flagBadges(f?: number) {
   const out: { label: string; cls: string }[] = [];
@@ -160,7 +186,7 @@ function DescLine({ line }: { line: string }) {
   return <div className="text-fg-2">{tokenize(line)}</div>;
 }
 
-function Card({ meta, rect, onClose, cardRef }: { meta: HoverMeta; rect: DOMRect; onClose: () => void; cardRef: React.RefObject<HTMLDivElement | null> }) {
+function Card({ meta, rect, onClose, cardRef, onCardEnter, onCardLeave }: { meta: HoverMeta; rect: DOMRect; onClose: () => void; cardRef: React.RefObject<HTMLDivElement | null>; onCardEnter?: () => void; onCardLeave?: () => void }) {
   const icons = useAvailableIcons();
   const desc = useItemDescription(meta.id);
   const chars = useKnownCharacters();
@@ -180,20 +206,25 @@ function Card({ meta, rect, onClose, cardRef }: { meta: HoverMeta; rect: DOMRect
   // long items (many tags + description + owners) fit without scrolling. It keeps the same 300px
   // width and the anchor beside the clicked item; only the available height changes.
   const W = 300;
-  let left = rect.right + M;
-  if (left + W > window.innerWidth) left = rect.left - W - M;
+  // Position in the popover's own (zoom-adjusted) coordinate space so a uiScale > 1 never throws the card
+  // off-screen; see uiZoom.ts. No-op at 100%.
+  const r = logicalRect(rect);
+  const vp = logicalViewport();
+  let left = r.right + M;
+  if (left + W > vp.w) left = r.left - W - M;
   if (left < M) left = M;
   let top: number, maxHeight: number;
   if (big) {
     top = M;
-    maxHeight = window.innerHeight - 2 * M;
+    maxHeight = vp.h - 2 * M;
   } else {
-    top = Math.max(M, Math.min(rect.top, window.innerHeight - 200));
-    maxHeight = window.innerHeight - top - M;
+    top = Math.max(M, Math.min(r.top, vp.h - 200));
+    maxHeight = vp.h - top - M;
   }
 
   const name = meta.n || `Item ${meta.id}`;
   const badges = flagBadges(meta.f);
+  const jobInfo = itemJobs(meta.id);
   const noAh = !!((meta.f ?? 0) & 0x08);
   const ahItem = ahCat.items.find((i) => i.id === meta.id);
   const sellable = ahCat.items.length > 0 ? !!ahItem : !noAh;
@@ -208,6 +239,8 @@ function Card({ meta, rect, onClose, cardRef }: { meta: HoverMeta; rect: DOMRect
   return createPortal(
     <motion.div
       ref={cardRef}
+      onMouseEnter={onCardEnter}
+      onMouseLeave={onCardLeave}
       className="fixed z-[80] rounded-lg border border-line bg-popover shadow-2xl p-3 overscroll-contain"
       style={{ left, top, width: W, maxHeight, overflowY: 'auto' }}
       initial={{ opacity: 0, scale: 0.97, y: -3 }}
@@ -228,7 +261,7 @@ function Card({ meta, rect, onClose, cardRef }: { meta: HoverMeta; rect: DOMRect
         </div>
         <div className="min-w-0 flex-1">
           <div className="text-[13px] font-bold text-fg leading-tight">{name}</div>
-          <div className="text-[10px] text-fg-4 mt-0.5 tabular-nums">#{meta.id}{stack}</div>
+          <div className="text-[10px] text-fg-4 mt-0.5 tabular-nums">#{meta.id}{stack}{jobInfo?.level ? ` · Lv ${jobInfo.level}` : ''}</div>
           {badges.length > 0 && (
             <div className="flex flex-wrap gap-1 mt-1.5">
               {badges.map((b) => <span key={b.label} className={`px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-wide border ${b.cls}`}>{b.label}</span>)}
@@ -259,6 +292,15 @@ function Card({ meta, rect, onClose, cardRef }: { meta: HoverMeta; rect: DOMRect
         </div>
       )}
 
+      {jobInfo && (jobInfo.all || jobInfo.jobs.length > 0) && (
+        <div className="mt-2.5 flex flex-wrap items-center gap-1">
+          <span className="text-[9px] font-bold uppercase tracking-wide text-fg-4 mr-0.5">Jobs</span>
+          {jobInfo.all
+            ? <span className="px-2 py-0.5 rounded text-[10px] font-bold border border-accent/50 text-accent bg-accent/10">All Jobs</span>
+            : jobInfo.jobs.map((j) => { const col = JOB_COLORS[j] ?? 'var(--color-fg-2)'; return <span key={j} className="px-1.5 py-0.5 rounded text-[10px] font-bold border" style={{ color: col, borderColor: `${col}66`, backgroundColor: `${col}1f` }}>{j}</span>; })}
+        </div>
+      )}
+
       {meta.aug && meta.aug.length > 0 && (
         <div className="mt-2.5 pt-2.5 border-t border-line">
           <div className="text-[10px] font-bold uppercase tracking-wide text-violet-300 mb-1">Augments</div>
@@ -271,7 +313,7 @@ function Card({ meta, rect, onClose, cardRef }: { meta: HoverMeta; rect: DOMRect
       <div className="mt-2.5 pt-2.5 border-t border-line flex items-center gap-2 flex-wrap">
         <span className="text-[10px] font-bold uppercase tracking-wide text-fg-4">Info</span>
         {links.map((l) => (
-          <button key={l.label} onClick={() => openExternal(l.url)} className="le-tap text-[11px] font-semibold text-sky-300 hover:text-sky-200 hover:underline transition-colors">[{l.label}]</button>
+          <Button key={l.label} variant="link" onClick={() => openExternal(l.url)}>[{l.label}]</Button>
         ))}
       </div>
 

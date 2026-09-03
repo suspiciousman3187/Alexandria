@@ -4,6 +4,8 @@ import { inTauri } from './bridge';
 
 const COLS = 32;
 const PER = COLS * COLS;
+const SHEET_PX = 1024;         // each atlas sheet PNG is 1024x1024
+const CELL = SHEET_PX / COLS;  // native cell size within a sheet (32px)
 
 let atlasMap: Map<number, number> | null = null;
 let sheetCount = 0;
@@ -54,17 +56,25 @@ export function IconInner({ id, size, name, assets, bmpHas }: { id: number; size
     const within = idx % PER;
     const col = within % COLS;
     const row = Math.floor(within / COLS);
-    const px = COLS * size;
+    // Draw the cell at its NATIVE resolution and GPU-scale the div to `size` with a transform, rather than
+    // forcing a non-native `background-size`. A scaled background-size makes the browser rasterize and cache
+    // a resized copy of the whole 1024x1024 sheet for every (sheet, size) pair; across 23 sheets and several
+    // icon sizes that is a large, redundant GPU-memory cost -- the most likely trigger for the icon-dense
+    // Curio view crashing the display on lower-VRAM machines running several game clients. A CSS transform
+    // reuses the already-decoded native texture and allocates no extra raster.
     return (
-      <div
-        style={{
-          width: size,
-          height: size,
-          backgroundImage: `url(/atlas/cat_${sheet}.png)`,
-          backgroundSize: `${px}px ${px}px`,
-          backgroundPosition: `-${col * size}px -${row * size}px`,
-        }}
-      />
+      <div style={{ width: size, height: size, overflow: 'hidden' }}>
+        <div
+          style={{
+            width: CELL,
+            height: CELL,
+            backgroundImage: `url(/atlas/cat_${sheet}.png)`,
+            backgroundPosition: `-${col * CELL}px -${row * CELL}px`,
+            transform: size === CELL ? undefined : `scale(${size / CELL})`,
+            transformOrigin: 'top left',
+          }}
+        />
+      </div>
     );
   }
   if (bmpHas && assets && inTauri) return <BmpImg id={id} name={name} assets={assets} size={size} />;

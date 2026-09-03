@@ -11,6 +11,8 @@ export type ParsedSet = {
   combineBase?: string;
   nonSlotKeys: number;
   valueSpan: [number, number];
+  // Byte range of each slot's whole `key = value` entry in the source, for surgical in-place edits.
+  slotSpans: Partial<Record<SlotKey, [number, number]>>;
 };
 
 export type ParsedGearsets = { sets: ParsedSet[]; byKey: Map<string, ParsedSet> };
@@ -225,19 +227,20 @@ function toGear(node: Node): GearEntry | null {
   }
   return null;
 }
-function tableToSlots(node: Node): { slots: Partial<Record<SlotKey, GearEntry>>; nonSlotKeys: number } {
+function tableToSlots(node: Node): { slots: Partial<Record<SlotKey, GearEntry>>; nonSlotKeys: number; slotSpans: Partial<Record<SlotKey, [number, number]>> } {
   const slots: Partial<Record<SlotKey, GearEntry>> = {};
+  const slotSpans: Partial<Record<SlotKey, [number, number]>> = {};
   let nonSlotKeys = 0;
-  if (node.kind !== 'table') return { slots, nonSlotKeys };
+  if (node.kind !== 'table') return { slots, nonSlotKeys, slotSpans };
   for (const en of node.entries) {
     if (!en.key) continue;
     if (SLOT_ALIASES.has(en.key.toLowerCase())) {
       const sk = canonSlot(en.key);
       const g = toGear(en.value);
-      if (sk && g) slots[sk] = g;
+      if (sk && g) { slots[sk] = g; slotSpans[sk] = en.span; }
     } else nonSlotKeys++;
   }
-  return { slots, nonSlotKeys };
+  return { slots, nonSlotKeys, slotSpans };
 }
 
 export type ResolvedSlot = { entry: GearEntry; inherited: boolean; source?: string };
@@ -315,10 +318,10 @@ export function parseGearsetFile(src: string): ParsedGearsets {
           const v = readValue(src, q + 1);
           if (v.node.kind === 'table') {
             const t = tableToSlots(v.node);
-            sets.push({ path, key: path.join('.'), slots: t.slots, nonSlotKeys: t.nonSlotKeys, valueSpan: [q + 1, v.end] });
+            sets.push({ path, key: path.join('.'), slots: t.slots, nonSlotKeys: t.nonSlotKeys, valueSpan: [q + 1, v.end], slotSpans: t.slotSpans });
           } else if (v.node.kind === 'combine') {
             const t = tableToSlots(v.node.overrides);
-            sets.push({ path, key: path.join('.'), slots: t.slots, combineBase: v.node.base, nonSlotKeys: t.nonSlotKeys, valueSpan: [q + 1, v.end] });
+            sets.push({ path, key: path.join('.'), slots: t.slots, combineBase: v.node.base, nonSlotKeys: t.nonSlotKeys, valueSpan: [q + 1, v.end], slotSpans: t.slotSpans });
           }
           i = v.end;
           continue;

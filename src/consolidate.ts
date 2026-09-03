@@ -127,7 +127,7 @@ async function consolidateOne(name: string, collectorName: string, wants: Record
     const collector = fresh(collectorName);
     if (collector?.conn != null) armTradeReceiver(collector.conn, name, fresh(name)?.id);
     await sleep(400);
-    tradeTo(conn, collectorName, items);
+    tradeTo(conn, collectorName, items, 0, collector?.id);
     const ok = await pollUntil(() => items.some((it) => bagCount(fresh(name), it.id, 0) < before[it.id]), 15000);
     let movedAny = 0;
     for (const it of items) { const moved = Math.max(0, before[it.id] - bagCount(fresh(name), it.id, 0)); sent[it.id] = (sent[it.id] ?? 0) + moved; movedAny += moved; }

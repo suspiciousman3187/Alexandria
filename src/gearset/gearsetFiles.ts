@@ -41,6 +41,11 @@ export async function readGearsetFile(path: string): Promise<string | null> {
   try { return await invoke<string>('read_text_file', { path }); } catch { return null; }
 }
 
+export async function writeGearsetFile(path: string, contents: string): Promise<boolean> {
+  if (!inTauri) return false;
+  try { await invoke('write_text_file', { path, contents }); return true; } catch { return false; }
+}
+
 // Mirrors GearSwap's search: directory outer loop, filename inner loop.
 export async function findGearsetFile(base: string, char: string, job: string): Promise<string | null> {
   const j = job.toUpperCase();

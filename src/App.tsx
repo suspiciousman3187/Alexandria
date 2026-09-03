@@ -3,6 +3,8 @@ import { MotionConfig, AnimatePresence, motion } from 'motion/react';
 import { ItemHoverProvider } from './ItemTooltip';
 import TitleBar from './TitleBar';
 import NavRail, { type Section, GEARSETS_ENABLED } from './NavRail';
+import { GlobalReforgeTracker } from './reforgeProgress';
+import { useStickyChar } from './sticky';
 import { DistributeHost } from './distributeHost';
 import { UseAllHost } from './useAllHost';
 import { TextTipHost } from './textTip';
@@ -20,15 +22,18 @@ import { useDropSync, useDrop, setDrop } from './drop';
 import { useShopSellSync } from './shop';
 import { useShopNpcSync } from './menuShortcuts';
 import { usePoolRulesSync } from './poolRules';
+import { usePoolPriceTee } from './poolPriceTee';
+import { usePoolSageBridge } from './poolSageBridge';
 import { useSettings, setSettings, useSettingsSync } from './settings';
 import { setRowPollMinutes } from './priceStore';
 import { useAutoOrganizeOnMog } from './autoOrganize';
+import { usePullAutoRun } from './pullAutoRun';
 import { initMovedTracker } from './movedTracker';
 import { useResupplySync, useResupplyDone } from './resupply';
 import { useVendorSync, useVendorDone } from './vendors';
 import { useFindCacheSync } from './findCache';
 import { useNavTo, clearNavTo } from './ahNav';
-import { Group, Row, RowStacked, Segmented, Toggle, Select, Slider } from './ui';
+import { Group, Row, RowStacked, Segmented, Toggle, Select, Slider, Button } from './ui';
 import UpdateBanner, { getStartupCheck, setStartupCheck } from './UpdateBanner';
 import WhatsNew from './WhatsNew';
 import ListingToasts from './ListingToasts';
@@ -54,15 +59,29 @@ import NetworthView from './NetworthView';
 import { GearsetLauncher } from './GearsetView';
 import { deriveGearswapData } from './gearset/gearsetFiles';
 import { ServerHealthRow } from './ServerHealth';
+import { debugLogPath, setDebugView } from './debugLog';
 import ResupplyView from './ResupplyView';
 import VendorsView from './VendorsView';
 import SparksView from './SparksView';
 import StoreView from './StoreView';
 import AugmentView from './AugmentView';
+import ReforgeView from './ReforgeView';
 import BazaarView from './BazaarView';
 import SequencesView from './SequencesView';
 import CommandsView from './CommandsView';
 import './alerts';
+
+function DebugLogRow() {
+  const [path, setPath] = useState('');
+  const [copied, setCopied] = useState(false);
+  useEffect(() => { void debugLogPath().then(setPath); }, []);
+  const copy = async () => { try { await navigator.clipboard.writeText(path); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch { /* clipboard blocked */ } };
+  return (
+    <Row label="Debug Log" desc={path ? `Rolling diagnostic log (GPU, memory, frame timing, breadcrumbs) at: ${path}` : 'Rolling diagnostic log of GPU, memory, and frame timing, written to disk for crash diagnosis.'}>
+      <Button variant="secondary" size="sm" onClick={copy} disabled={!path}>{copied ? 'Copied' : 'Copy Path'}</Button>
+    </Row>
+  );
+}
 
 function Placeholder({ title, blurb }: { title: string; blurb: string }) {
   return (
@@ -328,6 +347,7 @@ function SettingsView() {
           <Toggle on={settings.memLog} onChange={(v) => setSettings({ ...settings, memLog: v })} />
         </Row>
         <ServerHealthRow />
+        <DebugLogRow />
       </Group>
       <Group title="MARKET">
         <Row label="Auto-Refresh Prices" desc="How often on-screen Wishlist and Browse prices re-check the auction house.">
@@ -407,17 +427,21 @@ const VIEWS: Record<Section, ReactElement> = {
   skirmish: <AugmentView view="skirmish" />,
   reive: <AugmentView view="reive" />,
   geasfete: <AugmentView view="geasfete" />,
+  reforge: <ReforgeView />,
   settings: <SettingsView />,
 };
 
 export default function App() {
   const [section, setSection] = useState<Section>('inventory');
+  const [, setActiveChar] = useStickyChar();
   const navTo = useNavTo();
   useWatchAlerts();
   useDropSync();
   useShopSellSync();
   useShopNpcSync();
   usePoolRulesSync();
+  usePoolPriceTee();   // forward pool-item AH prices to Sage's overlay
+  usePoolSageBridge(); // tee pool settings to Sage + apply its overlay's rule/drop/price-mode clicks
   useSettingsSync();
   const ahPollMin = useSettings().ahPollMin;
   useEffect(() => { setRowPollMinutes(ahPollMin); }, [ahPollMin]);
@@ -430,6 +454,7 @@ export default function App() {
     else el.style.removeProperty('zoom');
   }, [uiScale]);
   useAutoOrganizeOnMog();
+  usePullAutoRun();
   useResupplySync();
   useResupplyDone();
   useVendorSync();
@@ -439,6 +464,9 @@ export default function App() {
   useEffect(() => { void applyWindowSize(getMode()); }, []);
   useEffect(() => { let un = () => {}; void watchMaximized().then((u) => { un = u; }); return () => un(); }, []);
   useEffect(() => { if (navTo) { setSection(navTo); clearNavTo(); } }, [navTo]);
+  // Stamp the diagnostic log with the current view on EVERY navigation, so a crash tail always says where the
+  // user was -- not just on the Curio screen. Junior's freezes hit different views, so this is what tells us which.
+  useEffect(() => { setDebugView(section); }, [section]);
   return (
     <MotionConfig reducedMotion="user">
       <ItemHoverProvider>
@@ -465,6 +493,7 @@ export default function App() {
           </main>
         </div>
       </div>
+      <GlobalReforgeTracker hidden={section === 'reforge'} onOpen={(name) => { setActiveChar(name); setSection('reforge'); }} />
       <ListingToasts />
       <DistributeHost />
       <UseAllHost />

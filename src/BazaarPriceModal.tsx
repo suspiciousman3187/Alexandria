@@ -3,7 +3,9 @@ import { Modal } from './overlay';
 import { GilInput } from './ui';
 import { IconInner } from './atlasIcon';
 import { bzApply } from './bridge';
-import { getCachedValue } from './priceStore';
+import { getCachedValue, useItemValues } from './priceStore';
+import { itemStack } from './itemNames';
+import { getMedianStack, toggleMedianStack, useMedianModeTick } from './medianMode';
 
 export type BazaarItem = { id: number; n: string; c: number; s: number; bz?: number };
 
@@ -23,10 +25,19 @@ export function BazaarPriceModal({ conn, items, server, iconSet, assets, onClose
   });
   const [bulkPrice, setBulkPrice] = useState('');
   const single = items.length === 1;
+  // Fetch the single-unit AH median for every item in the dialog so it can be shown next to the price
+  // (the seed above only reads cache; this fills it in even for items never browsed). Bounded to the
+  // handful of items in this modal, so no risk of bursting the AH like a whole-inventory scan would.
+  const values = useItemValues(server, items.map((it) => it.id));
+  const valuesStack = useItemValues(server, items.filter((it) => itemStack(it.id) > 1).map((it) => it.id), true);
+  useMedianModeTick(); // re-render when a per-item stack/single toggle lands
+  const medOf = (it: BazaarItem, stack: boolean) => (stack ? valuesStack : values).get(it.id)?.median ?? (server ? getCachedValue(server, it.id, stack)?.median : undefined);
+  const stkOf = (it: BazaarItem) => itemStack(it.id) > 1 && getMedianStack(it.id);
+  const medianOf = (it: BazaarItem) => medOf(it, stkOf(it)); // respects the per-item toggle (single by default)
   const priceOf = (it: BazaarItem) => prices[it.s] ?? '';
   const numOf = (v: string) => Math.max(0, Math.floor(Number(String(v).replace(/[^0-9]/g, '')) || 0));
   const setAll = (v: string) => setPrices(() => { const m: Record<number, string> = {}; for (const it of items) m[it.s] = v; return m; });
-  const useMedians = () => setPrices(() => { const m: Record<number, string> = {}; for (const it of items) { const md = server ? getCachedValue(server, it.id)?.median : undefined; if (md && md > 0) m[it.s] = String(md); } return m; });
+  const useMedians = () => setPrices(() => { const m: Record<number, string> = {}; for (const it of items) { const md = medianOf(it); if (md && md > 0) m[it.s] = String(md); } return m; });
   const priced = items.map((it) => ({ it, price: numOf(priceOf(it)) })).filter((x) => x.price > 0);
 
   const run = () => {
@@ -63,7 +74,22 @@ export function BazaarPriceModal({ conn, items, server, iconSet, assets, onClose
               placeholder={single ? '0' : 'price each'}
               className="flex-1 min-w-0 bg-field border border-line rounded-md px-2.5 py-1.5 text-xs text-fg-2 placeholder-fg-4 outline-none focus:border-accent/50"
             />
-            {server && <button onClick={useMedians} className="le-tap shrink-0 px-2.5 py-1.5 text-[11px] font-semibold rounded-md border border-line bg-field text-accent hover:text-accent-hover transition-colors">AH median</button>}
+            {server && (single
+              ? (() => {
+                  const it0 = items[0]; const stackable = itemStack(it0.id) > 1; const stk = stackable && getMedianStack(it0.id); const md = medOf(it0, stk); return (
+                  <button
+                    onClick={() => {
+                      const next = stackable && !getMedianStack(it0.id);
+                      if (stackable) toggleMedianStack(it0.id);
+                      const val = medOf(it0, next) ?? md;
+                      if (val) setPrices((p) => ({ ...p, [it0.s]: String(val) }));
+                    }}
+                    disabled={!md} title={stackable ? 'Toggle stack/single median and fill' : 'Use the AH median'} className="le-tap shrink-0 px-2.5 py-1.5 text-[11px] font-semibold rounded-md border border-line bg-field text-accent enabled:hover:text-accent-hover disabled:opacity-50 tabular-nums transition-colors">
+                    {md ? `Median${stackable ? (stk ? ' · Stack' : ' · Each') : ''} · ${md.toLocaleString()}` : 'Median —'}
+                  </button>
+                ); })()
+              : <button onClick={useMedians} className="le-tap shrink-0 px-2.5 py-1.5 text-[11px] font-semibold rounded-md border border-line bg-field text-accent hover:text-accent-hover transition-colors">AH median</button>
+            )}
           </div>
           {single ? (
             <div className={rowCls}>
@@ -78,6 +104,17 @@ export function BazaarPriceModal({ conn, items, server, iconSet, assets, onClose
                   <div className="shrink-0 w-7 h-7 rounded bg-field grid place-items-center overflow-hidden"><IconInner id={it.id} size={28} name={it.n} assets={assets} bmpHas={iconSet.has(it.id)} /></div>
                   <span className="text-[12px] text-fg-2 truncate flex-1">{it.n}</span>
                   {it.c > 1 && <span className="text-[11px] text-fg-4 tabular-nums shrink-0">×{it.c}</span>}
+                  {(() => {
+                    const stackable = itemStack(it.id) > 1; const stk = stackable && getMedianStack(it.id); const md = medOf(it, stk); return md ? (
+                    <button
+                      onClick={() => {
+                        const next = stackable && !getMedianStack(it.id);
+                        if (stackable) toggleMedianStack(it.id);
+                        const val = medOf(it, next) ?? md;
+                        setPrices((p) => ({ ...p, [it.s]: String(val) }));
+                      }}
+                      title={stackable ? 'Toggle stack/single median and fill' : 'Use the AH median'} className="le-tap shrink-0 text-[10px] tabular-nums text-fg-4 hover:text-accent transition-colors">{stackable ? (stk ? 'stk ' : 'ea ') : 'med '}{md.toLocaleString()}</button>
+                  ) : null; })()}
                   <GilInput value={priceOf(it)} onChange={(d) => setPrices((p) => ({ ...p, [it.s]: d }))} placeholder="price" className={priceCls} />
                 </div>
               ))}

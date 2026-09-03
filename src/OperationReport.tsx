@@ -5,7 +5,7 @@ import { useAvailableIcons } from './bridge';
 
 export type ReportMove = { id: number; n: string; c: number; from: string; to: string; fromId: number; toId: number };
 export type ReportBlock = { name: string; assets?: string; moves: ReportMove[]; skipped: ReportMove[] };
-export type ReportData = { kind: 'organize' | 'consolidate'; blocks: ReportBlock[] };
+export type ReportData = { kind: 'organize' | 'consolidate' | 'pull' | 'store' | 'retrieve'; blocks: ReportBlock[] };
 
 // Tailwind -400 hex for each bag id, matching bagColors.ts so the report reads
 // with the same bag colors as the rest of Library.
@@ -16,9 +16,28 @@ export const BAG_HEX: Record<number, string> = {
 };
 const hex = (id: number) => BAG_HEX[id] ?? '#69776f';
 
+type DestItem = { id: number; n: string; c: number; froms: Map<string, number> };
+
+function ItemLine({ it, assets, iconSet }: { it: DestItem; assets?: string; iconSet: Set<number> }) {
+  return (
+    <>
+      <div className="shrink-0 w-6 h-6 rounded bg-field grid place-items-center overflow-hidden"><IconInner id={it.id} size={24} name={it.n} assets={assets} bmpHas={it.id > 0 && iconSet.has(it.id)} /></div>
+      <div className="min-w-0 flex-1">
+        <div className="text-[11px] text-fg-2 truncate">{it.n}</div>
+        <div className="text-[10px] text-fg-4 truncate">
+          from {[...it.froms.entries()].map(([n, id], i) => (
+            <span key={n}><span className="font-medium" style={{ color: hex(id) }}>{n}</span>{i < it.froms.size - 1 ? ', ' : ''}</span>
+          ))}
+        </div>
+      </div>
+      <span className="shrink-0 text-[10px] font-bold tabular-nums text-emerald-300">+{it.c}</span>
+    </>
+  );
+}
+
 function Grouped({ block, iconSet }: { block: ReportBlock; iconSet: Set<number> }) {
   const byDest = useMemo(() => {
-    const m = new Map<string, { toId: number; total: number; items: Map<string, { id: number; n: string; c: number; froms: Map<string, number> }> }>();
+    const m = new Map<string, { toId: number; total: number; items: Map<string, DestItem> }>();
     for (const mv of block.moves) {
       let g = m.get(mv.to);
       if (!g) { g = { toId: mv.toId, total: 0, items: new Map() }; m.set(mv.to, g); }
@@ -29,28 +48,41 @@ function Grouped({ block, iconSet }: { block: ReportBlock; iconSet: Set<number> 
     }
     return [...m.entries()].sort((a, b) => b[1].total - a[1].total);
   }, [block]);
+
+  const header = (dest: string, g: { toId: number; total: number }) => (
+    <div className="flex items-center gap-2 px-3 py-1.5 border-b border-line bg-surface-raised">
+      <span className="w-2 h-2 rounded-full shrink-0" style={{ background: hex(g.toId) }} />
+      <span className="text-[12px] font-bold truncate" style={{ color: hex(g.toId) }}>{dest}</span>
+      <span className="ml-auto text-[10px] tabular-nums text-fg-4">{g.total}</span>
+    </div>
+  );
+
+  // Single destination: flow its items across the full width instead of one skinny column.
+  if (byDest.length === 1) {
+    const [dest, g] = byDest[0];
+    return (
+      <div className="rounded-lg border border-line bg-surface overflow-hidden">
+        {header(dest, g)}
+        <div className="grid" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))' }}>
+          {[...g.items.values()].map((it) => (
+            <div key={it.n} className="flex items-center gap-2 px-3 py-1.5 border-t border-line">
+              <ItemLine it={it} assets={block.assets} iconSet={iconSet} />
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="grid gap-2.5" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))' }}>
       {byDest.map(([dest, g]) => (
         <div key={dest} className="rounded-lg border border-line bg-surface overflow-hidden">
-          <div className="flex items-center gap-2 px-3 py-1.5 border-b border-line bg-surface-raised">
-            <span className="w-2 h-2 rounded-full shrink-0" style={{ background: hex(g.toId) }} />
-            <span className="text-[12px] font-bold truncate" style={{ color: hex(g.toId) }}>{dest}</span>
-            <span className="ml-auto text-[10px] tabular-nums text-fg-4">{g.total}</span>
-          </div>
+          {header(dest, g)}
           <div>
             {[...g.items.values()].map((it) => (
               <div key={it.n} className="flex items-center gap-2 px-3 py-1.5 border-t border-line first:border-t-0">
-                <div className="shrink-0 w-6 h-6 rounded bg-field grid place-items-center overflow-hidden"><IconInner id={it.id} size={24} name={it.n} assets={block.assets} bmpHas={it.id > 0 && iconSet.has(it.id)} /></div>
-                <div className="min-w-0 flex-1">
-                  <div className="text-[11px] text-fg-2 truncate">{it.n}</div>
-                  <div className="text-[10px] text-fg-4 truncate">
-                    from {[...it.froms.entries()].map(([n, id], i) => (
-                      <span key={n}><span className="font-medium" style={{ color: hex(id) }}>{n}</span>{i < it.froms.size - 1 ? ', ' : ''}</span>
-                    ))}
-                  </div>
-                </div>
-                <span className="shrink-0 text-[10px] font-bold tabular-nums text-emerald-300">+{it.c}</span>
+                <ItemLine it={it} assets={block.assets} iconSet={iconSet} />
               </div>
             ))}
           </div>
@@ -66,7 +98,8 @@ export default function OperationReport({ report, onClose }: { report: ReportDat
   const totItems = report.blocks.reduce((s, b) => s + b.moves.reduce((n, m) => n + m.c, 0), 0);
   const totSkip = report.blocks.reduce((s, b) => s + b.skipped.length, 0);
   const multi = report.blocks.length > 1;
-  const title = report.kind === 'organize' ? 'Organize Complete' : 'Consolidate Complete';
+  const title = report.kind === 'organize' ? 'Organize Complete' : report.kind === 'pull' ? 'Pull Complete'
+    : report.kind === 'store' ? 'Stored to Slips' : report.kind === 'retrieve' ? 'Retrieved from Slips' : 'Consolidate Complete';
   return (
     <Modal onClose={onClose} panelClass="w-[720px] max-w-[94vw] max-h-[86vh]">{(close) => (
       <>

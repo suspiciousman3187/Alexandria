@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { useKnownCharacters, useAvailableIcons, useBzBuy, bzOpen, bzApply, bzClose, bzMySync, bzScan, bzDeepScan, bzScanStop, bzBuy, nextBzBuy, bzRange, bzWatch, type MyBazaarItem, type BazaarSeller, type BazaarListing, type BazaarScan } from './bridge';
 import { IconInner } from './atlasIcon';
-import { Group, Segmented, SectionTabs, CharacterSelect, GilInput, Stepper, SearchInput } from './ui';
+import { Group, Segmented, SectionTabs, CharacterSelect, GilInput, Stepper, SearchInput, Button } from './ui';
 import { Crossfade, Modal, Collapse } from './overlay';
 import { useItemHover } from './ItemTooltip';
 import { useCart, addToCart, setCartQty, removeFromCart, clearCart, getCart, cartKey, type CartEntry } from './bzCart';
@@ -10,7 +10,9 @@ import { useSticky, useStickyChar } from './sticky';
 import { useSettings } from './settings';
 import { OpCard } from './OpCard';
 import { useBzBlacklist, addBzBlacklist, removeBzBlacklist } from './bzBlacklist';
-import { itemNameMatches } from './itemNames';
+import { itemNameMatches, itemStack } from './itemNames';
+import { useItemValues, getCachedValue } from './priceStore';
+import { getMedianStack, toggleMedianStack, useMedianModeTick } from './medianMode';
 
 const SCAN_RANGE = 50;
 
@@ -41,11 +43,27 @@ function Check({ on, onClick }: { on: boolean; onClick: () => void }) {
   );
 }
 
-function MyBazaarPanel({ conn, items, assets, iconSet }: { conn: number; items: MyBazaarItem[]; assets?: string; iconSet: Set<number> }) {
+function MyBazaarPanel({ conn, items, server, assets, iconSet }: { conn: number; items: MyBazaarItem[]; server?: string; assets?: string; iconSet: Set<number> }) {
   const [prices, setPrices] = useState<Record<number, string>>({});
   const [sel, setSel] = useState<Set<number>>(new Set());
   const [bulkPrice, setBulkPrice] = useState('');
+  const [search, setSearch] = useSticky('bz.my.search', '');
   useEffect(() => { bzMySync(conn); }, [conn]);
+
+  // AH median per item, shown beside each price field so you can price competitively without leaving the
+  // tab. Bounded to your sellable stock (one bazaar's worth), so fetching them all is fine.
+  const values = useItemValues(server, items.map((it) => it.id));
+  const valuesStack = useItemValues(server, items.filter((it) => itemStack(it.id) > 1).map((it) => it.id), true);
+  useMedianModeTick(); // re-render this list when any per-item stack/single toggle lands
+  // Median for an item at the given stack mode (stack median is a real stacked-listing price, not single x N).
+  const medOf = (it: MyBazaarItem, stack: boolean) => (stack ? valuesStack : values).get(it.id)?.median ?? (server ? getCachedValue(server, it.id, stack)?.median : undefined);
+
+  // Filter the sellable inventory by item name (same fuzzy match the Browse tab uses). Selection and edited
+  // prices persist across filter changes; bulk Select acts on what's currently visible.
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return q ? items.filter((it) => itemNameMatches(it.id, it.n, q)) : items;
+  }, [items, search]);
 
   const setPrice = (slot: number, v: string) => setPrices((p) => ({ ...p, [slot]: v.replace(/[^0-9]/g, '') }));
   const priceOf = (it: MyBazaarItem) => (prices[it.slot] !== undefined ? prices[it.slot] : (it.listed ? String(it.price) : ''));
@@ -63,8 +81,8 @@ function MyBazaarPanel({ conn, items, assets, iconSet }: { conn: number; items: 
   };
 
   const toggle = (slot: number) => setSel((s) => { const n = new Set(s); if (n.has(slot)) n.delete(slot); else n.add(slot); return n; });
-  const allOn = items.length > 0 && sel.size === items.length;
-  const toggleAll = () => setSel(allOn ? new Set() : new Set(items.map((i) => i.slot)));
+  const allOn = filtered.length > 0 && filtered.every((i) => sel.has(i.slot));
+  const toggleAll = () => setSel((s) => { const n = new Set(s); if (allOn) filtered.forEach((i) => n.delete(i.slot)); else filtered.forEach((i) => n.add(i.slot)); return n; });
   const selSlots = items.filter((i) => sel.has(i.slot)).map((i) => i.slot);
 
   // Click+drag to paint a selection across rows (like the inventory grid). The first row sets the
@@ -105,6 +123,15 @@ function MyBazaarPanel({ conn, items, assets, iconSet }: { conn: number; items: 
         </div>
       </div>
       {items.length > 0 && (
+        <SearchInput
+          value={search}
+          onChange={setSearch}
+          wrap="mb-2"
+          placeholder="Filter your items"
+          className="w-full bg-field border border-line rounded-md px-2.5 py-1.5 text-xs text-fg-2 placeholder-fg-4 outline-none focus:border-accent/50"
+        />
+      )}
+      {items.length > 0 && (
         <div className="flex items-center gap-2 mb-2 px-3 py-2 rounded-lg bg-field border border-line">
           <Check on={allOn} onClick={toggleAll} />
           <span className="text-[11px] text-fg-3 w-16">{sel.size > 0 ? `${sel.size} picked` : 'Select'}</span>
@@ -121,9 +148,11 @@ function MyBazaarPanel({ conn, items, assets, iconSet }: { conn: number; items: 
       <div className="rounded-xl bg-surface border border-line divide-y divide-line">
         {items.length === 0 ? (
           <div className="text-[12px] text-fg-4 text-center py-8">No sellable items in your inventory.</div>
+        ) : filtered.length === 0 ? (
+          <div className="text-[12px] text-fg-4 text-center py-8">No items match your filter.</div>
         ) : (
           <AnimatePresence mode="popLayout" initial={false}>
-          {items.map((it) => (
+          {filtered.map((it) => (
             <motion.div
               key={it.slot}
               layout
@@ -138,14 +167,35 @@ function MyBazaarPanel({ conn, items, assets, iconSet }: { conn: number; items: 
             <div className="flex items-center gap-3 min-w-0 flex-1 cursor-pointer select-none" onPointerDown={(e) => { e.preventDefault(); startDrag(it.slot); }}>
               <Icon id={it.id} n={it.n} assets={assets} iconSet={iconSet} />
               <div className="min-w-0 flex-1">
+                {it.listed && <span className="block text-[9px] font-bold uppercase tracking-wide text-amber-300 leading-none mb-0.5">Listed</span>}
                 <div className="flex items-center gap-2">
                   <span className="text-[13px] font-semibold text-fg truncate">{it.n}</span>
                   {it.count > 1 && <span className="shrink-0 text-[10px] font-bold tabular-nums px-1.5 py-0.5 rounded bg-field text-fg-3">×{it.count}</span>}
-                  {it.listed && <span className="shrink-0 text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300">listed</span>}
                 </div>
               </div>
             </div>
             <div className="flex items-center gap-1.5 shrink-0">
+              {(() => {
+                const stackable = itemStack(it.id) > 1;
+                const stk = stackable && getMedianStack(it.id);
+                const md = medOf(it, stk);
+                if (md == null) return null;
+                return (
+                  <button
+                    onClick={() => {
+                      const next = stackable && !getMedianStack(it.id);
+                      if (stackable) toggleMedianStack(it.id);
+                      const val = medOf(it, next) ?? md;
+                      setPrice(it.slot, String(val));
+                    }}
+                    title={stackable ? 'Toggle stack/single median and fill the price' : 'Use the AH median'}
+                    className="le-tap shrink-0 flex flex-col items-end leading-tight hover:opacity-80 transition-opacity"
+                  >
+                    <span className="text-[9px] font-bold uppercase tracking-wide text-fg-4">Median{stackable ? (stk ? ' · Stack' : ' · Each') : ''}</span>
+                    <span className="text-[12.5px] font-semibold tabular-nums text-yellow-300">{md.toLocaleString()}</span>
+                  </button>
+                );
+              })()}
               <GilInput
                 value={priceOf(it)}
                 onChange={(d) => setPrice(it.slot, d)}
@@ -326,8 +376,8 @@ function CartModal({ conn, gil, assets, iconSet, onClose }: { conn: number; gil:
             <span className="text-[11px] text-fg-4 tabular-nums">{cart.length} listing{cart.length === 1 ? '' : 's'} · {units} item{units === 1 ? '' : 's'}</span>
             {cart.length > 0 && !running && (
               <div className="ml-auto flex items-center gap-2.5">
-                <button onClick={maxAll} disabled={!canMaxAll} className="text-[11px] font-semibold text-accent enabled:hover:text-accent-hover disabled:opacity-40 disabled:cursor-default transition-colors">Max All</button>
-                <button onClick={() => { clearCart(); setStatus({}); setFinished(false); }} className="text-[11px] font-semibold text-fg-4 hover:text-red-300 transition-colors">Clear</button>
+                <Button variant="ghost" size="xs" onClick={maxAll} disabled={!canMaxAll}>Max All</Button>
+                <Button variant="ghost" size="xs" onClick={() => { clearCart(); setStatus({}); setFinished(false); }}>Clear</Button>
               </div>
             )}
           </div>
@@ -647,6 +697,7 @@ export default function BazaarView() {
   const exp = useSettings().experimentalFeatures;
   const effTab = exp ? tab : 'my';
   const iconSet = useAvailableIcons();
+  const server = useSettings().ahServer || active?.server || online.find((k) => k.server)?.server;
 
   useEffect(() => {
     const c = active?.conn;
@@ -700,7 +751,7 @@ export default function BazaarView() {
       <div className="flex-1 min-h-0 overflow-y-auto p-4">
         {conn != null && (
           <Crossfade id={effTab}>{effTab === 'my'
-            ? <MyBazaarPanel conn={conn} items={active?.bzMy ?? []} assets={active?.assets} iconSet={iconSet} />
+            ? <MyBazaarPanel conn={conn} items={active?.bzMy ?? []} server={server} assets={active?.assets} iconSet={iconSet} />
             : <BrowsePanel conn={conn} sellers={active?.bzSellers ?? []} listings={active?.bzListings ?? {}} scan={active?.bzScan} mem={!!active?.bzMem} gil={active?.gil ?? 0} assets={active?.assets} iconSet={iconSet} />}</Crossfade>
         )}
       </div>

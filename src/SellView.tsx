@@ -2,14 +2,18 @@ import { useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { useKnownCharacters, useAvailableIcons } from './bridge';
 import { useShopSell, setShopSell } from './shop';
-import { useItemNames, itemNameMatches, itemStack, type ItemName } from './itemNames';
+import { useItemNames, itemNameMatches, type ItemName } from './itemNames';
 import { IconInner } from './atlasIcon';
 import { Popover } from './overlay';
 import { useSticky } from './sticky';
-import { Group, Row, Toggle, SearchInput } from './ui';
+import { Group, Row, Toggle, SearchInput, Button } from './ui';
 import { useSettings } from './settings';
-import { useItemValues } from './priceStore';
-import { openAhDetail } from './ahNav';
+import { exportSellList } from './sellListShare';
+import SellListImportModal from './SellListImportModal';
+
+// Max add-search suggestions shown at once. Generous so a full job-variant set (e.g. every "??? Ear.: <JOB>")
+// fits; the dropdown scrolls past this and shows a "keep typing" hint only when there are still more.
+const MAX_SUGGEST = 100;
 
 function SmallIcon({ id, n, assets, iconSet }: { id?: number; n: string; assets?: string; iconSet: Set<number> }) {
   return (
@@ -31,6 +35,7 @@ export default function SellView() {
   const [add, setAdd] = useState('');
   const addWrap = useRef<HTMLDivElement | null>(null);
   const [filter, setFilter] = useSticky('sell.filter', '');
+  const [importOpen, setImportOpen] = useState(false);
 
   const set = (items: string[], auto: boolean, anywhere: boolean = sell.anywhere) => setShopSell({ items, auto, anywhere });
   const has = (n: string) => sell.items.some((x) => x.toLowerCase() === n.toLowerCase());
@@ -44,9 +49,12 @@ export default function SellView() {
   const matches = useMemo(() => {
     const q = add.trim().toLowerCase();
     if (!q) return [];
+    // Collect up to MAX_SUGGEST+1 (the extra flags "there are more" for the footer). The old cap of 8 hid
+    // most of a multi-variant set -- e.g. "??? ear" has a job-specific piece per job, so only WAR/MNK/WHM
+    // showed. The dropdown already scrolls (max-h-64), so a high cap just lets you scroll the full set.
     const out: ItemName[] = [];
     for (const it of allItems) {
-      if (itemNameMatches(it.id, it.n, q) && !has(it.n)) { out.push(it); if (out.length >= 8) break; }
+      if (itemNameMatches(it.id, it.n, q) && !has(it.n)) { out.push(it); if (out.length > MAX_SUGGEST) break; }
     }
     return out;
   }, [add, allItems, sell.items]);
@@ -55,27 +63,6 @@ export default function SellView() {
     const q = filter.trim().toLowerCase();
     return q ? sell.items.filter((n) => n.toLowerCase().includes(q)) : sell.items;
   }, [sell.items, filter]);
-
-  const world = useSettings().ahServer || known.find((c) => c.online)?.server;
-  const held = useMemo(() => {
-    const m = new Map<number, { id: number; n: string; count: number }>();
-    for (const c of known) {
-      if (!c.online) continue;
-      for (const b of c.inv ?? []) for (const it of b.items) {
-        if (!it.id || ((it.f ?? 0) & 0x0A) || (it.aug && it.aug.length > 0)) continue;
-        const e = m.get(it.id);
-        if (e) e.count += it.c; else m.set(it.id, { id: it.id, n: it.n, count: it.c });
-      }
-    }
-    return [...m.values()];
-  }, [known]);
-  const heldIds = useMemo(() => held.map((h) => h.id), [held]);
-  const sellValues = useItemValues(world, heldIds);
-  const ranked = useMemo(() => held
-    .map((h) => { const v = sellValues.get(h.id); return { ...h, median: v?.median ?? 0, stock: v?.stock }; })
-    .filter((h) => h.median > 0)
-    .sort((a, b) => (b.median * b.count) - (a.median * a.count))
-    .slice(0, 25), [held, sellValues]);
 
   return (
     <div className="h-full flex flex-col">
@@ -97,24 +84,19 @@ export default function SellView() {
           </Row>
         </Group>
 
-        {ranked.length > 0 && (
-          <Group title="Worth Selling">
-            <div className="divide-y divide-line">
-              {ranked.map((h) => (
-                <button key={h.id} onClick={() => openAhDetail({ id: h.id, n: h.n, st: itemStack(h.id), back: 'selllist' })} className="le-tap w-full flex items-center gap-2.5 px-3 py-2 text-left hover:bg-field transition-colors">
-                  <SmallIcon id={h.id} n={h.n} assets={assetsAny} iconSet={iconSet} />
-                  <div className="min-w-0 flex-1">
-                    <div className="truncate text-[12px] text-fg-2">{h.n}{h.count > 1 ? ` ×${h.count}` : ''}</div>
-                    <div className="text-[10px] text-fg-4 tabular-nums">{h.median.toLocaleString()} G ea{h.stock != null ? ` · ${h.stock} listed` : ''}</div>
-                  </div>
-                  <span className="shrink-0 text-[13px] font-bold text-amber-300 tabular-nums">{(h.median * h.count).toLocaleString()}<span className="text-[9px] text-fg-4 ml-0.5">G</span></span>
-                </button>
-              ))}
-            </div>
-          </Group>
-        )}
-
-        <Group title="Sell List" right={<span className="text-[11px] text-fg-4 tabular-nums">{filter.trim() ? `${shown.length}/${sell.items.length}` : sell.items.length}</span>}>
+        <Group title="Sell List" right={
+          <span className="flex items-center gap-2">
+            <Button variant="secondary" size="sm" onClick={() => setImportOpen(true)}>
+              <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M5 21h14" /></svg>
+              Import
+            </Button>
+            <Button variant="secondary" size="sm" onClick={() => void exportSellList(sell.items)} disabled={sell.items.length === 0}>
+              <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><path d="M12 21V9" /><path d="m7 14 5-5 5 5" /><path d="M5 3h14" /></svg>
+              Export
+            </Button>
+            <span className="text-[11px] text-fg-4 tabular-nums">{filter.trim() ? `${shown.length}/${sell.items.length}` : sell.items.length}</span>
+          </span>
+        }>
           <div className="px-2.5 pt-2.5 pb-1.5 flex flex-col gap-2">
             <div ref={addWrap} className="relative">
               <div className="flex items-center gap-2">
@@ -128,13 +110,16 @@ export default function SellView() {
                 <button onClick={() => addItem(add)} disabled={!add.trim()} className="le-tap shrink-0 px-3 py-1.5 text-[12px] font-semibold rounded-md border border-line bg-surface text-fg-2 hover:text-fg disabled:opacity-40 transition-colors">Add</button>
               </div>
               <Popover open={matches.length > 0} anchor={addWrap} className="rounded-lg border border-line bg-popover divide-y divide-line overflow-hidden max-h-64 overflow-y-auto shadow-2xl">
-                {matches.map((it) => (
+                {matches.slice(0, MAX_SUGGEST).map((it) => (
                   <button key={it.id} onClick={() => addItem(it.n)} className="le-tap w-full flex items-center gap-2 px-3 py-1.5 text-left hover:bg-field transition-colors">
                     <SmallIcon id={it.id} n={it.n} assets={assetsAny} iconSet={iconSet} />
                     <span className="flex-1 min-w-0 truncate text-[12px] text-fg-2">{it.n}</span>
                     <span className="shrink-0 text-[11px] font-semibold text-accent">Add</span>
                   </button>
                 ))}
+                {matches.length > MAX_SUGGEST && (
+                  <div className="px-3 py-2 text-center text-[11px] text-fg-4">Keep typing to narrow the list.</div>
+                )}
               </Popover>
             </div>
             {sell.items.length > 0 && (
@@ -175,6 +160,7 @@ export default function SellView() {
           )}
         </Group>
       </div>
+      {importOpen && <SellListImportModal onClose={() => setImportOpen(false)} />}
     </div>
   );
 }

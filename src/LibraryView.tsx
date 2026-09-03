@@ -11,9 +11,10 @@ import { useWatchStore, addWatchItem, removeWatchItem } from './watch';
 import { useShopSell, setShopSell } from './shop';
 import { usePoolStore, setCharRules, emptyRules } from './poolRules';
 import { useSettings } from './settings';
+import { uiZoom, logicalRect, logicalViewport } from './uiZoom';
 import { IconInner } from './atlasIcon';
 import { Modal, Collapse } from './overlay';
-import { CharacterSelect, Select, Stepper, SearchInput } from './ui';
+import { CharacterSelect, Select, Stepper, SearchInput, Button } from './ui';
 import { useStickyChar, useSticky, useStickyPersisted } from './sticky';
 import { bagColor } from './bagColors';
 import { ALWAYS_BAGS, MOG_ONLY_BAGS, TEMPORARY_BAG } from './bagConstants';
@@ -24,6 +25,9 @@ import { useStoragePrefs, setCharLayout, layoutFor, STORABLE_BAGS } from './stor
 import { resolveLayout, useTagRules } from './tagRules';
 import { useItemTags, bulkSetTag } from './itemTags';
 import { useTagFilter, TagFilterSelect } from './tagFilter';
+import { useJobFilter, JobFilterSelect } from './jobFilter';
+import PullButton from './PullMenu';
+import { usePorterGear } from './porterGear';
 import { BAG_ORDER, bagName, bagIdByName } from './bagNames';
 import { useOrganize } from './useOrganize';
 import { openDistribute } from './distributeHost';
@@ -92,7 +96,7 @@ const parseKey = (k: string) => { const i = k.indexOf('|'); const [b, s] = k.sli
 const WARDROBES = new Set([8, 10, 11, 12, 13, 14, 15, 16]);
 const isEquippable = (id: number) => itemCategory(id) !== 'other';
 // Shared item filter predicate so the grid and Select All narrow identically.
-const passesFilt = (it: InvItem, filt: Filt, catMatch?: Set<number> | null, medianOf?: Map<number, number>, tagMatches?: ((id: number) => boolean) | null) => {
+const passesFilt = (it: InvItem, filt: Filt, catMatch?: Set<number> | null, medianOf?: Map<number, number>, tagMatches?: ((id: number) => boolean) | null, jobMatches?: ((id: number) => boolean) | null) => {
   const f = it.f ?? 0;
   if (filt.rare && !(f & 0x01)) return false;
   if (filt.ex && !(f & 0x02)) return false;
@@ -102,6 +106,7 @@ const passesFilt = (it: InvItem, filt: Filt, catMatch?: Set<number> | null, medi
   if (filt.worth && (medianOf?.get(it.id) ?? 0) < filt.minWorth) return false;
   if (catMatch && !catMatch.has(it.id)) return false;
   if (tagMatches && !tagMatches(it.id)) return false;
+  if (jobMatches && !jobMatches(it.id)) return false;
   return true;
 };
 const bagOf = (ch: KnownChar | undefined, bagId: number) => ch?.inv?.find((b) => b.id === bagId);
@@ -131,14 +136,18 @@ function LibraryTip({ assets, iconSet, server }: { assets?: string; iconSet: Set
   const desc = useItemDescription(st?.meta.id ?? 0);
   const ahCat = useAhCatalog();
   if (!st) return null;
-  const { meta, rect } = st;
+  const { meta } = st;
   const W = 256;
+  // Position in the tooltip's own (zoom-adjusted) coordinate space so a uiScale > 1 never throws it off-screen;
+  // see uiZoom.ts. No-op at 100%.
+  const rect = logicalRect(st.rect);
+  const vp = logicalViewport();
   let left = rect.left - 4;
-  if (left + W > window.innerWidth) left = window.innerWidth - W - 6;
+  if (left + W > vp.w) left = vp.w - W - 6;
   if (left < 6) left = 6;
-  const below = rect.bottom + 240 < window.innerHeight;
+  const below = rect.bottom + 240 < vp.h;
   const top = below ? rect.bottom + 6 : Math.max(6, rect.top - 6);
-  const maxH = Math.max(200, below ? window.innerHeight - top - 8 : rect.top - 12);
+  const maxH = Math.max(200, below ? vp.h - top - 8 : rect.top - 12);
   const badges = flagBadges(meta.f);
   const ahItem = ahCat.items.find((i) => i.id === meta.id);
   const gear = ahItem && (ahItem.lvl > 0 || (ahItem.j && ahItem.j.length > 0));
@@ -213,7 +222,7 @@ function Tile({ item, dataKey, tile, assets, iconSet, selected, dim, hit, homeCl
       onContextMenu={(e) => { clearTip(); onContext(e, item); }}
       onMouseEnter={(e) => setTip({ id: item.id, n: item.n, c: item.c, f: item.f, aug: item.aug, bz: item.bz, fleet }, e.currentTarget.getBoundingClientRect())}
       onMouseLeave={clearTip}
-      style={{ width: tile, height: tile }}
+      style={{ width: tile, height: tile, contentVisibility: 'auto', containIntrinsicSize: `${tile}px ${tile}px` }}
       className={`relative rounded-md bg-field grid place-items-center overflow-hidden cursor-grab select-none touch-none transition-all ${transit ? 'animate-pulse' : flash ? 'lib-flash-glow' : ''} ${transit ? 'opacity-50 ring-1 ring-accent/50 z-[1]' : dim ? 'opacity-20' : selected ? 'ring-2 ring-accent z-[1]' : hit ? 'ring-2 ring-amber-300 z-[1]' : misplaced ? 'ring-1 ring-orange-400/70' : 'hover:ring-1 hover:ring-line-2'}`}
     >
       {homeCls && <span title="Has an assigned preset bag" className={`absolute inset-x-0 bottom-0 h-[3px] z-[1] ${homeCls}`} />}
@@ -230,9 +239,9 @@ function Tile({ item, dataKey, tile, assets, iconSet, selected, dim, hit, homeCl
 
 const EMPTY_HOME: Map<string, number[]> = new Map();
 
-const BagCard = memo(function BagCard({ charName, bag, name, items, max, used, reach, isDrop, receiving, sel, query, homeBags, misplacedOnly, filt, catMatch, tagMatches, medianOf, pending, tile, tileCols, assets, iconSet, fleetTotals, onDown, onContext, onDouble }: {
+const BagCard = memo(function BagCard({ charName, bag, name, items, max, used, reach, isDrop, receiving, sel, query, homeBags, misplacedOnly, filt, catMatch, tagMatches, jobMatches, medianOf, pending, tile, tileCols, assets, iconSet, fleetTotals, onDown, onContext, onDouble }: {
   charName: string; bag: number; name: string; items: InvItem[]; max: number; used: number; reach: boolean; isDrop: boolean; receiving?: boolean; sel: Set<string>; query: string; homeBags: Map<string, number[]>; misplacedOnly: boolean;
-  filt: Filt; catMatch?: Set<number> | null; tagMatches?: ((id: number) => boolean) | null; medianOf?: Map<number, number>; pending?: Set<string>; tile: number; tileCols?: number;
+  filt: Filt; catMatch?: Set<number> | null; tagMatches?: ((id: number) => boolean) | null; jobMatches?: ((id: number) => boolean) | null; medianOf?: Map<number, number>; pending?: Set<string>; tile: number; tileCols?: number;
   assets?: string; iconSet: Set<number>; fleetTotals?: Map<number, number>;
   onDown: (e: React.PointerEvent, item: InvItem, from: number, charName: string) => void;
   onContext: (e: React.MouseEvent, item: InvItem, from: number, charName: string) => void;
@@ -241,10 +250,10 @@ const BagCard = memo(function BagCard({ charName, bag, name, items, max, used, r
   const c = bagColor(bag);
   const now = Date.now();
   const homeOf = (n: string) => homeBags.get(n.toLowerCase());
-  const anyFilter = filt.rare || filt.ex || filt.aug || filt.equip || filt.sellable || filt.worth || filt.cat || !!tagMatches;
+  const anyFilter = filt.rare || filt.ex || filt.aug || filt.equip || filt.sellable || filt.worth || filt.cat || !!tagMatches || !!jobMatches;
   // When searching, render ONLY the matching tiles (do not render every tile and
   // dim non-matches) so a 5000-item fleet stays responsive per keystroke.
-  const passed = (misplacedOnly ? items.filter((it) => { const h = homeOf(it.n); return h && h.length && !h.includes(bag); }) : items).filter((it) => passesFilt(it, filt, catMatch, medianOf, tagMatches));
+  const passed = (misplacedOnly ? items.filter((it) => { const h = homeOf(it.n); return h && h.length && !h.includes(bag); }) : items).filter((it) => passesFilt(it, filt, catMatch, medianOf, tagMatches, jobMatches));
   const shown = query ? passed.filter((it) => itemNameMatches(it.id, it.n, query)) : passed;
   const pct = max ? Math.min(100, (used / max) * 100) : 0;
   const full = !!max && used / max >= 0.95;
@@ -279,15 +288,10 @@ const BagCard = memo(function BagCard({ charName, bag, name, items, max, used, r
 // it is a stable component type; an inline definition remounts every button on each
 // render and drops clicks that straddle a re-render (the Library re-renders often as
 // inventory streams in).
-const BTN_BASE = 'le-tap shrink-0 inline-flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-semibold rounded-md border transition-colors disabled:opacity-40 disabled:cursor-not-allowed';
-const BTN_V = {
-  default: 'border-line bg-field text-fg-3 hover:text-fg hover:border-line-2',
-  on:      'border-accent bg-accent/15 text-accent',
-  primary: 'border-transparent bg-accent text-on-accent hover:bg-accent-hover',
-  danger:  'border-line bg-field text-fg-4 hover:text-red-300 hover:border-red-500/40',
-} as const;
-function Btn({ on, v = 'default', onClick, title, disabled, children }: { on?: boolean; v?: keyof typeof BTN_V; onClick: () => void; title?: string; disabled?: boolean; children: React.ReactNode }) {
-  return <button title={title} onClick={onClick} disabled={disabled} className={`${BTN_BASE} ${BTN_V[on ? 'on' : v]}`}>{children}</button>;
+// Thin toggle-aware wrapper over the canonical <Button>: `on` renders the active (accent) look; `v`
+// picks the base variant. Kept local only so call sites stay terse (<Btn on v="primary">).
+function Btn({ on, v = 'default', onClick, title, disabled, children }: { on?: boolean; v?: 'default' | 'primary' | 'danger'; onClick: () => void; title?: string; disabled?: boolean; children: React.ReactNode }) {
+  return <Button variant={v === 'default' ? 'secondary' : v} active={on} size="sm" className="shrink-0" onClick={onClick} title={title} disabled={disabled}>{children}</Button>;
 }
 
 export default function LibraryView() {
@@ -299,6 +303,8 @@ export default function LibraryView() {
   const tf = useTagFilter('library.tagfilter');
   const sortOpts = useMemo(() => [...SORTS, ...tagSorts(tf.tags)], [tf.tags]);
   const tagMatches = tf.matches;
+  const jf = useJobFilter('library.jobfilter');
+  const jobMatches = jf.matches;
   const drop = useDrop();
   const wishlist = useWishlist();
   const watch = useWatchStore();
@@ -345,18 +351,22 @@ export default function LibraryView() {
     const el = menuRef.current;
     if (!el) return;
     const m = 8;
+    // menu.x/y are visual (zoomed) cursor px; offsetWidth/Height are local. Map the cursor + viewport into the
+    // menu's own local space so a uiScale > 1 never throws it off-screen; see uiZoom.ts. No-op at 100%.
+    const z = uiZoom();
+    const vp = logicalViewport();
     const w = el.offsetWidth || 240, h = el.offsetHeight || 0;
     setMenuPos({
-      left: Math.max(m, Math.min(menu.x, window.innerWidth - w - m)),
-      top: Math.max(m, Math.min(menu.y, window.innerHeight - h - m)),
+      left: Math.max(m, Math.min(menu.x / z, vp.w - w - m)),
+      top: Math.max(m, Math.min(menu.y / z, vp.h - h - m)),
     });
   }, [menu]);
   const [confirm, setConfirm] = useState<{ kind: 'drop' | 'sell' | 'dropall'; items: Drag[]; count: number } | null>(null);
   const [consoOpen, setConsoOpen] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
+  const [porterOpen, setPorterOpen] = useState(false);
   const [consoTargets, setConsoTargets] = useSticky<number[]>('library.consoTargets', DEFAULT_LOCAL_TARGETS);
   const [consoRun, setConsoRun] = useState<{ chars: string[]; initial: Record<string, number>; startedAt: number } | null>(null);
-  const [suggest, setSuggest] = useState<{ char: string; rows: { id: number; n: string; to: number }[] } | null>(null);
   const [sellDrawer, setSellDrawer] = useState<{ char: KnownChar; items: SelItem[] } | null>(null);
   const [bazaar, setBazaar] = useState<{ conn: number; items: BazaarItem[] } | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -399,6 +409,7 @@ export default function LibraryView() {
   const single = useMemo(() => (isAll ? undefined : (known.find((k) => k.name === pick) ?? online[0] ?? known[0])), [isAll, known, online, pick]);
   const viewChars = useMemo(() => (isAll ? online : (single ? [single] : [])), [isAll, online, single]);
   const org = useOrganize(viewChars, { grouped: isAll });
+  const porterGear = usePorterGear(single); // Store / Retrieve current-job gear from the Porter slips
   useEffect(() => { if (!isAll && single && single.name !== pick) setPick(single.name); }, [isAll, single, pick, setPick]);
 
   const charByName = (n: string) => known.find((k) => k.name === n);
@@ -426,7 +437,7 @@ export default function LibraryView() {
   }, [isAll, viewChars]);
 
   const filt: Filt = useMemo(() => ({ rare: hasF('rare'), ex: hasF('ex'), aug: hasF('aug'), equip: hasF('equip'), sellable: hasF('sellable'), worth: minWorth > 0 && !!settings.ahServer, cat: catTop !== 'all', minWorth }), [filters, minWorth, settings.ahServer, catTop]);
-  const anyFilter = filters.length > 0 || minWorth > 0 || catTop !== 'all' || tf.active;
+  const anyFilter = filters.length > 0 || minWorth > 0 || catTop !== 'all' || tf.active || jf.active;
 
   // AH-category filter: match items whose bundled auction-house category (via
   // useAcMap) falls under the chosen top group, optionally narrowed to one sub.
@@ -481,7 +492,7 @@ export default function LibraryView() {
       for (const b of ch.inv ?? []) {
         for (const it of b.items) {
           if (dQuery && !itemNameMatches(it.id, it.n, dQuery)) continue;
-          if (!passesFilt(it, filt, catMatch, medianOf, tagMatches)) continue;
+          if (!passesFilt(it, filt, catMatch, medianOf, tagMatches, jobMatches)) continue;
           if (homes) { const h = homes.get(it.n.toLowerCase()); if (!(h && h.length && !h.includes(b.id))) continue; }
           bagSet.add(b.id); count++;
         }
@@ -489,7 +500,7 @@ export default function LibraryView() {
       if (count) m.set(ch.name, { bags: bagSet, count });
     }
     return m;
-  }, [dQuery, anyFilter, misplacedOnly, viewChars, filt, catMatch, medianOf, homeBagMaps, tagMatches]);
+  }, [dQuery, anyFilter, misplacedOnly, viewChars, filt, catMatch, medianOf, homeBagMaps, tagMatches, jobMatches]);
   // The characters left to show once the visibility map has dropped the empty ones.
   const shownChars = useMemo(() => (searchMap ? viewChars.filter((ch) => searchMap.has(ch.name)) : viewChars), [searchMap, viewChars]);
 
@@ -890,34 +901,6 @@ export default function LibraryView() {
     if (drop.skipDropConfirm) execDrop(items); else setConfirm({ kind: 'drop', items, count: 0 });
   };
 
-  const openSuggest = () => {
-    const ch = single; if (!ch) return;
-    const homes = homeBagMaps.get(ch.name) ?? new Map<string, number[]>();
-    const byName = new Map<string, { id: number; n: string; bags: Map<number, number> }>();
-    for (const b of ch.inv ?? []) {
-      if (!STORABLE_SET.has(b.id)) continue;
-      for (const it of b.items) {
-        if (homes.has(it.n.toLowerCase())) continue;
-        let e = byName.get(it.n.toLowerCase());
-        if (!e) { e = { id: it.id, n: it.n, bags: new Map() }; byName.set(it.n.toLowerCase(), e); }
-        e.bags.set(b.id, (e.bags.get(b.id) ?? 0) + it.c);
-      }
-    }
-    const rows: { id: number; n: string; to: number }[] = [];
-    byName.forEach((e) => {
-      let best = -1, bestN = -1;
-      e.bags.forEach((n, bag) => { if (n > bestN) { bestN = n; best = bag; } });
-      if (best >= 0) rows.push({ id: e.id, n: e.n, to: best });
-    });
-    rows.sort((a, b) => a.to - b.to || a.n.localeCompare(b.n));
-    setSuggest({ char: ch.name, rows });
-  };
-  const applySuggest = () => {
-    if (!suggest) return;
-    const kept = layoutFor(suggest.char).filter((e) => !suggest.rows.some((r) => r.n.toLowerCase() === e.item.toLowerCase()));
-    setCharLayout(suggest.char, [...kept, ...suggest.rows.map((r) => ({ item: r.n, bags: [r.to] }))]);
-    setSuggest(null);
-  };
 
   // Select All honors the active filters, category, misplaced-only, and search,
   // so "filter to a category, then select all and send" works as expected.
@@ -928,7 +911,7 @@ export default function LibraryView() {
       for (const b of ch.inv ?? []) {
         if (!reachable(b.id, ch, experimental)) continue;
         for (const it of b.items) {
-          if (!passesFilt(it, filt, catMatch, medianOf, tagMatches)) continue;
+          if (!passesFilt(it, filt, catMatch, medianOf, tagMatches, jobMatches)) continue;
           if (homes) { const h = homes.get(it.n.toLowerCase()); if (!(h && h.length && !h.includes(b.id))) continue; }
           if (query && !itemNameMatches(it.id, it.n, query)) continue;
           all.add(keyOf(ch.name, b.id, it.s));
@@ -1075,11 +1058,11 @@ export default function LibraryView() {
       if (e.key === 'Delete' && sel.size > 0) { e.preventDefault(); dropSelected(); return; }
       // The Modal primitive owns Escape for the dialogs (animated close); bail so we
       // don't race it or clear the selection underneath an open dialog.
-      if (e.key === 'Escape') { if (org.previewOpen || org.reportOpen || consoOpen || suggest || confirm || split) return; if (moreOpen) setMoreOpen(false); else if (menu) setMenu(null); else setSel(new Set()); }
+      if (e.key === 'Escape') { if (org.previewOpen || org.reportOpen || consoOpen || confirm || split) return; if (moreOpen) setMoreOpen(false); else if (menu) setMenu(null); else setSel(new Set()); }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [sel, viewChars, menu, org.previewOpen, org.reportOpen, consoOpen, suggest, confirm, split, moreOpen, hist, drop.skipDropConfirm]);
+  }, [sel, viewChars, menu, org.previewOpen, org.reportOpen, consoOpen, confirm, split, moreOpen, hist, drop.skipDropConfirm]);
 
   const pickChars = useMemo(() => {
     const list = [...known].sort((a, b) => (a.online === b.online ? a.name.localeCompare(b.name) : a.online ? -1 : 1)).map((k) => ({ name: k.name, online: k.online }));
@@ -1147,6 +1130,7 @@ export default function LibraryView() {
         ))}
         <div className="w-32 shrink-0" title="Filter by auction-house category"><Select full value={catTop} onChange={(v) => { setCatTop(v); setCatSub(0); }} options={['all', ...AH_CATEGORY_TREE.map((g) => g.top)]} renderValue={(v) => (v === 'all' ? 'AH Category' : v)} renderOption={(v) => (v === 'all' ? 'All AH Categories' : v)} /></div>
         {tf.tags.length > 0 && <div className="w-28 shrink-0" title="Filter by tag"><TagFilterSelect value={tf.value} onChange={tf.setValue} tags={tf.tags} /></div>}
+        <div className="w-24 shrink-0" title="Filter by job"><JobFilterSelect value={jf.value} onChange={jf.setValue} /></div>
         {catGroup && catGroup.subs.length > 1 && <div className="w-36 shrink-0"><Select full value={String(catSub)} onChange={(v) => setCatSub(Number(v))} options={['0', ...catGroup.subs.map((s) => String(s.id))]} renderValue={(v) => (v === '0' ? 'All' : (catGroup.subs.find((s) => String(s.id) === v)?.label ?? v))} renderOption={(v) => (v === '0' ? `All ${catTop}` : (catGroup.subs.find((s) => String(s.id) === v)?.label ?? v))} /></div>}
         <div className={`shrink-0 inline-flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-semibold rounded-md border transition-colors ${minWorth > 0 ? 'border-accent bg-accent/15' : 'border-line bg-field hover:border-line-2 focus-within:border-accent/50'}`}>
           <span className={minWorth > 0 ? 'text-accent' : 'text-fg-4'}>Worth &gt;</span>
@@ -1154,12 +1138,12 @@ export default function LibraryView() {
           <span className={minWorth > 0 ? 'text-accent/70' : 'text-fg-4'}>g</span>
         </div>
         {hasHomes && <Btn on={misplacedOnly} onClick={() => setMisplacedOnly(!misplacedOnly)} title="Show only items not in their assigned preset bag">Misplaced</Btn>}
-        {anyFilter && <Btn v="danger" onClick={() => { setFilters([]); setMinWorth(0); setCatTop('all'); setCatSub(0); tf.setValue('all'); }} title="Clear all filters">Clear</Btn>}
+        {anyFilter && <Btn v="danger" onClick={() => { setFilters([]); setMinWorth(0); setCatTop('all'); setCatSub(0); tf.setValue('all'); jf.setValue('all'); }} title="Clear all filters">Clear</Btn>}
         {!settings.ahServer && minWorth > 0 && <span className="shrink-0 text-[10px] text-amber-300 ml-0.5">needs an AH server</span>}
         {catTop !== 'all' && acMap.size === 0 && <span className="shrink-0 text-[10px] text-amber-300 ml-0.5">category data not loaded</span>}
         <div className="flex items-center gap-1.5 flex-wrap basis-full justify-start sm:basis-auto sm:ml-auto sm:justify-end">
         {busy && <span className="shrink-0 text-[11px] font-semibold text-accent mr-0.5">{busy}</span>}
-        {(hist.length > 0 || (!isAll && single) || (org.lastReport && !org.reportOpen)) && (
+        {(hist.length > 0 || (org.lastReport && !org.reportOpen)) && (
           <div className="relative shrink-0">
             <Btn on={moreOpen} onClick={() => setMoreOpen((o) => !o)} title="More actions"><svg viewBox="0 0 24 24" className="w-4 h-4" fill="currentColor"><circle cx="5" cy="12" r="1.7" /><circle cx="12" cy="12" r="1.7" /><circle cx="19" cy="12" r="1.7" /></svg></Btn>
             {moreOpen && (
@@ -1167,8 +1151,31 @@ export default function LibraryView() {
                 <div className="fixed inset-0 z-[70]" onPointerDown={() => setMoreOpen(false)} />
                 <motion.div className="absolute right-0 top-full mt-1 z-[71] min-w-[186px] rounded-md border border-line bg-surface-raised shadow-xl py-1 overflow-hidden" style={{ transformOrigin: 'top right' }} initial={{ opacity: 0, scale: 0.97, y: -4 }} animate={{ opacity: 1, scale: 1, y: 0 }} transition={{ duration: 0.14, ease: [0.22, 1, 0.36, 1] }}>
                   {hist.length > 0 && <button className={moreItem} onClick={() => { undo(); setMoreOpen(false); }}><svg viewBox="0 0 24 24" className="w-3.5 h-3.5 shrink-0 text-fg-4" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><path d="M9 14 4 9l5-5" /><path d="M4 9h11a5 5 0 0 1 0 10h-1" /></svg>Undo Last Move{hist.length > 1 ? ` (${hist.length})` : ''}</button>}
-                  {!isAll && single && <button className={moreItem} onClick={() => { openSuggest(); setMoreOpen(false); }}><svg viewBox="0 0 24 24" className="w-3.5 h-3.5 shrink-0 text-fg-4" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><path d="M6 3h12a1 1 0 0 1 1 1v16l-7-4-7 4V4a1 1 0 0 1 1-1Z" /></svg>Suggest Presets</button>}
-                  {org.lastReport && !org.reportOpen && <button className={moreItem} onClick={() => { org.showLastReport(); setMoreOpen(false); }}><svg viewBox="0 0 24 24" className="w-3.5 h-3.5 shrink-0 text-fg-4" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><path d="M4 5h16" /><path d="M4 12h10" /><path d="M4 19h7" /><path d="m16 16 2.5 2.5L22 14" /></svg>Last Report</button>}
+                  {org.lastReport && !org.reportOpen &&<button className={moreItem} onClick={() => { org.showLastReport(); setMoreOpen(false); }}><svg viewBox="0 0 24 24" className="w-3.5 h-3.5 shrink-0 text-fg-4" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><path d="M4 5h16" /><path d="M4 12h10" /><path d="M4 19h7" /><path d="m16 16 2.5 2.5L22 14" /></svg>Last Report</button>}
+                </motion.div>
+              </>
+            )}
+          </div>
+        )}
+        {!isAll && <PullButton char={single} conn={single?.conn ?? undefined} compact />}
+        {!isAll && (porterGear.storeIds.length > 0 || porterGear.retrieveIds.length > 0) && (
+          <div className="relative shrink-0">
+            <Btn on={porterOpen} onClick={() => setPorterOpen((o) => !o)} title={`Store or retrieve ${porterGear.job ?? 'this job'}'s gear from your Porter slips`}>
+              <span className="inline-flex items-center gap-1">Porter<svg viewBox="0 0 24 24" className={`w-3 h-3 -mr-0.5 transition-transform ${porterOpen ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" strokeWidth={2.4} strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6" /></svg></span>
+            </Btn>
+            {porterOpen && (
+              <>
+                <div className="fixed inset-0 z-[70]" onPointerDown={() => setPorterOpen(false)} />
+                <motion.div className="absolute right-0 top-full mt-1 z-[71] min-w-[190px] rounded-md border border-line bg-surface-raised shadow-xl py-1 overflow-hidden" style={{ transformOrigin: 'top right' }} initial={{ opacity: 0, scale: 0.97, y: -4 }} animate={{ opacity: 1, scale: 1, y: 0 }} transition={{ duration: 0.14, ease: [0.22, 1, 0.36, 1] }}>
+                  <button className={`${moreItem} disabled:opacity-40`} disabled={!porterGear.near || porterGear.running || porterGear.retrieveIds.length === 0} onClick={() => { porterGear.openRetrieve(); setPorterOpen(false); }}>
+                    <svg viewBox="0 0 24 24" className="w-3.5 h-3.5 shrink-0 text-fg-4" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M5 21h14" /></svg>
+                    Retrieve<span className="ml-auto tabular-nums text-fg-4">{porterGear.retrieveIds.length}</span>
+                  </button>
+                  <button className={`${moreItem} disabled:opacity-40`} disabled={!porterGear.near || porterGear.running || porterGear.storeIds.length === 0} onClick={() => { porterGear.openStore(); setPorterOpen(false); }}>
+                    <svg viewBox="0 0 24 24" className="w-3.5 h-3.5 shrink-0 text-fg-4" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><path d="M21 8v13H3V8" /><path d="M1 3h22v5H1z" /><path d="M10 12h4" /></svg>
+                    Store<span className="ml-auto tabular-nums text-fg-4">{porterGear.storeIds.length}</span>
+                  </button>
+                  {!porterGear.near && <div className="px-3 py-1 text-[10px] text-amber-300">Stand next to the Porter Moogle</div>}
                 </motion.div>
               </>
             )}
@@ -1261,6 +1268,7 @@ export default function LibraryView() {
                       filt={filt}
                       catMatch={catMatch}
                       tagMatches={tagMatches}
+                      jobMatches={jobMatches}
                       medianOf={medianOf}
                       pending={pending}
                       tile={tile}
@@ -1360,7 +1368,7 @@ export default function LibraryView() {
       {menu && createPortal(
         <>
           <div className="fixed inset-0 z-[9990]" onPointerDown={() => setMenu(null)} onContextMenu={(e) => { e.preventDefault(); setMenu(null); }} />
-          <motion.div ref={menuRef} className="fixed z-[9991] w-60 rounded-lg border border-line-2 bg-popover shadow-2xl py-1.5 max-h-[92vh] overflow-y-auto" style={{ left: menuPos?.left ?? Math.min(menu.x, window.innerWidth - 252), top: menuPos?.top ?? Math.max(8, menu.y), transformOrigin: 'top left' }} initial={{ opacity: 0, scale: 0.96, y: -4 }} animate={{ opacity: 1, scale: 1, y: 0 }} transition={{ duration: 0.14, ease: [0.22, 1, 0.36, 1] }}>
+          <motion.div ref={menuRef} className="fixed z-[9991] w-60 rounded-lg border border-line-2 bg-popover shadow-2xl py-1.5 max-h-[92vh] overflow-y-auto" style={{ left: menuPos?.left ?? Math.min(menu.x / uiZoom(), logicalViewport().w - 252), top: menuPos?.top ?? Math.max(8, menu.y / uiZoom()), transformOrigin: 'top left' }} initial={{ opacity: 0, scale: 0.96, y: -4 }} animate={{ opacity: 1, scale: 1, y: 0 }} transition={{ duration: 0.14, ease: [0.22, 1, 0.36, 1] }}>
             <div className="px-3 py-1 text-[11px] font-bold text-fg truncate">{menuOne ? menuOne.n : `${menu.items.length} items`}<span className="text-fg-4 font-normal"> · {menuChar}</span></div>
             <div className="px-3 pt-1.5 pb-1 text-[9px] font-bold uppercase tracking-wide text-fg-4">Move to</div>
             <div className="px-2 pb-1.5 flex flex-wrap gap-1">
@@ -1482,30 +1490,6 @@ export default function LibraryView() {
         </>
       )}</Modal>}
 
-      {suggest && <Modal onClose={() => setSuggest(null)} panelClass="w-[520px] max-h-[80vh]">{(close) => (
-        <>
-            <div className="px-4 py-3 border-b border-line">
-              <div className="text-[13px] font-bold text-fg">Suggested Presets<span className="text-fg-4 font-normal"> · {suggest.char}</span></div>
-              <div className="text-[11px] text-fg-3 mt-0.5">{suggest.rows.length ? `Presets proposed for ${suggest.rows.length} item${suggest.rows.length === 1 ? '' : 's'} without one, based on where each already lives.` : 'Every stored item already has a preset.'}</div>
-            </div>
-            <div className="flex-1 overflow-y-auto p-2">
-              {suggest.rows.length === 0
-                ? <div className="text-[12px] text-fg-4 p-4 text-center">Nothing to suggest.</div>
-                : suggest.rows.map((r) => (
-                  <div key={r.id} className="flex items-center gap-2 px-2 py-1 rounded hover:bg-field">
-                    <div className="shrink-0 w-6 h-6 rounded bg-field grid place-items-center overflow-hidden"><IconInner id={r.id} size={24} name={r.n} assets={tipAssets} bmpHas={r.id > 0 && iconSet.has(r.id)} /></div>
-                    <span className="text-[11px] text-fg-2 truncate flex-1">{r.n}</span>
-                    <span className="text-[10px] tabular-nums text-fg-4 shrink-0 flex items-center gap-1">preset <span className="text-accent">→</span> <span className={bagColor(r.to).text}>{bagName(r.to).replace('Mog ', '')}</span></span>
-                  </div>
-                ))}
-            </div>
-            <div className="px-4 py-3 border-t border-line flex gap-2">
-              <button onClick={close} className="flex-1 py-1.5 text-[12px] font-semibold rounded-md border border-line text-fg-3 hover:text-fg transition-colors">Cancel</button>
-              <button onClick={applySuggest} disabled={!suggest.rows.length} className="flex-1 py-1.5 text-[12px] font-bold rounded-md bg-accent text-on-accent hover:bg-accent-hover disabled:opacity-40 transition-colors">Assign {suggest.rows.length} Preset{suggest.rows.length === 1 ? '' : 's'}</button>
-            </div>
-        </>
-      )}</Modal>}
-
       {confirm && <Modal onClose={() => setConfirm(null)} panelClass="w-72 p-4">{(close) => (
         <>
             {(() => {
@@ -1558,6 +1542,7 @@ export default function LibraryView() {
       {bazaar && <BazaarPriceModal conn={bazaar.conn} items={bazaar.items} server={settings.ahServer} iconSet={iconSet} assets={viewChars[0]?.assets} onClose={() => setBazaar(null)} onDone={() => setSel(new Set())} />}
 
       {org.nodes}
+      {porterGear.modals}
       <ConsolidateProgressCard />
     </div>
   );

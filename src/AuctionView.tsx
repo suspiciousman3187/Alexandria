@@ -11,6 +11,7 @@ import { itemNameMatches } from './itemNames';
 import { useAhDetailTarget, closeAhDetail, type AhSellContext } from './ahNav';
 import { useWishlist, addWish, removeWish, removeWishEntry, type WishItem } from './wishlist';
 import { IconInner } from './atlasIcon';
+import { logicalRect, logicalViewport } from './uiZoom';
 import { useItemHover, RichDescription, WhereOwned } from './ItemTooltip';
 import { Select, Segmented, SectionTabs, Group, GilInput, Stepper, SearchInput, BagTag } from './ui';
 import IncBidModal from './IncBidModal';
@@ -1126,7 +1127,7 @@ function ItemDetail({ item, onBack, backLabel, sell, initialStack, atah, assets,
             <GilInput value={price} onChange={setPrice} placeholder="Bid price (gil)" className="flex-1 min-w-0 bg-field border border-line rounded-md px-3 py-2 text-[13px] text-fg-2 placeholder-fg-4 outline-none focus:border-accent/50 tabular-nums" />
             <Stepper value={qty} min={1} max={99} onChange={setQty} title={stack ? 'How many stacks to buy' : 'How many to buy'} className="shrink-0 h-9" />
             <div className="relative shrink-0">
-                  <button ref={bidBtnRef} onClick={() => { if (!bidderOpen) { const r = bidBtnRef.current?.getBoundingClientRect(); if (r) setBidderPos({ right: window.innerWidth - r.right, bottom: window.innerHeight - r.top + 6 }); } setBidderOpen((o) => !o); }} disabled={!canBid} className="le-tap px-5 py-2 text-[13px] font-bold rounded-md bg-accent text-on-accent enabled:hover:bg-accent-hover disabled:opacity-40 transition-colors flex items-center gap-1.5">
+                  <button ref={bidBtnRef} onClick={() => { if (!bidderOpen) { const raw = bidBtnRef.current?.getBoundingClientRect(); if (raw) { const r = logicalRect(raw); const vp = logicalViewport(); setBidderPos({ right: vp.w - r.right, bottom: vp.h - r.top + 6 }); } } setBidderOpen((o) => !o); }} disabled={!canBid} className="le-tap px-5 py-2 text-[13px] font-bold rounded-md bg-accent text-on-accent enabled:hover:bg-accent-hover disabled:opacity-40 transition-colors flex items-center gap-1.5">
                     Bid
                     <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2.5} strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6" /></svg>
                   </button>

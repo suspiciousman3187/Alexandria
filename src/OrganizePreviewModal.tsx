@@ -25,13 +25,18 @@ export function OrganizePreviewModal({ targets, rules, layoutForChar, iconSet, g
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const byChar = targets.map((ch) => ({ char: ch.name, steps: ch.orgPreview, assets: ch.assets }));
+  const byChar = targets.map((ch) => ({ char: ch.name, steps: ch.orgPreview, overflow: ch.orgOverflow, assets: ch.assets }));
   const ready = byChar.filter((p) => p.steps !== undefined);
   const pending = byChar.some((p) => p.steps === undefined);
   const loading = !waited && pending;
   const noResponse = waited && byChar.length > 0 && ready.length === 0;
   const missing = waited && ready.length > 0 && pending;
   const total = ready.reduce((n, p) => n + (p.steps?.length ?? 0), 0);
+  // Pieces the addon couldn't place because their routed bag (usually a wardrobe) filled up. The moves that
+  // DID fit still run; this just tells the user some gear stayed put so a full wardrobe isn't a silent no-op.
+  const overflow = ready.flatMap((p) => p.overflow ?? []);
+  const overflowTotal = overflow.reduce((n, o) => n + o.c, 0);
+  const overflowNames = [...new Set(overflow.map((o) => o.n))].slice(0, 6).join(', ');
 
   return (
     <Modal onClose={onClose} panelClass="w-[min(92vw,440px)] max-h-[80vh]">{(close) => (
@@ -47,6 +52,7 @@ export function OrganizePreviewModal({ targets, rules, layoutForChar, iconSet, g
               ? <div className="m-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-4 text-[12px] text-amber-200"><div className="font-bold mb-1">The addon did not answer the preview.</div>Reload Alexandria in-game with <span className="font-mono text-amber-100">//lua reload Alexandria</span>, then open Organize again.</div>
               : <>
                   {missing && <div className="m-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200"><span className="font-bold">{byChar.filter((p) => p.steps === undefined).length} character(s) didn't answer</span> the preview and aren't shown. Reload Alexandria on those clients: <span className="font-mono text-amber-100">//lua reload Alexandria</span></div>}
+                  {overflowTotal > 0 && <div className="m-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200"><span className="font-bold">{overflowTotal} piece{overflowTotal === 1 ? '' : 's'} won't fit</span> the assigned bag (it's full){overflowNames ? `: ${overflowNames}` : ''}. The moves below still run; free up space, then organize again for the rest.</div>}
                   {total === 0
                     ? <div className="text-[12px] text-fg-4 p-8 text-center">Nothing to move. {missing ? 'The characters that answered are already sorted.' : 'Your inventory is already organized.'}</div>
                     : byChar.filter((p) => p.steps && p.steps.length > 0).map(({ char, steps, assets }) => (

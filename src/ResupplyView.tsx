@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from 'react';
+import { useMemo, useState, useEffect, useRef, type ReactNode, type CSSProperties } from 'react';
 import { useKnownCharacters, useAvailableIcons, moveItem, NOMAD_BAGS, nomadReachable, type KnownChar } from './bridge';
 import { useResupplyStore, useProfiles, setResupplyChar, setProfileItems, createProfile, renameProfile, deleteProfile, assignProfile, profileUsage, effectiveItems, emptyResupply, type ResupplyChar, type ResupplyItem } from './resupply';
 import { useCurioCatalog, useCurioVersion, type CurioItem } from './curioCatalog';
@@ -6,13 +6,20 @@ import { itemNameMatches } from './itemNames';
 import { useSettings } from './settings';
 import { IconInner } from './atlasIcon';
 import { Modal, Collapse } from './overlay';
-import { Stepper, Toggle, SearchInput, Select, SectionTabs } from './ui';
+import { Stepper, Toggle, SearchInput, Select, SectionTabs, Button } from './ui';
 import { useSticky } from './sticky';
 import { OpGlyph } from './OpCard';
 import { ALWAYS_BAGS, MOG_ONLY_BAGS } from './bagConstants';
 import { useAnon } from './anonymize';
+import { dlog } from './debugLog';
 
 const fmt = (v: number) => v.toLocaleString();
+
+// content-visibility:auto lets the browser skip layout, paint, and compositing for off-screen rows --
+// cheap virtualization so a long, icon-heavy catalog list can't flood the WebView2 GPU compositor while
+// scrolling (the "scrolling the Curio food list hard-crashes the display" report). contain-intrinsic-size
+// reserves each skipped row's height so the scrollbar stays stable.
+const ROW_CV: CSSProperties = { contentVisibility: 'auto', containIntrinsicSize: 'auto 48px' };
 
 const CATS: { opt: number; label: string }[] = [
   { opt: 1, label: 'Medicines' },
@@ -86,7 +93,7 @@ function PickerRow({ it, onAll, onAny, disabled, iconSet, assets, onAdd, onRemov
   const quick = 'le-tap shrink-0 w-14 py-1.5 text-[10px] font-semibold rounded-md border border-line bg-surface text-fg-2 enabled:hover:text-fg disabled:opacity-40 transition-colors';
 
   return (
-    <div className="flex items-center gap-2.5 px-4 py-2">
+    <div className="flex items-center gap-2.5 px-4 py-2" style={ROW_CV}>
       <SmallIcon id={it.id} n={it.n} assets={assets} iconSet={iconSet} />
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-1.5">
@@ -129,6 +136,24 @@ function CatalogPicker({ catalog, iconSet, assets, title, onAllOf, onAnyOf, onAd
     if (!s) { const pi = list.findIndex((it) => it.id === 4112); if (pi > 0) list.unshift(list.splice(pi, 1)[0]); }
     return list;
   }, [catalog, cat, q]);
+  // Cap painted rows: a broad search can match every category at once (300+ icon rows), so render a
+  // slice and let the user refine. Combined with content-visibility this keeps the list GPU-safe.
+  const MAX_ROWS = 150;
+  const capped = shown.length > MAX_ROWS ? shown.slice(0, MAX_ROWS) : shown;
+
+  // Diagnostic breadcrumbs: what the catalog browser was doing right before a crash (see debugLog).
+  const lastScroll = useRef(0);
+  const onScroll = (e: React.UIEvent<HTMLDivElement>) => {
+    const t = performance.now();
+    if (t - lastScroll.current < 250) return;
+    lastScroll.current = t;
+    dlog('curio.scroll', { top: Math.round(e.currentTarget.scrollTop), shown: shown.length, rows: capped.length });
+  };
+  useEffect(() => {
+    dlog('curio.picker.open', { catalog: catalog.length, cat, shown: shown.length, capped: capped.length });
+    return () => dlog('curio.picker.close');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <Modal onClose={onClose} panelClass="w-[min(94vw,600px)] h-[82vh]">
@@ -155,16 +180,21 @@ function CatalogPicker({ catalog, iconSet, assets, title, onAllOf, onAnyOf, onAd
               </div>
             )}
           </div>
-          <div className="flex-1 min-h-0 overflow-y-auto divide-y divide-line">
+          <div className="flex-1 min-h-0 overflow-y-auto divide-y divide-line" onScroll={onScroll}>
             {disabled && disabledHint && (
               <div className="px-4 py-2 text-center text-[11px] text-amber-300/90 bg-amber-500/5">{disabledHint}</div>
             )}
             {shown.length === 0 ? (
               <div className="px-4 py-10 text-center text-[12px] text-fg-4">No supplies match.</div>
             ) : (
-              shown.map((it) => (
-                <PickerRow key={it.id} it={it} onAll={onAllOf(it.n)} onAny={onAnyOf(it.n)} disabled={!!disabled} iconSet={iconSet} assets={assets} onAdd={(qty) => onAdd(it, qty)} onRemove={() => onRemove(it)} />
-              ))
+              <>
+                {capped.map((it) => (
+                  <PickerRow key={it.id} it={it} onAll={onAllOf(it.n)} onAny={onAnyOf(it.n)} disabled={!!disabled} iconSet={iconSet} assets={assets} onAdd={(qty) => onAdd(it, qty)} onRemove={() => onRemove(it)} />
+                ))}
+                {shown.length > capped.length && (
+                  <div className="px-4 py-3 text-center text-[11px] text-fg-4">{shown.length - capped.length} more. Refine your search to narrow the list.</div>
+                )}
+              </>
             )}
           </div>
         </div>
@@ -306,8 +336,8 @@ function CharCard({ char, byName, iconSet, assets, onAddClick, onManageProfiles 
 
   return (
     <div className={`rounded-xl bg-surface border overflow-hidden ${rp?.active ? 'border-accent/40' : 'border-line'}`}>
-      <div className="flex items-center gap-2 px-3.5 py-2.5">
-        <button onClick={() => setOpen((o) => !o)} className="flex items-center gap-2 min-w-0 flex-1 text-left">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 px-3.5 py-2.5">
+        <button onClick={() => setOpen((o) => !o)} className="flex items-center gap-2 min-w-0 grow basis-[200px] text-left">
           <span className={`w-3.5 h-3.5 shrink-0 text-fg-4 transition-transform ${open ? 'rotate-90' : ''}`}>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.5} strokeLinecap="round" strokeLinejoin="round"><path d="m9 6 6 6-6 6" /></svg>
           </span>
@@ -316,18 +346,20 @@ function CharCard({ char, byName, iconSet, assets, onAddClick, onManageProfiles 
             <span className={`text-[11px] font-semibold tabular-nums shrink-0 ${stocked === items.length ? 'text-emerald-400' : 'text-fg-4'}`}>{stocked}/{items.length} stocked</span>
           )}
         </button>
-        {cfg.enabled && <CurioPill near={char.vendorNear?.curio} />}
-        {bringPlan.length > 0 && (
-          <button onClick={bringToInv} title="Bring Supplies To Inventory" className="le-tap shrink-0 px-2.5 py-1 text-[11px] font-semibold rounded-md border border-accent/40 bg-accent/10 text-accent hover:bg-accent/20 transition-colors">Bring Supplies</button>
-        )}
-        <div className="w-[112px] shrink-0" title="Curio profile"><Select value={cfg.profile ?? '__custom__'} onChange={onPickProfile} options={['__custom__', ...profileNames, '__new__']} renderValue={(v) => (v === '__custom__' ? 'Custom' : v === '__new__' ? '＋ New' : v)} renderOption={(v) => (v === '__custom__' ? 'Custom' : v === '__new__' ? '＋ New Profile' : v)} full /></div>
-        {!onProfile && <button onClick={onAddClick} className="le-tap shrink-0 px-2.5 py-1 text-[11px] font-semibold rounded-md border border-line bg-surface text-fg-2 hover:text-fg transition-colors">Add</button>}
-        <Toggle on={cfg.enabled} onChange={(v) => update({ ...cfg, enabled: v })} />
+        <div className="flex items-center gap-2 shrink-0 ml-auto">
+          {cfg.enabled && <CurioPill near={char.vendorNear?.curio} />}
+          {bringPlan.length > 0 && (
+            <button onClick={bringToInv} title="Bring Supplies To Inventory" className="le-tap shrink-0 px-2.5 py-1 text-[11px] font-semibold rounded-md border border-accent/40 bg-accent/10 text-accent hover:bg-accent/20 transition-colors">Bring Supplies</button>
+          )}
+          <div className="w-[112px] shrink-0" title="Curio profile"><Select value={cfg.profile ?? '__custom__'} onChange={onPickProfile} options={['__custom__', ...profileNames, '__new__']} renderValue={(v) => (v === '__custom__' ? 'Custom' : v === '__new__' ? '＋ New' : v)} renderOption={(v) => (v === '__custom__' ? 'Custom' : v === '__new__' ? '＋ New Profile' : v)} full /></div>
+          {!onProfile && <button onClick={onAddClick} className="le-tap shrink-0 px-2.5 py-1 text-[11px] font-semibold rounded-md border border-line bg-surface text-fg-2 hover:text-fg transition-colors">Add</button>}
+          <Toggle on={cfg.enabled} onChange={(v) => update({ ...cfg, enabled: v })} />
+        </div>
       </div>
       {onProfile && (
         <div className="flex items-center gap-2 px-3.5 py-1.5 border-t border-line bg-field/40 text-[11px] text-fg-4">
           <span className="min-w-0 flex-1 truncate">On profile <span className="font-semibold text-accent">{cfg.profile}</span> · shared by {profileUsage(cfg.profile as string)}</span>
-          <button onClick={onManageProfiles} className="shrink-0 font-semibold text-accent hover:underline transition-colors">Edit in Profiles →</button>
+          <Button variant="ghost" size="sm" className="shrink-0" onClick={onManageProfiles}>Edit in Profiles →</Button>
         </div>
       )}
       <Collapse open={!!rp?.active}>{rp?.active && (
@@ -350,7 +382,7 @@ function CharCard({ char, byName, iconSet, assets, onAddClick, onManageProfiles 
             <div className="px-3.5 py-3 text-[11px] text-fg-4">{onProfile ? 'This profile has no supplies yet. Add them in the Profiles tab.' : "No supplies yet. Use Add to pick from the Curio Moogle's stock."}</div>
           ) : (
             status.map(({ it, c, owned, met, locs }) => (
-              <div key={it.name} className="flex items-center gap-2.5 px-3.5 py-2 border-b border-line last:border-b-0">
+              <div key={it.name} className="flex items-center gap-2.5 px-3.5 py-2 border-b border-line last:border-b-0" style={ROW_CV}>
                 <SmallIcon id={c?.id} n={it.name} assets={assets} iconSet={iconSet} />
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-1.5">
@@ -429,7 +461,7 @@ function ProfileCard({ name, items, users, byName, iconSet, assets, onAdd, onSet
             items.map((it) => {
               const c = byName.get(it.name.toLowerCase());
               return (
-                <div key={it.name} className="flex items-center gap-2.5 px-3.5 py-2 border-b border-line last:border-b-0">
+                <div key={it.name} className="flex items-center gap-2.5 px-3.5 py-2 border-b border-line last:border-b-0" style={ROW_CV}>
                   <SmallIcon id={c?.id} n={it.name} assets={assets} iconSet={iconSet} />
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-1.5">

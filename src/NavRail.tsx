@@ -3,6 +3,7 @@ import { AnimatePresence, motion } from 'motion/react';
 import { Tip } from './ui';
 import { openExternal } from './bridge';
 import { useSettings } from './settings';
+import { useActiveReforgeCount } from './reforgeProgress';
 
 const DISCORD_URL = 'https://discord.com/invite/vSgYvdh8gT';
 
@@ -11,7 +12,7 @@ export type Section =
   | 'pool' | 'lotlist' | 'passlist' | 'pricelist'
   | 'shop' | 'selllist' | 'resupply' | 'vendors' | 'auction' | 'bazaar' | 'delivery' | 'sparks' | 'networth'
   | 'organize' | 'sequences' | 'commands' | 'store' | 'tags'
-  | 'slips' | 'ambuscade' | 'skirmish' | 'reive' | 'geasfete'
+  | 'slips' | 'ambuscade' | 'skirmish' | 'reive' | 'geasfete' | 'reforge'
   | 'gearsets'
   | 'settings';
 
@@ -22,6 +23,7 @@ const passIcon = (<svg viewBox="0 0 24 24" {...S}><circle cx="12" cy="12" r="9" 
 const cape = (<svg viewBox="0 0 24 24" {...S}><path d="M9.5 4.5a2.5 2.5 0 0 0 5 0" /><path d="M9.5 4.5C6.5 6.5 5 13 5 21l3.5-2 3.5 2 3.5-2 3.5 2c0-8-1.5-14.5-4.5-16.5" /></svg>);
 const armor = (<svg viewBox="0 0 24 24" {...S}><path d="M4 6l4-3 4 2 4-2 4 3-1 6c-.5 3-3 5.5-7 7-4-1.5-6.5-4-7-7z" /><path d="M12 5v15" /><path d="M5 9h14" /></svg>);
 const sword = (<svg viewBox="0 0 24 24" {...S}><path d="M14.5 17.5 L3 6 L3 3 L6 3 L17.5 14.5" /><path d="M13 19 L19 13" /><path d="M16 16 L20 20" /><path d="M19 21 L21 19" /></svg>);
+const hammer = (<svg viewBox="0 0 24 24" {...S}><path d="m15 12-8.5 8.5a2.12 2.12 0 1 1-3-3L12 9" /><path d="M17.64 15 22 10.64" /><path d="m20.91 11.7-1.25-1.25c-.6-.6-.93-1.4-.93-2.25v-.86L16.01 4.6a5.56 5.56 0 0 0-3.94-1.64H9l.92.82A6.18 6.18 0 0 1 12 8.4v1.56l2 2h2.47l2.26 1.91" /></svg>);
 
 const ICONS: Record<Section, ReactElement> = {
   inventory: (<svg viewBox="0 0 24 24" {...S}><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M3 9h18" /><path d="M9 4v5" /><path d="M15 4v5" /></svg>),
@@ -56,6 +58,7 @@ const ICONS: Record<Section, ReactElement> = {
   skirmish:  sword,
   reive:     cape,
   geasfete:  armor,
+  reforge:   hammer,
   gearsets:  sword,
   settings:  (<svg viewBox="0 0 24 24" {...S}><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2V21a2 2 0 1 1-4 0v-.1A1.7 1.7 0 0 0 7 19.4a1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0-1.2-2.9H1a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 2.6 7a1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H7a1.7 1.7 0 0 0 1-1.5V1a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V7a1.7 1.7 0 0 0 1.5 1H23a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z" /></svg>),
 };
@@ -65,13 +68,13 @@ const LABELS: Record<Section, string> = {
   currency: 'Currency', trade: 'Trade', pool: 'Pool', lotlist: 'Lot List', passlist: 'Pass List', pricelist: 'Price Display',
   shop: 'Shop', selllist: 'Sell List', resupply: 'Curio', vendors: 'Vendors', auction: 'Auction', bazaar: 'Bazaar', delivery: 'Delivery', sparks: 'Sparks/Unity', networth: 'Net Worth',
   organize: 'Organize', sequences: 'Sequences', commands: 'Commands', store: 'Storage NPC', tags: 'Tagging',
-  slips: 'Storage Slips', ambuscade: 'Ambuscade', skirmish: 'Skirmish', reive: 'Reive', geasfete: 'Geas Fete',
+  slips: 'Storage Slips', ambuscade: 'Ambuscade', skirmish: 'Skirmish', reive: 'Reive', geasfete: 'Geas Fete', reforge: 'Reforge',
   gearsets: 'Gearsets',
   settings: 'Settings',
 };
 
-const EXPERIMENTAL: Partial<Record<Section, boolean>> = { bazaar: true, ambuscade: true, reive: true, skirmish: true, geasfete: true, store: true, sparks: true };
-const TOGGLE_EXPERIMENTAL = new Set<Section>(['ambuscade', 'reive', 'skirmish', 'geasfete', 'store', 'bazaar', 'sparks']);
+const EXPERIMENTAL: Partial<Record<Section, boolean>> = { bazaar: true, ambuscade: true, reive: true, skirmish: true, geasfete: true, store: true, sparks: true, reforge: true };
+const TOGGLE_EXPERIMENTAL = new Set<Section>(['ambuscade', 'reive', 'skirmish', 'geasfete', 'store', 'bazaar', 'sparks', 'reforge']);
 
 const GROUP_ICON = {
   market: (<svg viewBox="0 0 24 24" {...S}><path d="M6 8h12l-1 12H7z" /><path d="M9 8a3 3 0 0 1 6 0" /></svg>),
@@ -87,7 +90,7 @@ const GROUPS: NavGroup[] = [
   { id: 'pool', label: 'Pool', icon: ICONS.pool, primary: 'pool', children: ['lotlist', 'passlist', 'pricelist'] },
   { id: 'market', label: 'Market', icon: GROUP_ICON.market, primary: 'auction', children: ['delivery', 'bazaar', 'shop', 'networth'] },
   { id: 'tools', label: 'Tools', icon: GROUP_ICON.tools, primary: 'organize', children: ['tags', 'dupe', 'store', 'slips', 'resupply', 'vendors', 'sparks'] },
-  { id: 'augment', label: 'Augment', icon: armor, primary: 'ambuscade', children: ['reive', 'skirmish', 'geasfete'] },
+  { id: 'augment', label: 'Augment', icon: armor, primary: 'ambuscade', children: ['reive', 'skirmish', 'geasfete', 'reforge'] },
   { id: 'gearsets', label: 'Gearsets', icon: ICONS.gearsets, primary: 'gearsets', children: [] },
 ];
 
@@ -104,7 +107,7 @@ function RailButton({ id, label, icon, active, onSelect }: { id: Section; label:
   );
 }
 
-function GroupItem({ group, active, onSelect }: { group: NavGroup; active: Section; onSelect: (s: Section) => void }) {
+function GroupItem({ group, active, onSelect, badge = 0 }: { group: NavGroup; active: Section; onSelect: (s: Section) => void; badge?: number }) {
   const exp = useSettings().experimentalFeatures;
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement | null>(null);
@@ -133,6 +136,7 @@ function GroupItem({ group, active, onSelect }: { group: NavGroup; active: Secti
         {groupActive && <motion.span layoutId="nav-active" className="absolute inset-0 rounded-xl bg-[var(--color-nav-active)]" transition={{ duration: 0.25, ease: [0.22, 1, 0.36, 1] }} />}
         <span className="relative z-[1] w-5 h-5">{group.icon}</span>
         <span className="relative z-[1] text-[10px] font-semibold tracking-wide @max-[460px]:hidden">{group.label}</span>
+        {badge > 0 && <span className="absolute top-1 right-1.5 z-[2] min-w-[15px] h-[15px] px-1 rounded-full bg-accent text-on-accent text-[9px] font-extrabold grid place-items-center tabular-nums" style={{ boxShadow: '0 0 0 2px var(--color-bg)' }}>{badge}</span>}
       </button>
       <AnimatePresence>
         {open && (
@@ -156,11 +160,12 @@ function GroupItem({ group, active, onSelect }: { group: NavGroup; active: Secti
 }
 
 export default function NavRail({ active, onSelect }: { active: Section; onSelect: (s: Section) => void }) {
+  const rfCount = useActiveReforgeCount();
   return (
     <nav className="bg-nav relative z-40 w-[76px] @max-[460px]:w-14 shrink-0 h-full flex flex-col items-center gap-1 py-3 border-r border-line">
       {GROUPS.filter((g) => GEARSETS_ENABLED || g.id !== 'gearsets').map((g) => (g.children.length === 0 && g.primary
         ? <RailButton key={g.id} id={g.primary} label={g.label} icon={g.icon} active={active === g.primary} onSelect={onSelect} />
-        : <GroupItem key={g.id} group={g} active={active} onSelect={onSelect} />))}
+        : <GroupItem key={g.id} group={g} active={active} onSelect={onSelect} badge={g.id === 'augment' ? rfCount : 0} />))}
 
       <div className="mt-auto w-full flex flex-col items-center gap-1 pt-1 border-t border-line">
         <RailButton id="settings" label={LABELS.settings} icon={ICONS.settings} active={active === 'settings'} onSelect={onSelect} />

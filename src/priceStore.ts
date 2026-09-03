@@ -7,6 +7,13 @@ export type ItemValue = { median?: number; stock?: number; rate?: number; listed
 
 const keyOf = (world: string, id: number, stack: boolean) => `${world}|${id}|${stack ? 1 : 0}`;
 
+// FFXI's gil cap is 999,999,999 -- a character cannot hold, and therefore cannot pay, more than that.
+// Any "price" above it is impossible/corrupt data (a troll listing or a parse glitch) and must never be
+// trusted; a single one poisons net worth and every market display that reads this store. Discard it.
+const GIL_CAP = 999_999_999;
+const saneMedian = (v: number | null | undefined): number | undefined =>
+  v != null && Number.isFinite(v) && v > 0 && v <= GIL_CAP ? v : undefined;
+
 const latest = new Map<string, ItemValue>();
 const market = new Map<string, MarketData | null>();
 const history: Record<string, PriceSnap[]> = {};
@@ -39,7 +46,7 @@ function load(): Promise<void> {
           if (!Array.isArray(p[k]) || history[k]) continue;
           history[k] = p[k];
           const last = p[k][p[k].length - 1];
-          if (last && !latest.has(k)) latest.set(k, { median: last.median, stock: last.stock, at: last.at });
+          if (last && !latest.has(k)) latest.set(k, { median: saneMedian(last.median), stock: last.stock, at: last.at });
         }
       }
     } catch { /* none saved yet */ }
@@ -81,7 +88,7 @@ function request(world: string, id: number, stack: boolean): Promise<MarketData 
       let data: MarketData | null = null;
       try {
         data = await fetchMarket(id, stack, world);
-        const median = data.median ? Number(data.median.replace(/[^\d]/g, '')) : undefined;
+        const median = saneMedian(data.median ? Number(data.median.replace(/[^\d]/g, '')) : undefined);
         const stock = data.stock != null && data.stock !== '' ? Number(data.stock) : undefined;
         const rate = data.rate ? Number(data.rate) : undefined;
         market.set(k, data);

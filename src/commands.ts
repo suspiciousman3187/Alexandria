@@ -6,7 +6,7 @@ import {
   broadcastDropRules, runOrganize, storeRequest, NOMAD_BAGS, inNomadZone,
   type KnownChar, type OrganizeRules,
 } from './bridge';
-import { resolveItemName, itemNameMatches } from './itemNames';
+import { resolveItemName, itemNameMatches, itemFullName } from './itemNames';
 import { openUseAll } from './useAllHost';
 import { isPoolOverlay, isGearsetWindow } from './overlayWindow';
 import { addRuleToChars, removeRuleFromChar } from './poolRules';
@@ -58,12 +58,14 @@ function onlineFleet(): KnownChar[] {
 const unquote = (s: string): string => s.trim().replace(/^['"]+/, '').replace(/['"]+$/, '').trim();
 
 function searchInv(c: KnownChar | undefined, lc: string): { id: number; n: string } | null {
-  const items: { id: number; n: string; ln: string }[] = [];
-  for (const b of c?.inv ?? []) for (const it of b.items) items.push({ id: it.id, n: it.n, ln: it.n.toLowerCase() });
-  for (const it of items) if (it.ln === lc) return { id: it.id, n: it.n };
-  for (const it of items) if (it.ln.includes(lc)) return { id: it.id, n: it.n };
+  // Match against BOTH the shown (abbreviated) name and the full name -- FFXI truncates long item names,
+  // so "Ra'Kaznar Starstone" only matches the stored "Ra'Ka. Starstone" via the full name.
+  const items: { id: number; n: string; ln: string; fl?: string }[] = [];
+  for (const b of c?.inv ?? []) for (const it of b.items) items.push({ id: it.id, n: it.n, ln: it.n.toLowerCase(), fl: itemFullName(it.id) });
+  for (const it of items) if (it.ln === lc || it.fl === lc) return { id: it.id, n: it.n };
+  for (const it of items) if (it.ln.includes(lc) || (it.fl != null && it.fl.includes(lc))) return { id: it.id, n: it.n };
   const toks = lc.split(/[^a-z0-9]+/).filter(Boolean);
-  if (toks.length > 1) for (const it of items) if (toks.every((t) => it.ln.includes(t))) return { id: it.id, n: it.n };
+  if (toks.length > 1) for (const it of items) if (toks.every((t) => it.ln.includes(t) || (it.fl != null && it.fl.includes(t)))) return { id: it.id, n: it.n };
   return null;
 }
 function globToRe(glob: string): RegExp | null {
@@ -73,7 +75,7 @@ function globToRe(glob: string): RegExp | null {
 }
 function matchInvAll(c: KnownChar | undefined, re: RegExp): { id: number; n: string }[] {
   const seen = new Map<number, string>();
-  for (const b of c?.inv ?? []) for (const it of b.items) if (re.test(it.n)) seen.set(it.id, it.n);
+  for (const b of c?.inv ?? []) for (const it of b.items) { const fl = itemFullName(it.id); if (re.test(it.n) || (fl != null && re.test(fl))) seen.set(it.id, it.n); }
   return [...seen].map(([id, n]) => ({ id, n }));
 }
 function resolveItem(char: KnownChar | undefined, name: string): { id: number; n: string } | null {

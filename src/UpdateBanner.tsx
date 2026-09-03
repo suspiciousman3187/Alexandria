@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { checkForUpdate, installUpdate, checkAddonUpdate, installAddonUpdate, type Update, type ManifestAddon } from './updater';
 import { useAddonInfo } from './bridge';
+import { Button } from './ui';
 
 const STARTUP_KEY = 'alex_check_updates_startup';
 const SKIP_APP_KEY = 'alex_skip_app_v';
@@ -112,7 +113,7 @@ export default function UpdateBanner() {
             <div className="flex items-center gap-3 px-4 py-2 text-[12px]">
               <span className="text-emerald-300">Addon updated.</span>
               <span className="text-fg-3">Run <span className="text-fg-2 font-semibold">//lua reload Alexandria</span> in-game to apply.</span>
-              <button onClick={() => setAddonDone(false)} className="ml-auto text-fg-4 hover:text-fg text-[11px] px-2 py-1">Dismiss</button>
+              <Button variant="ghost" size="sm" className="ml-auto" onClick={() => setAddonDone(false)}>Dismiss</Button>
             </div>
           </motion.div>
         )}
@@ -120,7 +121,7 @@ export default function UpdateBanner() {
           <motion.div key="err" {...collapse}>
             <div className="flex items-center gap-3 px-4 py-2 text-[12px]">
               <span className="text-red-300 truncate">{err}</span>
-              <button onClick={() => setErr('')} className="ml-auto text-fg-4 hover:text-fg text-[11px] px-2 py-1">Dismiss</button>
+              <Button variant="ghost" size="sm" className="ml-auto" onClick={() => setErr('')}>Dismiss</Button>
             </div>
           </motion.div>
         )}
@@ -141,8 +142,8 @@ function Line({ text, busy, busyLabel, onInstall, onDismiss, disabled }: {
           <span className="text-fg-3 text-[11px]">{busyLabel}</span>
         ) : (
           <>
-            <button onClick={onInstall} disabled={disabled} className="px-3 py-1 text-[11px] font-semibold rounded-md bg-accent text-on-accent hover:bg-accent-hover disabled:opacity-50 transition-colors">Install</button>
-            <button onClick={onDismiss} disabled={disabled} className="px-2 py-1 text-[11px] font-semibold rounded-md text-fg-3 hover:text-fg-2 disabled:opacity-50 transition-colors">Later</button>
+            <Button variant="primary" size="sm" onClick={onInstall} disabled={disabled}>Install</Button>
+            <Button variant="ghost" size="sm" onClick={onDismiss} disabled={disabled}>Later</Button>
           </>
         )}
       </div>

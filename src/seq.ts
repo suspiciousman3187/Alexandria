@@ -77,7 +77,7 @@ export async function runStep(char: KnownChar, step: Step): Promise<void> {
     if (!id) throw new Error(`item not found: ${step.item}`);
     const want = Math.max(1, step.count);
     const before = countItem(freshChar(target), id);
-    tradeTo(char.conn, step.to, [{ id, count: want }]);
+    tradeTo(char.conn, step.to, [{ id, count: want }], 0, target.id);
     const ok = await pollUntil(() => countItem(freshChar(target), id) >= before + want, 15000);
     if (stopFlag) return;
     if (!ok) throw new Error(`trade not confirmed: ${countItem(freshChar(target), id) - before}/${want} to ${step.to}`);

@@ -14,6 +14,7 @@ import { useDrop, setDrop } from './drop';
 import { usePoolStore, setCharRules, addRuleToChars, emptyRules, usePassOnLot, setPassOnLot, useAutoLotEnabled, setAutoLotEnabled, useAutoLotOff, setAutoLotChar } from './poolRules';
 import { usePoolPriceMode, setPoolPriceMode, usePoolPriceDefault, setPoolPriceDefault } from './poolPriceMode';
 import { useSticky, useStickyChar } from './sticky';
+import { logicalRect, logicalViewport } from './uiZoom';
 import { Group, CharacterSelect, Select, Row, Toggle, SearchInput, Segmented } from './ui';
 import { Popover } from './overlay';
 import { Crossfade } from './overlay';
@@ -227,9 +228,11 @@ function ItemCombo({ existing, onAdd, assets }: { existing: string[]; onAdd: (na
     setQ(''); setOpen(false);
   };
 
-  const W = rect?.width ?? 240;
-  const left = rect?.left ?? 0;
-  const top = (rect?.bottom ?? 0) + 4;
+  // Position in the popover's own (zoom-adjusted) coordinate space so a uiScale > 1 never offsets it; see uiZoom.ts.
+  const lr = rect ? logicalRect(rect) : null;
+  const W = lr?.width ?? 240;
+  const left = lr?.left ?? 0;
+  const top = (lr?.bottom ?? 0) + 4;
 
   return (
     <div className="mb-2.5">
@@ -443,22 +446,27 @@ export default function PoolView({ view = 'pool', compact = false, dense = false
   const doAllEveryone = (kind: 'lot' | 'pass') => { for (const c of allMembers) doAllOn(c, kind); };
 
   const menuW = 224;
-  const menuLeft = menu ? Math.max(8, Math.min(menu.rect.right - menuW, window.innerWidth - menuW - 8)) : 0;
-  const menuSpaceBelow = menu ? window.innerHeight - menu.rect.bottom - 8 : 0;
-  const menuSpaceAbove = menu ? menu.rect.top - 8 : 0;
-  const menuAbove = menu ? menuSpaceBelow < 200 && menuSpaceAbove > menuSpaceBelow : false;
+  // Position menus in their own (zoom-adjusted) coordinate space so a uiScale > 1 never throws them off-screen;
+  // see uiZoom.ts. No-op at 100% and in the un-zoomed pop-out window.
+  const vp = logicalViewport();
+  const mR = menu ? logicalRect(menu.rect) : null;
+  const menuLeft = mR ? Math.max(8, Math.min(mR.right - menuW, vp.w - menuW - 8)) : 0;
+  const menuSpaceBelow = mR ? vp.h - mR.bottom - 8 : 0;
+  const menuSpaceAbove = mR ? mR.top - 8 : 0;
+  const menuAbove = mR ? menuSpaceBelow < 200 && menuSpaceAbove > menuSpaceBelow : false;
   const menuMaxH = menuAbove ? menuSpaceAbove : menuSpaceBelow;
-  const menuStyle: CSSProperties = menu
+  const menuStyle: CSSProperties = mR
     ? (menuAbove
-        ? { position: 'fixed', left: menuLeft, bottom: window.innerHeight - menu.rect.top + 4, width: menuW, maxHeight: menuMaxH, zIndex: 80 }
-        : { position: 'fixed', left: menuLeft, top: menu.rect.bottom + 4, width: menuW, maxHeight: menuMaxH, zIndex: 80 })
+        ? { position: 'fixed', left: menuLeft, bottom: vp.h - mR.top + 4, width: menuW, maxHeight: menuMaxH, zIndex: 80 }
+        : { position: 'fixed', left: menuLeft, top: mR.bottom + 4, width: menuW, maxHeight: menuMaxH, zIndex: 80 })
     : {};
   const eligibleChars = menu ? eligible(menu.item) : [];
   const menuLot = menu?.kind === 'lot';
   const heldOf = (c: KnownChar, id: number) => { let n = 0; for (const b of c.inv ?? []) for (const it of b.items) if (it.id === id) n += it.c; return n; };
   const lotableChars = menuLot && menu ? eligibleChars.filter((c) => !rareBlocked(c, menu.item)) : eligibleChars;
-  const allMenuLeft = allMenu ? Math.max(8, Math.min(allMenu.rect.right - menuW, window.innerWidth - menuW - 8)) : 0;
-  const allMenuTop = allMenu ? allMenu.rect.bottom + 4 : 0;
+  const aR = allMenu ? logicalRect(allMenu.rect) : null;
+  const allMenuLeft = aR ? Math.max(8, Math.min(aR.right - menuW, vp.w - menuW - 8)) : 0;
+  const allMenuTop = aR ? aR.bottom + 4 : 0;
 
   return (
     <div className="h-full flex flex-col">

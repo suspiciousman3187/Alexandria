@@ -1,6 +1,6 @@
 _addon.name = 'Alexandria'
 _addon.author = 'Noirblanc'
-_addon.version = '0.0.20'
+_addon.version = '0.0.26'
 _addon.commands = {'alexandria', 'alex', 'ax'}
 
 local socket = require('socket')
@@ -31,6 +31,16 @@ local RETRY_MAX = 15.0
 local CONN_TIMEOUT = 3.0
 local rx = ''
 local txbuf = ''
+-- Sage master-overlay fan-out: a SECOND socket teeing our frames to Sage (127.0.0.1:2027) and reading pool
+-- commands back through the SAME dispatch(). Globals (not locals) to stay clear of Lua's 200-local limit.
+SAGE_HOST = '127.0.0.1'
+SAGE_PORT = 2027
+SAGE_RETRY = 5.0
+sage_conn = nil
+sage_connected = false
+sage_rx = ''
+sage_txbuf = ''
+sage_last_try = 0
 mem_log_on = false
 mem_sample_t = 0
 mem_log_interval = 600
@@ -91,8 +101,11 @@ shop_sell_list = {}
 shop_autosell = false
 sell_anywhere = false
 shop_session = false
+loaded_since = 0    -- os.clock() when the client first became fully in-world (0 while loading); buffer counts from HERE
+AUTO_SETTLE = 15    -- seconds fully-in-world before ANY auto packet action fires, so nothing injects during/just after a load
 shop_sold = {}
 shop_pending_sell = nil
+shop_manual_until = 0
 drop_pending = nil
 drop_move_q = {}
 
@@ -369,6 +382,7 @@ end
 local TXBUF_MAX = 524288
 local function queue_send(data)
     if data and #txbuf < TXBUF_MAX then txbuf = txbuf .. data end
+    if data and sage_connected and #sage_txbuf < TXBUF_MAX then sage_txbuf = sage_txbuf .. data end
 end
 
 function ah_extract_all_icons()
@@ -528,8 +542,9 @@ local function build_inventory()
                         augpart = ',"aug":[' .. table.concat(ap, ',') .. ']'
                     end
                     local bzpart = (it.bazaar and it.bazaar > 0) and (',"bz":' .. it.bazaar) or ''  -- a nonzero bazaar price means it's listed on your bazaar
+                    local lkpart = (it.status and it.status ~= 0) and ',"lk":1' or ''  -- locked: equipped/bazaar/etc, can't be freely moved
                     slot_parts[#slot_parts + 1] =
-                        '{"s":' .. s .. ',"id":' .. it.id .. ',"c":' .. (it.count or 1) .. ',"n":"' .. esc(name) .. '"' .. usable .. fpart .. mspart .. augpart .. bzpart .. '}'
+                        '{"s":' .. s .. ',"id":' .. it.id .. ',"c":' .. (it.count or 1) .. ',"n":"' .. esc(name) .. '"' .. usable .. fpart .. mspart .. augpart .. bzpart .. lkpart .. '}'
                 end
             end
             local bname = bag.en or bag.english or bag.command or tostring(bag_id)
@@ -545,6 +560,19 @@ local function build_pool()
     local lots = nil
     local party = windower.ffxi.get_party()
     if party and party.p0 then lots = party.p0.lots end
+    -- One pass over the carry bags (inventory + satchel/sack/case + wardrobes): how many of each item id
+    -- this character holds. Feeds Sage's overlay "Owns (Rare)" lot guard + the held x N annotation without a
+    -- get_items call per pool item. Bag list is inlined to avoid adding a main-chunk local (200-limit).
+    local held = {}
+    for _, bag in ipairs({ 0, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16 }) do
+        local items = windower.ffxi.get_items(bag)
+        if type(items) == 'table' then
+            for s = 1, (items.max or 80) do
+                local it = items[s]
+                if type(it) == 'table' and it.id and it.id ~= 0 then held[it.id] = (held[it.id] or 0) + (it.count or 0) end
+            end
+        end
+    end
     local parts = {}
     for i = 0, 9 do
         local p = pool[i]
@@ -556,7 +584,7 @@ local function build_pool()
             local lotter_s = p.lotter and ('"' .. esc(p.lotter) .. '"') or 'null'
             parts[#parts + 1] = '{"i":' .. i .. ',"id":' .. p.id .. ',"n":"' .. esc(name) ..
                 '","ts":' .. (p.ts or 0) .. ',"lotter":' .. lotter_s .. ',"lot":' .. (p.lot or 0) ..
-                ',"mylot":' .. mylot_s .. '}'
+                ',"mylot":' .. mylot_s .. ',"held":' .. (held[p.id] or 0) .. ',"f":' .. item_flags(p.id) .. '}'
         end
     end
     return '{"t":"pool","items":[' .. table.concat(parts, ',') .. ']}\n'
@@ -637,7 +665,10 @@ local function build_slips()
                 if it and it.id and it.id ~= 0 then
                     if slips_lib.items[it.id] then slip_bag[it.id] = bag.id end
                     local sid = slips_lib.get_slip_id_by_item_id(it.id)
-                    if sid then
+                    -- Only offer gear that is actually free to store: skip equipped (5) / bazaared (25) pieces,
+                    -- which the game refuses to move anyway. Without this the count and Store-for-job list
+                    -- include the gear you are wearing.
+                    if sid and (it.status == nil or it.status == 0) then
                         storable[sid] = storable[sid] or {}
                         storable[sid][it.id] = (storable[sid][it.id] or 0) + (it.count or 1)
                     end
@@ -717,6 +748,7 @@ po_last_update = nil
 po_progress = nil
 po_progress_dirty = false
 po_consolidate_state = nil
+po_return_slips = {}   -- slip sid -> origin bag we pulled it from, to put back after the op
 porter_near = false
 porter_near_dirty = false
 sparks_near = false
@@ -764,6 +796,7 @@ local function po_consolidate(need, cb)
             if bag and po_space(0) > 0 then
                 pcall(windower.ffxi.get_item, bag, slot, count)
                 waiting[id] = true
+                if slips_lib.items[id] and bag ~= 0 then po_return_slips[id] = bag end -- a slip we pulled in; put it back after
             end
         end
     end
@@ -906,11 +939,33 @@ local function po_progress_update()
     po_progress_dirty = true
 end
 
+-- After a store/retrieve, put every slip we had to pull into inventory back where it came from, so bulk ops
+-- do not leave the slips scattered in inventory.
+function po_return_slips_now()
+    if not next(po_return_slips) then return end
+    for sid, origin in pairs(po_return_slips) do
+        local s_sid, s_origin = sid, origin
+        enqueue_fast(function()
+            local items = windower.ffxi.get_items(0)
+            if type(items) ~= 'table' then return end
+            for s = 1, (items.max or 0) do
+                local it = items[s]
+                if it and it.id == s_sid and it.id ~= 0 and (it.status == nil or it.status == 0) then
+                    pcall(windower.ffxi.move_item, 0, s_origin, it.slot or s, 1)
+                    return
+                end
+            end
+        end)
+    end
+    po_return_slips = {}
+end
+
 local function po_progress_done()
     if po_progress and po_progress.active then
         po_progress.active = false
         po_progress_dirty = true
     end
+    po_return_slips_now()
 end
 
 local function po_release_event(data, release)
@@ -1110,12 +1165,25 @@ local function enqueue_stack(bag)
 end
 
 local name_to_id_cache = nil
+name_to_ids_cache = nil   -- GLOBAL (kept off the main-chunk local cap): name -> { EVERY id sharing it }.
+-- Relic/mythic/empyrean weapons reuse one name across ~10 upgrade-tier ids (Apocalypse, Tizona, Aegis...).
+-- A name->single-id map lands a name-keyed rule (layout/keepQty/alwaysBring) on the last-seen tier, not the
+-- one the player owns, so their copy is silently unrouted. Resolve a name to ALL its ids instead.
 local function build_name_index()
     if name_to_id_cache then return name_to_id_cache end
     name_to_id_cache = {}
+    name_to_ids_cache = {}
     for id, item in pairs(res.items) do
-        if item.enl then name_to_id_cache[item.enl:lower()] = id end
-        if item.en then name_to_id_cache[item.en:lower()] = id end
+        local a = item.enl and item.enl:lower()
+        local b = item.en and item.en:lower()
+        if a then
+            name_to_id_cache[a] = id
+            local l = name_to_ids_cache[a]; if not l then l = {}; name_to_ids_cache[a] = l end; l[#l + 1] = id
+        end
+        if b then
+            name_to_id_cache[b] = id
+            if b ~= a then local l = name_to_ids_cache[b]; if not l then l = {}; name_to_ids_cache[b] = l end; l[#l + 1] = id end
+        end
     end
     return name_to_id_cache
 end
@@ -1145,8 +1213,10 @@ local function ids_for_name_entry(nm)
     if not low:find('*', 1, true) then
         local grp = TREASURE_GROUPS[low]
         if grp then return grp end
-        local id = build_name_index()[low]
-        return id and { id } or {}
+        build_name_index()
+        local all = name_to_ids_cache[low]
+        if all and #all > 0 then return all end
+        return {}
     end
     local pat = name_glob_to_pattern(low)
     local out = {}
@@ -2259,7 +2329,14 @@ local function trade_kind(kind) pcall(windower.packets.inject_outgoing, 0x33, st
 -- FFXI player names are a single capitalized word, so an exact get_mob_by_name is
 -- case-sensitive. Resolve a user-typed name to the nearby PC case-insensitively,
 -- with a prefix fallback so shorthand ("bay" -> "Bayld") also works.
-function resolve_pc_mob(name)
+function resolve_pc_mob(name, id)
+    -- Prefer the server ID when we have it: Witness Protection (and any display-name addon) rewrites the shown
+    -- NAME but never the entity ID, so an id lookup hits the right character even when this client shows a
+    -- different name than Alexandria's stored real name. Fall back to the name scan when no id / not found.
+    if id and tonumber(id) then
+        local m = windower.ffxi.get_mob_by_id(tonumber(id))
+        if m and m.id and not m.is_npc then return m end
+    end
     if type(name) ~= 'string' or name == '' then return nil end
     local norm = name:sub(1, 1):upper() .. name:sub(2):lower()
     local mob = windower.ffxi.get_mob_by_name(norm)
@@ -2280,9 +2357,9 @@ function resolve_pc_mob(name)
     return best
 end
 
-function trade_begin(name, items, gil)
+function trade_begin(name, items, gil, id)
     if not packets_ok or trade_tx then return end
-    local mob = resolve_pc_mob(name)
+    local mob = resolve_pc_mob(name, id)
     if not mob or not mob.id then alex_chat(207, '[Alexandria] trade: ' .. tostring(name) .. ' not nearby', 'error') return end
     if not mob.distance or math.sqrt(mob.distance) > 6 then alex_chat(207, '[Alexandria] trade: target out of range', 'error') return end
     local entries = trade_expand(items or {})
@@ -2559,6 +2636,8 @@ STORE_NEAREST_NAMES = { ['Waypoint'] = true, ['Proto-Waypoint'] = true }
 
 STORE_FIXED_NPCS = {
     ['Monisette'] = { zone = 246, id = 17784989, index = 157 },
+    ['Ruspix']    = { zone = 281, id = 17928266, index = 74 },
+    ['Coelestrox'] = { zone = 291, id = 17970039, index = 887 },
     ['Oboro']     = { zone = 246, id = 17784988, index = 156 },
     ['Paparoon']  = { zone = 53,  id = 16994398, index = 94 },
     ['Shami']     = { zone = 246, id = 17784905, index = 73 },
@@ -2648,9 +2727,10 @@ function store_save_discovered()
     end
 end
 
--- Fold a finished capture into store_discovered + STORE_FIXED_NPCS. Shared by the dev
--- `capture stop` and the user-facing `learn done`. Returns a summary table.
-function store_capture_commit(c)
+-- Fold a finished capture into store_discovered + STORE_FIXED_NPCS, and return a summary. Only
+-- `//ax learn done` commits; `//ax capture stop` passes no_commit=true because it is a pure packet
+-- recorder (reforge/misc trades) and must NEVER register the NPC as a storage location.
+function store_capture_commit(c, no_commit)
     local npcname = c.label or c.tname
     if not npcname and c.npc.id then local m = windower.ffxi.get_mob_by_id(c.npc.id); npcname = m and m.name end
     npcname = npcname or 'UnknownNPC'
@@ -2667,7 +2747,7 @@ function store_capture_commit(c)
     local item_names = {}
     for _, iid in ipairs(item_ids) do item_names[#item_names + 1] = (res.items[iid] and res.items[iid].en) or ('item ' .. iid) end
     local saved, added = false, 0
-    if eid and eidx and #item_ids > 0 then
+    if not no_commit and eid and eidx and #item_ids > 0 then
         local d = store_discovered[npcname]
         if type(d) ~= 'table' then d = { items = {} }; store_discovered[npcname] = d end
         d.zone, d.id, d.index = c.zone, eid, eidx
@@ -2897,8 +2977,38 @@ function store_finish()
         if r.traded and store_close_until == 0 then store_close_until = os.clock() + 6 end
         alex_chat(207, ('[Alexandria] Stored %d %s'):format(r.done or 0, r.name or 'item'), 'action')
         emit_store(false, r.id or 0, r.done or 0, r.want or 0, 'done')
+        if r.drop_extra and r.rem_ch then store_drop_arm(r.rem_ch, r.id) end
     end
     store_dirty = true
+end
+
+-- Drop Extra: after a Monisette / Rem's Tale store finishes, discard the un-storable remainder -- but
+-- ONLY once the 0x113 currency (which storing refreshes) confirms the chapter is genuinely at the 255
+-- cap, so we never toss items that failed to store for another reason (e.g. walking out of range). A
+-- short settle lets that currency land; the actual dropping rides the paced drain_drops queue. FIFO
+-- queued so a "Store All" spanning several chapters resolves each one independently.
+store_drop_q = {}
+
+function store_drop_arm(ch, id)
+    store_drop_q[#store_drop_q + 1] = { ch = ch, id = id, deadline = os.clock() + 1.2, hard = os.clock() + 4 }
+    currency_request()
+end
+
+function store_drop_tick()
+    local p = store_drop_q[1]
+    if not p then return end
+    if os.clock() < p.deadline then return end
+    if not rem_currency_ready() and os.clock() < p.hard then return end  -- wait for a fresh page, up to the hard cap
+    table.remove(store_drop_q, 1)
+    if rem_stored_count(p.ch) < 255 then return end        -- not at the cap: nothing is excess, never drop
+    local inv = windower.ffxi.get_items(0)
+    if type(inv) ~= 'table' then return end
+    for s = 1, (inv.max or 80) do
+        local it = inv[s]
+        if type(it) == 'table' and it.id == p.id and (it.count or 0) > 0 and it.status == 0 then
+            enqueue_drop(it.slot or s, p.id)
+        end
+    end
 end
 
 function store_menu_close()
@@ -2915,7 +3025,7 @@ function store_menu_close()
 end
 
 capture = nil
-CAPTURE_IDS = { [0x016] = 1, [0x01A] = 1, [0x032] = 1, [0x033] = 1, [0x034] = 1, [0x036] = 1, [0x04B] = 1, [0x052] = 1, [0x05B] = 1, [0x05C] = 1 }
+CAPTURE_IDS = { [0x016] = 1, [0x01A] = 1, [0x01E] = 1, [0x020] = 1, [0x032] = 1, [0x033] = 1, [0x034] = 1, [0x036] = 1, [0x04B] = 1, [0x052] = 1, [0x05B] = 1, [0x05C] = 1, [0x118] = 1 }
 
 function capture_record(dir, id, data)
     if not capture or not CAPTURE_IDS[id] then return end
@@ -2953,7 +3063,7 @@ function capture_record(dir, id, data)
     if #capture.events > 500 then table.remove(capture.events, 1) end
 end
 
-function store_begin(npc, id, want)
+function store_begin(npc, id, want, drop)
     if store_run then return end
     if not packets_ok then alex_chat(207, '[Alexandria] packets unavailable', 'error') return end
     local nid, nidx = store_find_npc(npc)
@@ -2963,6 +3073,15 @@ function store_begin(npc, id, want)
     if batch and batch > 1 then
         want = math.floor(want / batch) * batch
         if want < batch then alex_chat(207, ('[Alexandria] %s only accepts batches of %d'):format(npc, batch), 'error') return end
+    end
+    -- Drop Extra (Monisette / Rem's Tale only): cap the trade at the 255-per-chapter storage limit and
+    -- flag the run so the un-storable remainder is discarded once the store completes.
+    local rem_ch = nil
+    if drop and npc == 'Monisette' and id > REM_ITEM_BASE and id <= REM_ITEM_BASE + 10 then
+        rem_ch = id - REM_ITEM_BASE
+        currency_request()  -- refresh stored counts so the cap math is accurate
+        if rem_currency_ready() then want = math.min(want, math.max(0, 255 - rem_stored_count(rem_ch))) end
+        if want <= 0 then store_drop_arm(rem_ch, id) return end  -- already maxed: skip the store, just drop the excess
     end
     local r = res.items[id]
     local zinfo = windower.ffxi.get_info()
@@ -2979,21 +3098,22 @@ function store_begin(npc, id, want)
         store_count(id, { 0 }), store_count(id, store_noninv_bags()), tostring(packets_ok)))
     store_run = { npc = npc, npc_id = nid, npc_index = nidx, id = id, name = (r and r.en) or ('item ' .. id),
         want = want, done = 0, phase = 'trade', t = os.clock(), start = os.clock(),
-        batch_req = (batch and batch > 1) and batch or nil }
+        batch_req = (batch and batch > 1) and batch or nil,
+        drop_extra = rem_ch ~= nil, rem_ch = rem_ch }
     alex_chat(207, ('[Alexandria] Storing %s -> %s...'):format(store_run.name, npc), 'action')
     emit_store(true, id, 0, want, 'storing')
 end
 
-function store_enqueue(npc, id, want)
+function store_enqueue(npc, id, want, drop)
     if id == SPKEY_ID then gobbie_enqueue(npc, want) return end
     if store_run and store_run.npc == npc and store_run.id == id then return end
     for _, q in ipairs(store_q) do
-        if q.npc == npc and q.id == id then q.want = math.max(q.want, want) return end
+        if q.npc == npc and q.id == id then q.want = math.max(q.want, want); q.drop = q.drop or drop; return end
     end
     if store_run then
-        store_q[#store_q + 1] = { npc = npc, id = id, want = want }
+        store_q[#store_q + 1] = { npc = npc, id = id, want = want, drop = drop }
     else
-        store_begin(npc, id, want)
+        store_begin(npc, id, want, drop)
     end
 end
 
@@ -3003,7 +3123,7 @@ function store_tick(now)
             local nxt = table.remove(store_q, 1)
             store_close_until = 0
             store_released = false
-            store_begin(nxt.npc, nxt.id, nxt.want)
+            store_begin(nxt.npc, nxt.id, nxt.want, nxt.drop)
         end
         return
     end
@@ -3306,6 +3426,10 @@ end
 
 function shop_autosell_run()
     if not packets_ok then return end
+    -- Stand down while the player is hands-on the sell menu. FFXI's 0x085 confirm carries no
+    -- item; it sells whatever the last 0x084 appraise selected, and that slot is shared with
+    -- the client. Injecting a sell now could confirm the item they only meant to price-check.
+    if os.clock() < shop_manual_until then return end
     local inv = windower.ffxi.get_items(0)
     if not inv then return end
     local now = os.clock()
@@ -4243,6 +4367,7 @@ end
 
 function cfarm_sell(id)
     if not cfarm then return end
+    if os.clock() < shop_manual_until then return end
     local inv = windower.ffxi.get_items(0)
     if not inv then return end
     local now = os.clock()
@@ -4579,9 +4704,13 @@ function build_ah()
         .. ',"qn":' .. #ah_queue .. ',"slots":[' .. table.concat(parts, ',') .. ']}\n'
 end
 
--- Material-holding bags we scan + consolidate across (inventory + the common
--- storages). Wardrobes/temporary are excluded: they hold equipment, not mats.
-local ORGANIZE_SCAN = { 0, 1, 9, 2, 4, 5, 6, 7 }
+-- Bags we scan + consolidate across (inventory + the common storages). Wardrobes (8, 10-16) are included
+-- so per-item slot routing can send GEAR into them and see gear already inside; the scan only ever picks
+-- up stackables (wardrobes hold none) or items with an explicit layout target, and equipped/bazaar slots
+-- are skipped, so nothing else in a wardrobe is disturbed. do_move additionally refuses any non-equippable
+-- item into a wardrobe, so the general (materials) organize can never glitch junk into one.
+local ORGANIZE_SCAN = { 0, 1, 9, 2, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16 }
+ORG_WARDROBES = { [8] = true, [10] = true, [11] = true, [12] = true, [13] = true, [14] = true, [15] = true, [16] = true }   -- global: keep off the main-chunk local cap
 local ORG_PORTABLE_ORDER = { 5, 6, 7 }
 local ORG_DEEP_ORDER = { 1, 9, 2, 4 }
 
@@ -4590,13 +4719,22 @@ local function build_orgstatus()
         ',"total":' .. org_total .. ',"done":' .. org_done .. '}\n'
 end
 
-local function build_orgplan(plan, tname)
+local function build_orgplan(plan, tname, overflow)
     local parts = {}
     for _, st in ipairs(plan) do
         parts[#parts + 1] = '{"i":' .. st.i .. ',"id":' .. st.id .. ',"n":"' .. esc(st.n) ..
             '","c":' .. st.c .. ',"from":"' .. esc(st.from) .. '","to":"' .. esc(st.to) .. '"}'
     end
-    return '{"t":"' .. (tname or 'orgplan') .. '","steps":[' .. table.concat(parts, ',') .. ']}\n'
+    local ov = {}
+    if type(overflow) == 'table' then
+        for id, cnt in pairs(overflow) do
+            if type(cnt) == 'number' and cnt > 0 then
+                local nm = (res.items[id] and res.items[id].en) or ('Item ' .. id)
+                ov[#ov + 1] = '{"id":' .. id .. ',"n":"' .. esc(nm) .. '","c":' .. cnt .. '}'
+            end
+        end
+    end
+    return '{"t":"' .. (tname or 'orgplan') .. '","steps":[' .. table.concat(parts, ',') .. '],"overflow":[' .. table.concat(ov, ',') .. ']}\n'
 end
 
 local function org_step_done(i, ok)
@@ -4749,6 +4887,7 @@ local function do_organize(rules, preview)
 
     local plan = {}
     local touched = {}
+    local org_overflow = {}   -- id -> count that couldn't be placed in its routed bag (destination full)
     local function add_step(id, from, to, count)
         plan[#plan + 1] = { i = #plan, id = id, n = (res.items[id] and res.items[id].en or ('Item ' .. id)),
             c = count, from = bag_name(from), to = bag_name(to), _from = from, _to = to }
@@ -4759,6 +4898,17 @@ local function do_organize(rules, preview)
     -- vacate; destination only claims the NEW slots left after the incoming count
     -- merges into any partial stack already there.
     local function do_move(id, from, to, cnt)
+        -- HARD GATE: wardrobes only accept equipment. Refuse to move any item that has no equip slot into
+        -- one, regardless of how it got routed there (slot rule, tag rule, or explicit preset). res.items
+        -- .slots is the equip-slot bitmask; nil/0 = not equippable. Returns false so callers can try the
+        -- next target instead of counting a move that never happened.
+        if ORG_WARDROBES[to] then
+            -- Windower parses res.items[id].slots into a TABLE of equip-slot indices (e.g. {5}=body, {4}=head,
+            -- {1,0}=weapon); non-equippable items (materials/usables) have no slots table. Equippable = a
+            -- non-empty slots table. (Do NOT test it as a number -- that rejected every piece of gear.)
+            local r = res.items[id]
+            if not (r and type(r.slots) == 'table' and next(r.slots) ~= nil) then return false end
+        end
         add_step(id, from, to, cnt)
         local stack = (res.items[id] and res.items[id].stack) or 1
         local pf = (proj[from] and proj[from][id]) or 0
@@ -4770,6 +4920,7 @@ local function do_organize(rules, preview)
         proj[from] = proj[from] or {}; proj[from][id] = pf - cnt
         proj[to] = proj[to] or {}; proj[to][id] = pt + cnt
         touched[to] = true
+        return true
     end
 
     -- A storable bag with room. Consumables and AH-sellables prefer portable
@@ -4857,18 +5008,32 @@ local function do_organize(rules, preview)
             local targets = layout_map[id]
             local is_target = {}
             for _, t in ipairs(targets) do is_target[t] = true end
-            for bid, cnt in pairs(bags) do
-                if not is_target[bid] then
-                    local remaining = cnt
-                    for _, t in ipairs(targets) do
-                        if remaining <= 0 then break end
-                        local free = bag_free[t] or 0
-                        if free > 0 then
-                            local take = math.min(remaining, free * stack)
-                            if take > 0 then do_move(id, bid, t, take); remaining = remaining - take end
-                        end
+            -- Read the item's copies from the LIVE projected state (proj is kept in sync by do_move as the
+            -- plan is built), NOT the initial by_bag snapshot, so an item revisited on a later pass never
+            -- re-moves copies that already landed. Only the copies outside a target bag need to move.
+            local srcs = {}
+            for b, pc in pairs(proj) do
+                local c = pc[id]
+                if c and c > 0 and not is_target[b] then srcs[#srcs + 1] = { bag = b, cnt = c } end
+            end
+            if #srcs == 0 then touched[targets[1]] = true; return true end
+            -- Move whatever fits into the targets right now. If some copies still cannot fit because every
+            -- target is full THIS pass, return false so the multi-pass loop retries them AFTER other items
+            -- have vacated the target. That is what lets a full (80/80) wardrobe be emptied of its non-
+            -- matching gear first, then packed with the slot it is meant to hold -- in a single Organize run.
+            for _, s in ipairs(srcs) do
+                local remaining = s.cnt
+                for _, t in ipairs(targets) do
+                    if remaining <= 0 then break end
+                    if (bag_free[t] or 0) > 0 then
+                        local take = math.min(remaining, (bag_free[t] or 0) * stack)
+                        if take > 0 and do_move(id, s.bag, t, take) then remaining = remaining - take end
                     end
                 end
+            end
+            for b, pc in pairs(proj) do
+                local c = pc[id]
+                if c and c > 0 and not is_target[b] then return false end   -- still stuck outside a target: retry
             end
             touched[targets[1]] = true
             return true
@@ -4932,21 +5097,36 @@ local function do_organize(rules, preview)
         end
     end
 
-    -- Multi-pass: items that free space settle first; items waiting on a full
-    -- bag retry once it's been vacated. The plan is built in pass order, so at
-    -- run time the vacating moves execute before the moves that need the room.
+    -- Multi-pass: items that free space settle first; items waiting on a full bag retry once it has been
+    -- vacated. Loop while any pass still ADDS a move (an item that partially moved and returned false stays
+    -- unsettled and is retried, and the added steps prove space was freed somewhere). Bounded vs. a runaway.
     local ids = {}
     for id in pairs(by_bag) do ids[#ids + 1] = id end
-    local settled = {}
-    for _ = 1, 12 do
-        local progress = false
-        for _, id in ipairs(ids) do
-            if not settled[id] and plan_item(id) then
-                settled[id] = true
-                progress = true
+    -- layout_only restricts a sweep to routed GEAR (layout_map items). The storable/keep branches read the
+    -- initial by_bag SNAPSHOT rather than live proj, so re-running them across the staging rounds would
+    -- re-plan the same material moves every round (the duplicate Inventory->Storage steps that showed up as
+    -- "skipped"). The first sweep does the full organize; the staging rounds re-sweep gear only.
+    local function sweep(layout_only)
+        local settled = {}
+        for _ = 1, 40 do
+            local before = #plan
+            for _, id in ipairs(ids) do
+                if not settled[id] and (not layout_only or layout_map[id]) and plan_item(id) then settled[id] = true end
             end
+            if #plan == before then break end
         end
-        if not progress then break end
+    end
+    sweep(false)
+
+
+    -- Whatever gear still sits outside its routed bag is genuine overflow (target truly over capacity or a
+    -- deadlock that could not be broken); record it so the preview can warn "N won't fit".
+    for lid, ltargets in pairs(layout_map) do
+        local is_t = {}
+        for _, t in ipairs(ltargets) do is_t[t] = true end
+        local left = 0
+        for b, pc in pairs(proj) do local c = pc[lid]; if c and c > 0 and not is_t[b] then left = left + c end end
+        if left > 0 then org_overflow[lid] = left end
     end
 
     -- Organize all items: sweep any non-stackable, unprotected item out of the
@@ -4984,6 +5164,27 @@ local function do_organize(rules, preview)
         local bf = {}
         for _, bid in ipairs(ORGANIZE_SCAN) do bf[#bf + 1] = ('[%d]=%s'):format(bid, tostring(bag_free[bid])) end
         dbg[#dbg + 1] = 'bag_free: ' .. table.concat(bf, ' ')
+        -- DIAG: for each equippable piece in inventory, show whether it received a routing target and
+        -- made it into the move scan. layout=NONE means the desktop did not route it (slot map/category
+        -- miss); layout set but bybag=no means the move scan skipped it.
+        local inv0 = windower.ffxi.get_items(0)
+        if type(inv0) == 'table' then
+            local ng = 0
+            for s = 1, (inv0.max or 80) do
+                local it = inv0[s]
+                if type(it) == 'table' and it.id and it.id ~= 0 then
+                    ng = ng + 1
+                    if ng <= 30 then
+                        local r = res.items[it.id]
+                        dbg[#dbg + 1] = ('  inv#%d id=%d %s cat=%s slots=%s status=%s layout=%s'):format(
+                            s, it.id, (r and r.en or 'NO-RES-ENTRY'), (r and tostring(r.category) or '?'),
+                            (r and tostring(r.slots) or 'nil'), tostring(it.status),
+                            (layout_map[it.id] and table.concat(layout_map[it.id], ',') or 'n'))
+                    end
+                end
+            end
+            dbg[#dbg + 1] = ('  (items in inventory: %d)'):format(ng)
+        end
         dbg[#dbg + 1] = ('PLAN (%d steps):'):format(#plan)
         for _, st in ipairs(plan) do
             dbg[#dbg + 1] = ('  #%d %s x%d  %s(%d)->%s(%d)'):format(st.i, st.n, st.c, st.from, st._from, st.to, st._to)
@@ -4991,11 +5192,95 @@ local function do_organize(rules, preview)
         org_log_write(dbg)
     end
 
+    if org_debug then
+        -- Full machine-readable snapshot for the offline organize simulator: every movable item's real
+        -- metadata + position + resolved routing, the initial free-slot map, and the addon's OWN computed
+        -- plan (the faithfulness oracle). The simulator replays plan_item against this and must reproduce
+        -- `plan` exactly before any fix is trusted. Overwritten each preview.
+        local function jesc(s)
+            return (tostring(s):gsub('[%z\1-\31\\"]', function(c) return ('\\u%04x'):format(c:byte()) end))
+        end
+        local p = {}
+        p[#p + 1] = '{"ts":"' .. os.date('%Y-%m-%d %H:%M:%S') .. '",'
+        local sbj = {}
+        for _, b in ipairs(rules.storableBags or {}) do sbj[#sbj + 1] = tostring(b) end
+        p[#p + 1] = '"rules":{"storable":[' .. table.concat(sbj, ',') .. '],"portable":[5,6,7],"deep":[1,9,2,4],'
+            .. '"wardrobes":[8,10,11,12,13,14,15,16],"reserve":' .. reserve .. ',"storeUsable":' .. tostring(store_usable)
+            .. ',"strict":' .. tostring(strict_inventory) .. '},'
+        local bfj = {}
+        for _, bid in ipairs(ORGANIZE_SCAN) do bfj[#bfj + 1] = '"' .. bid .. '":' .. tostring(bag_free[bid] or 0) end
+        p[#p + 1] = '"bag_free":{' .. table.concat(bfj, ',') .. '},"items":['
+        local firstItem = true
+        for id, bags in pairs(by_bag) do
+            local r = res.items[id]
+            local slotsj = {}
+            if r and type(r.slots) == 'table' then for _, sv in ipairs(r.slots) do slotsj[#slotsj + 1] = tostring(sv) end end
+            local bbj = {}
+            for b, c in pairs(bags) do bbj[#bbj + 1] = '"' .. b .. '":' .. tostring(c) end
+            local lmj = {}
+            if layout_map[id] then for _, b in ipairs(layout_map[id]) do lmj[#lmj + 1] = tostring(b) end end
+            local equip = (r and type(r.slots) == 'table' and next(r.slots) ~= nil) and 'true' or 'false'
+            p[#p + 1] = (firstItem and '' or ',')
+                .. '{"id":' .. id .. ',"name":"' .. jesc(r and r.en or '?') .. '","stack":' .. tostring((r and r.stack) or 1)
+                .. ',"cat":"' .. jesc((r and r.category) or '?') .. '","ah":' .. tostring((r and tonumber(r.ah)) or 0)
+                .. ',"slots":[' .. table.concat(slotsj, ',') .. '],"equip":' .. equip
+                .. ',"bybag":{' .. table.concat(bbj, ',') .. '},"layout":[' .. table.concat(lmj, ',') .. ']'
+                .. ',"keepqty":' .. tostring(keepqty[id] or 0) .. ',"keep":' .. (keep[id] and 'true' or 'false')
+                .. ',"keepsingle":' .. (keepsingle[id] and 'true' or 'false') .. ',"always":' .. (always[id] and 'true' or 'false') .. '}'
+            firstItem = false
+        end
+        p[#p + 1] = '],"plan":['
+        for i, st in ipairs(plan) do
+            p[#p + 1] = (i == 1 and '' or ',') .. '{"i":' .. st.i .. ',"id":' .. (st.id or 0) .. ',"c":' .. st.c
+                .. ',"from":' .. st._from .. ',"to":' .. st._to .. '}'
+        end
+        p[#p + 1] = '],'
+        -- raw: EVERY occupied slot across scanned bags (with status), plus metadata for every id seen -- so the
+        -- analyzer can see pieces that never entered by_bag (unrouted gear that got no layout, or equipped
+        -- pieces). Those are exactly the ones that sit stuck in a wardrobe and never move.
+        p[#p + 1] = '"raw":['
+        local firstRaw = true
+        local seenMeta = {}
+        local metaParts = {}
+        for _, bid in ipairs(ORGANIZE_SCAN) do
+            local items = windower.ffxi.get_items(bid)
+            if type(items) == 'table' and items.enabled then
+                for s = 1, (items.max or 0) do
+                    local it = items[s]
+                    if it and it.id and it.id ~= 0 then
+                        p[#p + 1] = (firstRaw and '' or ',') .. '{"id":' .. it.id .. ',"bag":' .. bid .. ',"st":' .. tostring(it.status or 0) .. '}'
+                        firstRaw = false
+                        if not seenMeta[it.id] then
+                            seenMeta[it.id] = true
+                            local r = res.items[it.id]
+                            local slotsj = {}
+                            if r and type(r.slots) == 'table' then for _, sv in ipairs(r.slots) do slotsj[#slotsj + 1] = tostring(sv) end end
+                            local lmj = {}
+                            if layout_map[it.id] then for _, b in ipairs(layout_map[it.id]) do lmj[#lmj + 1] = tostring(b) end end
+                            local equip = (r and type(r.slots) == 'table' and next(r.slots) ~= nil) and 'true' or 'false'
+                            metaParts[#metaParts + 1] = '"' .. it.id .. '":{"name":"' .. jesc(r and r.en or '?')
+                                .. '","cat":"' .. jesc((r and r.category) or '?') .. '","slots":[' .. table.concat(slotsj, ',')
+                                .. '],"equip":' .. equip .. ',"layout":[' .. table.concat(lmj, ',') .. ']}'
+                        end
+                    end
+                end
+            end
+        end
+        p[#p + 1] = '],"allmeta":{' .. table.concat(metaParts, ',') .. '},"overflow":{'
+        local ovj = {}
+        for lid, n in pairs(org_overflow) do ovj[#ovj + 1] = '"' .. lid .. '":' .. tostring(n) end
+        p[#p + 1] = table.concat(ovj, ',') .. '}}'
+        local base = windower.addon_path .. 'debug'
+        if windower.dir_exists and not windower.dir_exists(base) then windower.create_dir(base) end
+        local f = io.open(base .. '/organize_snapshot.json', 'w')
+        if f then f:write(table.concat(p)); f:close() end
+    end
+
     -- Preview / dry-run: report the computed plan and bail before enqueuing any
     -- real moves. Uses a distinct feed so the desktop shows it in the Organize
     -- preview instead of driving the live-progress UI.
     if preview then
-        queue_send(build_orgplan(plan, 'orgpreview'))
+        queue_send(build_orgplan(plan, 'orgpreview', org_overflow))
         return
     end
 
@@ -5277,12 +5562,14 @@ local function dispatch(line)
         if org_active then
             alex_chat(207, '[Alexandria] organize already running', 'error')
         else
+            org_cache_rules(msg)
             do_organize(msg)
         end
     elseif msg.cmd == 'organizepreview' then
         -- Dry-run only: compute + report the plan, never move anything. A distinct
         -- command (not an 'organize' flag) so an out-of-date addon simply ignores it
         -- instead of running a real organize.
+        org_cache_rules(msg)
         do_organize(msg, true)
     elseif msg.cmd == 'localconsolidate' then
         do_local_consolidate(msg.bags)
@@ -5356,9 +5643,9 @@ local function dispatch(line)
     elseif msg.cmd == 'tradepcoffer' and type(msg.items) == 'table' then
         do_trade_pc_offer(msg.target, msg.items)
     elseif msg.cmd == 'augcape' then
-        aug_cape_start(msg.job, msg.material, msg.path, msg.repeats, msg.bag, msg.slot)
+        aug_cape_start(msg.job, msg.material, msg.path, msg.repeats, msg.bag, msg.slot, msg.confirm_mode)
     elseif msg.cmd == 'augcapeseq' then
-        aug_cape_seq_start(msg.job, msg.bag, msg.slot, msg.steps)
+        aug_cape_seq_start(msg.job, msg.bag, msg.slot, msg.steps, msg.confirm_mode)
     elseif msg.cmd == 'auggear' then
         aug_gear_start(msg)
     elseif msg.cmd == 'auginfo' then
@@ -5369,6 +5656,24 @@ local function dispatch(line)
         aug_manual_keep()
     elseif msg.cmd == 'augreroll' then
         aug_manual_reroll()
+    elseif msg.cmd == 'augstep' then
+        aug_step_continue()
+    elseif msg.cmd == 'reforge' then
+        rf_start(msg)
+    elseif msg.cmd == 'reforgestop' then
+        rf_stop()
+    elseif msg.cmd == 'reforgestep' then
+        rf_step_continue()
+    elseif msg.cmd == 'reforgecollect' then
+        rf_collect_start(msg)
+    elseif msg.cmd == 'reforgepause' then
+        rf_pause()
+    elseif msg.cmd == 'reforgeresume' then
+        rf_resume()
+    elseif msg.cmd == 'remget' and msg.chapter ~= nil then
+        rem_start(msg)
+    elseif msg.cmd == 'remstop' then
+        rem = nil
     elseif msg.cmd == 'bzopen' and msg.id and msg.index ~= nil then
         bz_open(tonumber(msg.id), tonumber(msg.index))
     elseif msg.cmd == 'bzrange' and msg.range ~= nil then
@@ -5411,7 +5716,7 @@ local function dispatch(line)
         if use_id then emit_use(false) end
         use_id = nil; use_left = 0; use_pending = nil
     elseif msg.cmd == 'store' and msg.npc and msg.id then
-        store_enqueue(tostring(msg.npc), tonumber(msg.id), math.max(1, tonumber(msg.want) or 1))
+        store_enqueue(tostring(msg.npc), tonumber(msg.id), math.max(1, tonumber(msg.want) or 1), msg.drop and true or false)
     elseif msg.cmd == 'storeadd' and msg.npc and type(msg.zone) == 'number' and msg.id and msg.index ~= nil then
         -- A store NPC learned on another character; register it here too (fleet sync).
         local items = {}
@@ -5473,7 +5778,7 @@ local function dispatch(line)
     elseif msg.cmd == 'npcselect' and msg.option ~= nil then
         npc_menu_select(tonumber(msg.option))
     elseif msg.cmd == 'trade' and msg.target then
-        trade_begin(tostring(msg.target), msg.items, msg.gil)
+        trade_begin(tostring(msg.target), msg.items, msg.gil, msg.id)
     elseif msg.cmd == 'tradewl_set' and type(msg.names) == 'table' then
         trade_wl = {}
         for _, nm in ipairs(msg.names) do if type(nm) == 'string' then trade_wl[nm] = true end end
@@ -5674,6 +5979,59 @@ local function poll_pending_connect(now)
     end
 end
 
+-- Sage master-overlay fan-out (parallel to the primary Alexandria-app connection). Non-blocking; a 50ms connect
+-- attempt every SAGE_RETRY is negligible when Sage is not running. Inbound lines run through the SAME socket-
+-- agnostic dispatch(), so pool lot/pass/lotall/droprules driven from Sage's overlay behave exactly like ours.
+function sage_disconnect()
+    if sage_conn then pcall(function() sage_conn:close() end) end
+    sage_conn = nil; sage_connected = false; sage_rx = ''; sage_txbuf = ''
+end
+
+function sage_try_connect()
+    local s = socket.tcp()
+    if not s then return end
+    s:settimeout(0.05)
+    local ok = s:connect(SAGE_HOST, SAGE_PORT)
+    if ok then
+        s:settimeout(0)
+        sage_conn = s
+        sage_connected = true
+        local me = windower.ffxi.get_player()
+        sage_txbuf = '{"t":"hello","app":"alexandria","char":"' .. esc((me and me.name) or '') .. '"}\n'
+        pool_dirty = true
+        pool_dirty_at = os.clock() - INV_DEBOUNCE   -- push the current pool to Sage promptly
+    else
+        pcall(function() s:close() end)
+    end
+end
+
+function sage_tick(now)
+    if not sage_connected then
+        if (now - sage_last_try) >= SAGE_RETRY then sage_last_try = now; sage_try_connect() end
+        return
+    end
+    local chunk, err, partial = sage_conn:receive('*a')
+    local data = chunk or partial
+    if data and #data > 0 then
+        sage_rx = sage_rx .. data
+        while true do
+            local nl = sage_rx:find('\n', 1, true)
+            if not nl then break end
+            local line = sage_rx:sub(1, nl - 1)
+            sage_rx = sage_rx:sub(nl + 1)
+            if #line > 0 then dispatch(line) end
+        end
+        if #sage_rx > TXBUF_MAX then sage_rx = '' end
+    end
+    if err == 'closed' then sage_disconnect(); return end
+    if #sage_txbuf > 0 then
+        local sent, serr, last = sage_conn:send(sage_txbuf)
+        local n = sent or last
+        if n and n > 0 then sage_txbuf = sage_txbuf:sub(n + 1) end
+        if serr == 'closed' then sage_disconnect(); return end
+    end
+end
+
 do
     local jobToCapeMap = {
         ['war'] = "Cichol's Mantle", ['mnk'] = "Segomo's Mantle", ['whm'] = "Alaunus's Cape",
@@ -5857,11 +6215,16 @@ do
     end
 
     local function aug_src_bags()
-        local b = { 5, 6, 7 }
+        local b = { 5, 6, 7 }   -- satchel/sack/case: reachable anywhere, always fair game
         local info = windower.ffxi.get_info()
         if info and info.mog_house then
             b[#b + 1] = 1; b[#b + 1] = 2; b[#b + 1] = 4; b[#b + 1] = 9
-        elseif info and info.zone and NOMAD_ZONES[info.zone] then
+        elseif info and info.zone and NOMAD_ZONES[info.zone] and (experimental_features or nomad_near) then
+            -- Nomad Moogle bags (safe/locker/safe2). Being in a nomad ZONE (e.g. Norg) is not the same as
+            -- standing AT the moogle, so honor the same contract as the rest of the app: zone-wide access
+            -- only with experimental features ON; otherwise require physical proximity (nomad_near, <=6y).
+            -- Without this, the augment path pulled Dark Matter from the Mog Locker across the zone with
+            -- experimental OFF and the user nowhere near the moogle.
             b[#b + 1] = 1; b[#b + 1] = 4; b[#b + 1] = 9
         end
         return b
@@ -6004,8 +6367,32 @@ do
 
     local function lc(v) return tostring(v or ''):lower() end
 
+    -- Passive ambuscade augment diagnostics: append a per-day log under debug/ambuscade/ so a material
+    -- loss (material spent but cape not augmented) can always be triaged after the fact. Observe-only;
+    -- globals (not locals) to stay under the main-chunk 200-local cap.
+    amb_dir_ready = false
+    function amb_log(line)
+        local base = windower.addon_path .. 'debug/ambuscade'
+        if not amb_dir_ready then
+            if windower.dir_exists and windower.create_dir then
+                if not windower.dir_exists(windower.addon_path .. 'debug') then windower.create_dir(windower.addon_path .. 'debug') end
+                if not windower.dir_exists(base) then windower.create_dir(base) end
+            end
+            amb_dir_ready = true
+        end
+        local ok, f = pcall(io.open, base .. '/' .. os.date('%Y-%m-%d') .. '.log', 'a')
+        if ok and f then f:write(('[%s] %s\n'):format(os.date('%H:%M:%S'), line)); f:close() end
+    end
+    function aug_sig_str(sig)
+        if type(sig) ~= 'table' then return '?' end
+        local t = {}
+        for i = 1, 5 do t[i] = tostring(sig[i] or 'none') end
+        return table.concat(t, ' | ')
+    end
+
     local function aug_fail(msg)
         aug = aug or {}
+        if aug.mode == 'Ambuscade' then amb_log(('FAIL: %s | done=%s/%s sig=[%s]'):format(tostring(msg), tostring(aug.done), tostring(aug.total), aug_sig_str(aug.cape_sig))) end
         aug.mode = aug.mode or 'Augment'
         aug.active = false
         aug.status = msg
@@ -6013,22 +6400,125 @@ do
         alex_chat(207, '[Alexandria] augment: ' .. msg, 'progress')
     end
 
-    local function cape_trade()
-        local ci
-        if aug.cape_slot then
-            local inv0 = windower.ffxi.get_items(0)
-            local it = inv0 and type(inv0) == 'table' and inv0[aug.cape_slot]
-            if type(it) == 'table' and it.id == aug.cape_id and it.id ~= 0 then ci = aug.cape_slot end
+    -- Money-critical identity + verification for Ambuscade cape augmenting. Two capes of the same item
+    -- id are told apart ONLY by their augment fingerprint (extdata); resolving by id alone augments the
+    -- wrong (often blank) duplicate and silently burns expensive materials. Globals, not locals, to
+    -- stay under Lua's 200 main-chunk local cap; they capture extdata/extdata_ok/lc as upvalues.
+
+    -- Canonical per-slot augment token. A never-augmented cape decodes with NO augments table at all;
+    -- nil / '' / 'none' all collapse to 'none' so a fresh 0-augment cape reads as a valid (empty)
+    -- fingerprint instead of an unreadable one, while augmented duplicates still fingerprint distinctly.
+    function aug_slot_token(a)
+        a = lc(tostring(a or 'none'))
+        if a == '' then a = 'none' end
+        return a
+    end
+
+    function aug_cape_sig_at(bag, slot, cape_id)
+        if not extdata_ok or not cape_id or not bag or not slot then return nil end
+        local items = windower.ffxi.get_items(bag)
+        local it = items and type(items) == 'table' and items[slot]
+        if not (type(it) == 'table' and it.id == cape_id and it.id ~= 0 and it.extdata) then return nil end
+        local ok, dec = pcall(extdata.decode, it)
+        if not (ok and dec) then return nil end
+        local s = {}
+        for i = 1, 5 do s[i] = aug_slot_token(dec.augments and dec.augments[i]) end
+        return s
+    end
+
+    -- Slot whose cape fingerprint equals sig exactly. Returns slot, matchCount (0 = not present).
+    function aug_cape_find(cape_id, sig)
+        if not extdata_ok or not sig then return nil, 0 end
+        local inv = windower.ffxi.get_items(0)
+        if not inv then return nil, 0 end
+        local slot, n = nil, 0
+        for s = 1, (inv.max or 80) do
+            local it = inv[s]
+            if type(it) == 'table' and it.id == cape_id and it.id ~= 0 and it.extdata then
+                local ok, dec = pcall(extdata.decode, it)
+                if ok and dec then
+                    local same = true
+                    for i = 1, 5 do if aug_slot_token(dec.augments and dec.augments[i]) ~= sig[i] then same = false break end end
+                    if same then slot = it.slot or s; n = n + 1 end
+                end
+            end
         end
-        if not ci then ci = find_slot(aug.cape_id) end
+        return slot, n
+    end
+
+    -- After a roll our cape matches `sig` on every slot except `changed`, which must have advanced.
+    -- Re-locates our exact cape even if it returned to a different inventory slot. Returns slot, newSig.
+    function aug_cape_find_advanced(cape_id, sig, changed)
+        if not extdata_ok or not sig then return nil end
+        local inv = windower.ffxi.get_items(0)
+        if not inv then return nil end
+        for s = 1, (inv.max or 80) do
+            local it = inv[s]
+            if type(it) == 'table' and it.id == cape_id and it.id ~= 0 and it.extdata then
+                local ok, dec = pcall(extdata.decode, it)
+                if ok and dec then
+                    local cur, good = {}, true
+                    for i = 1, 5 do cur[i] = aug_slot_token(dec.augments and dec.augments[i]) end
+                    for i = 1, 5 do
+                        if i == changed then if cur[i] == sig[i] then good = false break end
+                        elseif cur[i] ~= sig[i] then good = false break end
+                    end
+                    if good then return it.slot or s, cur end
+                end
+            end
+        end
+        return nil
+    end
+
+    local function cape_trade()
+        -- Before trading (and burning) another material, confirm the PREVIOUS roll actually landed on
+        -- OUR cape. If it did not advance, or the cape can't be found, stop cold -- the safety net that
+        -- makes it impossible to silently burn a stack.
+        if aug.verify_pending then
+            local slot, cur = aug_cape_find_advanced(aug.cape_id, aug.cape_sig, aug.verify_slot)
+            if slot then
+                amb_log(('VERIFY landed | %s | [%s] -> [%s]'):format(tostring(aug.cape_material), aug_sig_str(aug.cape_sig), aug_sig_str(cur)))
+                aug.cape_sig = cur; aug.cape_slot = slot; aug.verify_pending = false; aug.wait_since = nil
+            else
+                aug.wait_since = aug.wait_since or os.clock()
+                if (os.clock() - aug.wait_since) > 12 then
+                    local now_mat = count_in_bag(aug.mat_id, 0)
+                    local spent = (aug.trade_mat_count or now_mat) - now_mat
+                    amb_log(('VERIFY FAILED (12s) | %s slot did NOT advance | matAtTrade=%s matNow=%d spent=%d sig=[%s]%s'):format(
+                        tostring(aug.cape_material), tostring(aug.trade_mat_count), now_mat, spent, aug_sig_str(aug.cape_sig),
+                        spent > 0 and '  <<< MATERIAL LOST: spent but cape unchanged' or ''))
+                    if aug_cape_find(aug.cape_id, aug.cape_sig) then
+                        aug_fail(('augment did not apply (%s unchanged); stopped to protect materials'):format(aug.cape_material or '?'))
+                    else
+                        aug_fail('lost track of the cape after augmenting; stopped to protect materials')
+                    end
+                end
+                return
+            end
+        end
+        -- Resolve OUR exact cape by fingerprint -- never first-match by id.
+        local ci = aug_cape_find(aug.cape_id, aug.cape_sig)
+        if not ci then
+            aug.wait_since = aug.wait_since or os.clock()
+            if (os.clock() - aug.wait_since) > 12 then aug_fail('selected cape not found in inventory; stopped') end
+            return
+        end
+        aug.wait_since = nil
+        aug.cape_slot = ci
         local mi = find_slot(aug.mat_id)
-        if not ci or not mi then aug_fail('cape or material left inventory') return end
+        if not mi then aug_fail('material left inventory') return end
+        aug.verify_slot = aug.mat_slot
+        aug.trade_mat_count = count_in_bag(aug.mat_id, 0)
+        amb_log(('TRADE roll %d/%d | mat=%s(%d) haveInInv=%d capeSlot=%d verifySlot=%s opt=%d sig=[%s]'):format(
+            (aug.done or 0) + 1, aug.total or 1, tostring(aug.cape_material), aug.mat_id, aug.trade_mat_count, ci, tostring(aug.mat_slot), aug.first_time and 512 or 256, aug_sig_str(aug.cape_sig)))
         packets.inject(packets.new('outgoing', 0x036, {
             ['Target'] = aug.npc_id, ['Target Index'] = aug.npc_index,
             ['Item Count 1'] = 1, ['Item Count 2'] = 1,
             ['Item Index 1'] = ci, ['Item Index 2'] = mi, ['Number of Items'] = 2,
         }))
         aug.awaiting = true
+        aug.verify_pending = true
+        aug.last_progress = os.clock()   -- the response watchdog starts at THIS trade, not the prior one
     end
 
     local function cape_confirm()
@@ -6055,7 +6545,15 @@ do
             if type(it) == 'table' and it.id == aug.item_id and it.id ~= 0 then gi = aug.item_slot end
         end
         if not gi then gi = find_slot(aug.item_id) end
-        if not gi then aug_fail('gear left inventory') return end
+        if not gi then
+            -- The gear briefly leaves inventory during each reforge (traded out, augmented, then
+            -- returned a moment later). Don't abort on that transient gap -- with a 0s delay the next
+            -- trade can fire before the item is back. Wait for it, and only fail if it never returns.
+            aug.gear_gone_since = aug.gear_gone_since or now
+            if (now - aug.gear_gone_since) > 15 then aug_fail('gear left inventory') end
+            return
+        end
+        aug.gear_gone_since = nil
         local fields
         if aug.mode == 'Geas Fete' and not aug.paid then
             -- free daily roll: trade the gear alone to open the roll menu
@@ -6201,6 +6699,7 @@ do
             else
                 reject_npc()
                 aug.awaiting = false
+                aug.last_trade = os.clock()  -- measure the next-trade delay from now, so the gear has time to return
             end
         end
         aug_dirty = true
@@ -6235,15 +6734,12 @@ do
         if not aug or not aug.active or not aug.await_decision then return end
         aug.await_decision = false
         aug.active = false
-        if aug.results and any_match(aug.results) then
-            aug.status = 'Kept roll ' .. (aug.attempts or 0)
-            pcall(accept_npc)
-            alex_chat(207, '[Alexandria] kept roll: ' .. results_text(aug.results or {}), 'progress')
-        else
-            aug.status = 'Rejected (no match)'
-            pcall(reject_npc)
-            alex_chat(207, '[Alexandria] roll did not match; rejected, kept previous augments', 'progress')
-        end
+        -- Keep means keep THIS roll, always. Manual mode exists so the user decides per roll, so Keep must
+        -- accept unconditionally -- never gate on any_match, or a keep with no criteria set (all "(any)")
+        -- would reject the very roll the user chose to keep.
+        aug.status = 'Kept roll ' .. (aug.attempts or 0)
+        pcall(accept_npc)
+        alex_chat(207, '[Alexandria] kept roll: ' .. results_text(aug.results or {}), 'progress')
         aug_dirty = true
     end
 
@@ -6265,6 +6761,47 @@ do
         else
             reject_npc()
             aug.awaiting = false
+        end
+        aug_dirty = true
+    end
+
+    -- Advance a multi-cape sequence to the next step (pull its material, re-prep). Global to stay under
+    -- Lua's 200 main-chunk local cap; captures aug_pull_mat / aug_fail as upvalues.
+    function aug_advance_step()
+        aug.step_index = aug.step_index + 1
+        local st = aug.steps[aug.step_index]
+        aug.mat_id = st.mat_id
+        aug.path_index = st.path_index
+        aug.cape_material = st.material
+        aug.mat_slot = ({ thread = 1, dust = 2, dye = 3, sap = 4, resin = 5 })[st.material]
+        aug.total = st.total
+        aug.done = 0
+        aug.attempts = 0
+        aug.delay = (st.material == 'dye') and 2 or 1
+        if not aug_pull_mat(st.mat_id, st.total) then
+            aug_fail('material unavailable for step ' .. aug.step_index)
+            aug_dirty = true
+            return
+        end
+        aug.prep = true
+        aug.prep_deadline = os.clock() + 15
+        aug.status = 'Step ' .. aug.step_index .. '/' .. #aug.steps
+        aug.next_at = 0
+    end
+
+    -- Maximum-safety mode: after each roll the loop pauses (await_step) so the user can see the result
+    -- before another material is spent. Continue fires the next roll (or advances to the next sequence
+    -- step when the current step's repeats are done); Stop is the normal augstop.
+    function aug_step_continue()
+        if not aug or not aug.active or not aug.await_step then return end
+        aug.await_step = false
+        aug.last_progress = os.clock()   -- time spent reviewing is NOT a stall; restart the watchdog
+        aug.wait_since = nil
+        if aug.advance_on_continue then
+            aug.advance_on_continue = false
+            aug_advance_step()
+        else
+            aug.next_at = 0        -- resume: fire the next roll of the current step
         end
         aug_dirty = true
     end
@@ -6309,7 +6846,7 @@ do
             if a.return_bag and not a.returned then aug_return(now) end
             return
         end
-        if not a.await_decision and (a.awaiting or a.menu) and (now - (a.last_progress or now)) > AUG_STALL then
+        if not a.await_decision and not a.await_step and (a.awaiting or a.menu) and (now - (a.last_progress or now)) > AUG_STALL then
             if a.mode ~= 'Geas Fete' and a.mode ~= 'Ambuscade' and a.item_id and find_slot(a.item_id) and (a.stall_retries or 0) < 2 then
                 a.awaiting = false
                 a.last_progress = now
@@ -6322,11 +6859,12 @@ do
         end
         if a.mode == 'Ambuscade' then
             if a.prep then
+                -- Readiness gate only: any copy of the cape present + materials pulled. cape_trade
+                -- resolves the EXACT instance by fingerprint. (After a step, cape_sig lags one roll, so
+                -- aug_cape_find would miss the just-advanced cape here -- use find_slot for the gate.)
                 if find_slot(a.cape_id) and count_in_bag(a.mat_id, 0) >= (a.total or 1) then
-                    if not a.cape_slot then a.cape_slot = find_slot(a.cape_id) end
-                    local augs = read_cape_augs(a.cape_id, a.cape_slot)
-                    local slot = ({ thread = 1, dust = 2, dye = 3, sap = 4, resin = 5 })[a.cape_material]
-                    a.first_time = not (slot and augs[slot] and lc(augs[slot]) ~= 'none')
+                    a.mat_slot = ({ thread = 1, dust = 2, dye = 3, sap = 4, resin = 5 })[a.cape_material]
+                    a.first_time = a.cape_sig[a.mat_slot] == 'none'
                     a.prep = false
                     a.status = a.multi and ('Step ' .. (a.step_index or 1) .. '/' .. #a.steps) or 'Augmenting'
                     aug_dirty = true
@@ -6336,6 +6874,21 @@ do
                 else
                     return
                 end
+            end
+            if a.await_step then
+                -- Paused for review: never trade while paused. But do confirm the just-finished roll
+                -- actually landed on OUR cape, which refreshes cape_sig/slot so the streamed result
+                -- reflects the post-roll augments (the cape often changes slot during the trade).
+                -- Throttled to once a second so a non-landing roll doesn't rescan inventory every frame.
+                if a.verify_pending and now >= (a.verify_next or 0) then
+                    a.verify_next = now + 1
+                    local slot, cur = aug_cape_find_advanced(a.cape_id, a.cape_sig, a.verify_slot)
+                    if slot then
+                        a.cape_sig = cur; a.cape_slot = slot; a.verify_pending = false; a.wait_since = nil
+                        aug_dirty = true
+                    end
+                end
+                return
             end
             if not a.awaiting and ready_status() and now >= (a.next_at or 0) then
                 a.next_at = now + 6
@@ -6366,39 +6919,51 @@ do
         if aug.mode == 'Ambuscade' then
             if id == 0x034 or id == 0x032 then
                 local ok, p = pcall(packets.parse, 'incoming', data)
-                if ok and p and p['Menu ID'] then aug.menu = p['Menu ID'] end
+                if not (ok and p) then return nil end
+                -- Only the augment NPC's own menu event may drive the loop; a stray 0x032/0x034 must
+                -- not fire a confirm or advance the counter (that desyncs the menu and wastes a trade).
+                if p['NPC Index'] ~= nil and p['NPC Index'] ~= aug.npc_index then return nil end
+                if p['Menu ID'] then aug.menu = p['Menu ID'] end
                 aug.awaiting = false
                 aug.last_progress = os.clock()
                 cape_confirm()
                 aug.done = (aug.done or 0) + 1
                 aug.attempts = aug.done
-                if aug.done >= aug.total then
-                    if aug.multi and aug.step_index < #aug.steps then
-                        aug.step_index = aug.step_index + 1
-                        local st = aug.steps[aug.step_index]
-                        aug.mat_id = st.mat_id
-                        aug.path_index = st.path_index
-                        aug.cape_material = st.material
-                        aug.total = st.total
-                        aug.done = 0
-                        aug.attempts = 0
-                        aug.delay = (st.material == 'dye') and 2 or 1
-                        local ok = aug_pull_mat(st.mat_id, st.total)
-                        if not ok then
-                            aug_fail('material unavailable for step ' .. aug.step_index)
-                            aug_dirty = true
-                            return true
-                        end
-                        aug.prep = true
-                        aug.prep_deadline = os.clock() + 15
-                        aug.status = 'Step ' .. aug.step_index .. '/' .. #aug.steps
-                        aug.next_at = 0
-                    else
-                        aug.active = false
-                        aug.status = 'Done'
-                        aug.next_at = 0
-                        alex_chat(207, '[Alexandria] cape augmenting complete', 'progress')
-                    end
+                amb_log(('ROLL confirmed %d/%d | menu=0x%X'):format(aug.done, aug.total or 1, aug.menu or 0))
+                local step_done = aug.done >= (aug.total or 1)
+                local more_steps = aug.multi and aug.step_index < #aug.steps
+                local cm = aug.confirm_mode or 'none'
+                if step_done and not more_steps then
+                    aug.active = false
+                    aug.status = 'Done'
+                    aug.next_at = 0
+                    amb_log(('DONE | %d/%d complete | final sig=[%s]'):format(aug.done, aug.total or 1, aug_sig_str(aug.cape_sig)))
+                    alex_chat(207, '[Alexandria] cape augmenting complete', 'progress')
+                elseif cm == 'step' then
+                    -- "Each Step" = full safety: pause after EVERY individual roll so the user reviews the
+                    -- result (read live from the cape's extdata) before another material is spent. Continue
+                    -- fires the next roll, or advances to the next path when this path's rolls are done.
+                    -- (aug.step_index/#aug.steps = the PATH index; aug.done/aug.total = rolls in the path.)
+                    aug.await_step = true
+                    aug.awaiting = false
+                    aug.next_at = 0
+                    aug.advance_on_continue = step_done and more_steps
+                    aug.status = (step_done and more_steps)
+                        and ('Path %d/%d done -- confirm to continue'):format(aug.step_index, #aug.steps)
+                        or ('Step %d/%d done -- confirm to continue'):format(aug.done, aug.total)
+                    aug_dirty = true
+                    return true
+                elseif step_done and cm == 'path' then
+                    -- "Each Path" = some safety: pause only at each path boundary (after all of a path's rolls).
+                    aug.await_step = true
+                    aug.awaiting = false
+                    aug.next_at = 0
+                    aug.advance_on_continue = true
+                    aug.status = ('Path %d/%d done -- confirm to continue'):format(aug.step_index, #aug.steps)
+                    aug_dirty = true
+                    return true
+                elseif step_done then
+                    aug_advance_step()
                 elseif aug.multi then
                     aug.status = 'Step ' .. aug.step_index .. '/' .. #aug.steps .. ' (' .. aug.done .. '/' .. aug.total .. ')'
                     aug.next_at = os.clock() + aug.delay
@@ -6461,7 +7026,7 @@ do
         return nil
     end
 
-    function aug_cape_start(job, material, path, repeats, bag, slot)
+    function aug_cape_start(job, material, path, repeats, bag, slot, confirm_mode)
         if not packets_ok then return end
         job = lc(job)
         material = lc(material)
@@ -6536,16 +7101,19 @@ do
                 end
             end
         end
-        local first_time = true
-        if not prep then
-            local augs = read_cape_augs(cape_id, cape_slot)
-            local slot = ({ thread = 1, dust = 2, dye = 3, sap = 4, resin = 5 })[material]
-            first_time = not (slot and augs[slot] and lc(augs[slot]) ~= 'none')
-        end
+        -- Fingerprint the EXACT selected cape now (before any wardrobe move), so we can always relocate
+        -- that specific instance among duplicates and never augment the wrong (blank) one.
+        local sel_sig = aug_cape_sig_at(sb, ss, cape_id)
+        if not sel_sig then aug_fail("could not read the selected cape's augments (need extdata); cannot safely target it among duplicates") return end
+        local mat_slot = ({ thread = 1, dust = 2, dye = 3, sap = 4, resin = 5 })[material]
+        if not mat_slot then aug_fail('unknown material') return end
+        local first_time = sel_sig[mat_slot] == 'none'
         aug = {
             mode = 'Ambuscade', active = true, attempts = 0, done = 0,
             total = total_rolls,
             cape_id = cape_id, cape_slot = cape_slot, mat_id = mat_id, path_index = path_index, cape_material = material,
+            cape_sig = sel_sig, mat_slot = mat_slot, verify_pending = false,
+            confirm_mode = (confirm_mode == 'step' or confirm_mode == 'path') and confirm_mode or 'none',
             npc_id = aug_npc_id, npc_index = aug_npc_index, npc_name = 'Gorpa-Masorpa', menu = 0x183,
             zone = (windower.ffxi.get_info() or {}).zone or 0,
             first_time = first_time, next_at = 0, delay = (material == 'dye') and 2 or 1,
@@ -6554,10 +7122,12 @@ do
             status = prep and 'Moving to inventory' or 'Augmenting',
         }
         aug_dirty = true
+        amb_log(('START single | %s(%d) bag=%s slot=%s sig=[%s] mat=%s x%d confirm=%s'):format(
+            cape_name, cape_id, tostring(bag), tostring(slot), aug_sig_str(sel_sig), material, total_rolls, tostring(aug.confirm_mode)))
         alex_chat(207, '[Alexandria] augmenting ' .. cape_name .. ' x' .. aug.total, 'progress')
     end
 
-    function aug_cape_seq_start(job, bag, slot, steps)
+    function aug_cape_seq_start(job, bag, slot, steps, confirm_mode)
         if not packets_ok then return end
         if type(steps) ~= 'table' or #steps == 0 then aug_fail('no steps') return end
         job = lc(job)
@@ -6627,17 +7197,19 @@ do
         local ok, mprep = aug_pull_mat(first.mat_id, first.total)
         if not ok then aug_fail('material unavailable') return end
         if mprep then prep = true end
-        local first_time = true
-        if not prep then
-            local augs = read_cape_augs(cape_id, cape_slot)
-            local fslot = ({ thread = 1, dust = 2, dye = 3, sap = 4, resin = 5 })[first.material]
-            first_time = not (fslot and augs[fslot] and lc(augs[fslot]) ~= 'none')
-        end
+        -- Fingerprint the EXACT selected cape now (before any wardrobe move); see aug_cape_start.
+        local sel_sig = aug_cape_sig_at(sb, ss, cape_id)
+        if not sel_sig then aug_fail("could not read the selected cape's augments (need extdata); cannot safely target it among duplicates") return end
+        local fslot = ({ thread = 1, dust = 2, dye = 3, sap = 4, resin = 5 })[first.material]
+        if not fslot then aug_fail('unknown material') return end
+        local first_time = sel_sig[fslot] == 'none'
         aug = {
             mode = 'Ambuscade', multi = true, steps = norm, step_index = 1,
             active = true, attempts = 0, done = 0, total = first.total,
             cape_id = cape_id, cape_slot = cape_slot, mat_id = first.mat_id,
             path_index = first.path_index, cape_material = first.material,
+            cape_sig = sel_sig, mat_slot = fslot, verify_pending = false,
+            confirm_mode = (confirm_mode == 'step' or confirm_mode == 'path') and confirm_mode or 'none',
             npc_id = aug_npc_id, npc_index = aug_npc_index, npc_name = 'Gorpa-Masorpa', menu = 0x183,
             zone = (windower.ffxi.get_info() or {}).zone or 0,
             first_time = first_time, next_at = 0, delay = (first.material == 'dye') and 2 or 1,
@@ -6646,6 +7218,12 @@ do
             status = prep and 'Moving to inventory' or ('Step 1/' .. #norm),
         }
         aug_dirty = true
+        do
+            local matdesc = {}
+            for _, s in ipairs(norm) do matdesc[#matdesc + 1] = s.material .. ' x' .. s.total end
+            amb_log(('START multi | %s(%d) bag=%s slot=%s sig=[%s] paths=[%s] confirm=%s'):format(
+                cape_name, cape_id, tostring(bag), tostring(slot), aug_sig_str(sel_sig), table.concat(matdesc, ', '), tostring(aug.confirm_mode)))
+        end
         alex_chat(207, '[Alexandria] multi-augmenting ' .. cape_name .. ' (' .. #norm .. ' steps)', 'progress')
     end
 
@@ -6791,6 +7369,7 @@ do
             '"status":"' .. esc(a.status or '') .. '"',
             '"manual":' .. (a.manual and 'true' or 'false'),
             '"awaitDecision":' .. (a.await_decision and 'true' or 'false'),
+            '"awaitStep":' .. (a.await_step and 'true' or 'false'),
         }
         if a.multi then
             parts[#parts + 1] = '"multi":true'
@@ -6813,13 +7392,10 @@ do
             local inv0 = windower.ffxi.get_items(0)
             local it = a.cape_slot and type(inv0) == 'table' and inv0[a.cape_slot]
             if not (type(it) == 'table' and it.id == a.cape_id and it.id ~= 0) then
+                -- Locate OUR pinned cape by fingerprint, never a first-match duplicate.
                 it = nil
-                if type(inv0) == 'table' then
-                    for s = 1, (inv0.max or 80) do
-                        local x = inv0[s]
-                        if type(x) == 'table' and x.id == a.cape_id and x.id ~= 0 then it = x break end
-                    end
-                end
+                local s = a.cape_sig and aug_cape_find(a.cape_id, a.cape_sig)
+                if s and type(inv0) == 'table' then it = inv0[s] end
             end
             local augs = it and decode_item_augments(it)
             if augs then for _, s in ipairs(augs) do cur[#cur + 1] = '"' .. esc(s) .. '"' end end
@@ -7169,14 +7745,798 @@ do
     end
 end
 
+-- ==================== Reforge executor (Monisette / Coelestrox / Aurix) ====================
+-- Trade the input piece + all ingredients in ONE 0x036, wait until the piece is ready (next Vana'diel
+-- midnight, with a fixed-1h fallback/cap), then collect by Talking (0x01A ActionID 0) and reading the
+-- returned menu id: 0x182=ready (collect), 0x183=still working (exit + keep waiting). Every confirm is
+-- 0x05B option 0 with Zone=EventNum and Menu ID=EventPara = the received menu. Sequential queue.
+-- Reuses the augment injector's proven 0x036/0x05B pattern. Globals to respect the main-chunk local cap.
+-- NOTE (2026-08-19): V1 built from captures, NOT yet drive-tested. Moves real materials over ~1h cycles.
+rf = nil
+rf_dirty = false
+rf_last_frame = nil        -- last reforge frame string actually sent, so we can diff and emit on ANY change
+rf_paused = nil            -- a paused queue saved to disk for THIS character (survives leaving/reload)
+rf_paused_checked = false  -- have we tried loading the paused file yet (once the player is known)
+-- Per-NPC "ready to collect" menu id (from //ax captures). Talk returns this menu when the piece is
+-- done; any other menu = still working -> option 0 exits and we keep waiting. Trade-confirm and the
+-- not-ready exit are menu-agnostic (we echo whatever menu came back), so only this must be known per
+-- NPC. "???" is the Relic +2/+3 reforge moogle in Ru'Lude Gardens (trade menu 0xBBD, collect 0xBBE);
+-- both its tiers are single-trade so one ready menu covers them.
+RF_READY_MENU = { Monisette = 0x182, Ruspix = 0x4B, Coelestrox = 0x1E, ['???'] = 0xBBE }
+-- Fixed locations for reforge NPCs whose name must NOT live in STORE_FIXED_NPCS. The storage module
+-- iterates STORE_FIXED_NPCS by nearby-mob name (any mob named "???" would match and pollute the Storage
+-- panel), and the same physical NPC already serves a separate Storage role as 'Aurix' (Imperial cards).
+-- Keeping the reforge location here keeps the two features fully separated.
+RF_NPC_FIXED = { ['???'] = { zone = 243, id = 17772865, index = 321 } }
+-- Per-NPC trade-confirm option (the 0x05B option chosen on the menu that opens right after the 0x036
+-- trade). Most NPCs confirm with option 0; Coelestrox's menu (0x1C) confirms the reforge with option 1.
+RF_TRADE_OPTION = { Coelestrox = 1 }
+-- Multi-day reforges (Coelestrox AF +2->+3) split into steps where the non-final steps ADVANCE instead of
+-- collect: after that day cooks, talk returns this "advance" menu, and choosing this option carries the
+-- piece to the next day WITHOUT returning an item. The final step collects normally (RF_READY_MENU).
+RF_ADVANCE_MENU = { Coelestrox = 0x1D }
+RF_ADVANCE_OPTION = { Coelestrox = 2 }
+
+-- Rem's Tale chapter retrieval from Monisette (she uniquely stores them; they are Empyrean reforge
+-- ingredients). Captured sequence: talk (0x01A) -> menu 0x181 (0x034) -> EVENTEND (0x05B) whose option
+-- packs low byte = chapter (1-10) and high byte = quantity -> the chapters (item id 4063+chapter) are
+-- assigned (0x020). One sequence withdraws the whole requested quantity (captures only ever took 1).
+rem = nil
+REM_MENU = 0x181
+REM_ITEM_BASE = 4063  -- Rem's Tale Ch.N item id = REM_ITEM_BASE + N (Ch.1 = 4064 ... Ch.10 = 4073)
+
+function rf_active() return rf ~= nil and rf.active end
+
+function rf_ready_at(trade_time, timing)
+    local hard = trade_time + 3600                          -- fixed 1h fallback / conservative mode
+    if timing == 'fixed' then return hard end
+    local into_day = (trade_time - 1009810800) % 3456       -- real sec into the current Vana'diel day
+    return math.min(trade_time + (3456 - into_day) + 20, hard)  -- next Vana midnight + 20s buffer
+end
+
+function rf_inv_slot(item_id)
+    if not item_id or item_id == 0 then return nil end
+    local inv = windower.ffxi.get_items(0)
+    if type(inv) ~= 'table' then return nil end
+    for s = 1, (inv.max or 80) do
+        local it = inv[s]
+        if type(it) == 'table' and it.id == item_id and it.id ~= 0 then return it.slot or s end
+    end
+    return nil
+end
+
+function rf_inv_count(item_id)
+    local total = 0
+    local inv = windower.ffxi.get_items(0)
+    if type(inv) == 'table' then
+        for s = 1, (inv.max or 80) do
+            local it = inv[s]
+            if type(it) == 'table' and it.id == item_id then total = total + (it.count or 0) end
+        end
+    end
+    return total
+end
+
+-- Forensic dump: every bag that holds `id`, with count and RAW status, plus inventory free space. Logged
+-- on a pull failure so a "have it but reforge says missing" report shows exactly where the game thinks the
+-- item is and why it wouldn't move -- no more guessing at equipped vs bazaared vs some other status.
+RF_BAG_NAMES = { [0]='inv', [1]='safe', [2]='storage', [3]='temp', [4]='locker', [5]='satchel', [6]='sack',
+    [7]='case', [8]='ward1', [9]='safe2', [10]='ward2', [11]='ward3', [12]='ward4', [13]='ward5', [14]='ward6',
+    [15]='ward7', [16]='ward8' }
+function rf_where(id)
+    local parts = {}
+    for bag = 0, 16 do
+        local items = windower.ffxi.get_items(bag)
+        if type(items) == 'table' then
+            for s = 1, (items.max or 80) do
+                local it = items[s]
+                if type(it) == 'table' and it.id == id and it.id ~= 0 then
+                    parts[#parts + 1] = ('%s x%d(status=%s)'):format(RF_BAG_NAMES[bag] or ('bag' .. bag), it.count or 1, tostring(it.status))
+                end
+            end
+        end
+    end
+    local di = windower.ffxi.get_bag_info(0)
+    return (#parts > 0 and table.concat(parts, ', ') or 'NOT in any readable bag') .. (di and (' | inv free=' .. (di.max - di.count)) or '')
+end
+
+-- Pull an item into inventory from any reachable non-mog bag (satchel/sack/case + wardrobes). Returns
+-- 'moving' (already here or a move was queued), 'locked' (present only in an equipped/bazaared slot the
+-- game refuses to move), or 'none' (nowhere reachable). The 'locked' case matters: an EQUIPPED piece
+-- (e.g. the AF body you're wearing) shows up in a wardrobe but cannot be traded until it's taken off, so
+-- the caller can say so instead of spinning until a 20s "missing item id" timeout.
+function rf_pull(item_id, need)
+    if rf_inv_count(item_id) >= need then return 'moving' end
+    local locked = false
+    for _, bag in ipairs({ 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16 }) do
+        local items = windower.ffxi.get_items(bag)
+        if type(items) == 'table' then
+            for s = 1, (items.max or 80) do
+                local it = items[s]
+                if type(it) == 'table' and it.id == item_id and it.id ~= 0 then
+                    if it.status == nil or it.status == 0 then
+                        local di = windower.ffxi.get_bag_info(0)
+                        if di and (di.max - di.count) <= 0 then return 'nospace' end   -- movable, but inventory full
+                        enqueue_move(item_id, bag, 0, math.min(it.count or 1, need)); return 'moving'
+                    else
+                        locked = true   -- equipped (5) / bazaared (25): keep looking for a free copy first
+                    end
+                end
+            end
+        end
+    end
+    return locked and 'locked' or 'none'
+end
+
+function rf_npc_near()
+    if not rf then return false end
+    local info = windower.ffxi.get_info()
+    if not info or info.zone ~= rf.zone then return false end
+    local m = rf.npc_id and windower.ffxi.get_mob_by_id(rf.npc_id)
+    if not m then m = rf.npc_index and windower.ffxi.get_mob_by_index(rf.npc_index) end
+    local me = windower.ffxi.get_mob_by_target('me')
+    if not (m and me) then return false end
+    local dx, dy = (m.x or 0) - (me.x or 0), (m.y or 0) - (me.y or 0)
+    return (dx * dx + dy * dy) <= 36  -- within 6 yalms
+end
+
+-- ---- Reforge audit log (money-critical: ALWAYS on). A forensic trail under debug/reforge/<date>.log so any
+-- lost-material report can be reconstructed exactly -- what was traded, the menu, and the carry-bag counts
+-- before and after each trade -- and the safety check (rf_verify_advance) that HALTS the queue instead of
+-- silently advancing when a step consumed materials but produced no upgraded piece.
+rf_dir_ready = false
+RF_VERIFY_SECS = 20
+function rf_log(line)
+    local base = windower.addon_path .. 'debug/reforge'
+    if not rf_dir_ready then
+        if windower.dir_exists and windower.create_dir then
+            if not windower.dir_exists(windower.addon_path .. 'debug') then windower.create_dir(windower.addon_path .. 'debug') end
+            if not windower.dir_exists(base) then windower.create_dir(base) end
+        end
+        rf_dir_ready = true
+    end
+    -- Per-CHARACTER file. Multibox game instances share this addons folder (that is why the paused-queue file
+    -- is per-name too), so a single shared log would interleave every character's queue and two simultaneous
+    -- writes could garble a line. One file per character keeps each queue's trail clean and isolated.
+    local me = windower.ffxi.get_player()
+    local nm = ((me and me.name) or 'unknown'):gsub('[^%w]', '')
+    local ok, f = pcall(io.open, base .. '/' .. nm .. '_' .. os.date('%Y-%m-%d') .. '.log', 'a')
+    if ok and f then
+        f:write(('[%s] %s | %s\n'):format(os.date('%H:%M:%S'), (me and me.name) or '?', tostring(line)))
+        f:close()
+    end
+end
+
+-- ---- Frame-crash log. The prerender / packet / build_slips paths are wrapped in xpcall; if one throws
+-- (e.g. a Windower lib blowing up on a bad table), the loop keeps running instead of stalling silently, and
+-- the full stack is captured here so the culprit is exact. One file per character under debug/pull/<date>.log.
+pull_dir_ready = false
+function pull_log(line)
+    local base = windower.addon_path .. 'debug/pull'
+    if not pull_dir_ready then
+        if windower.dir_exists and windower.create_dir then
+            if not windower.dir_exists(windower.addon_path .. 'debug') then windower.create_dir(windower.addon_path .. 'debug') end
+            if not windower.dir_exists(base) then windower.create_dir(base) end
+        end
+        pull_dir_ready = true
+    end
+    local me = windower.ffxi.get_player()
+    local nm = ((me and me.name) or 'unknown'):gsub('[^%w]', '')
+    local ok, f = pcall(io.open, base .. '/' .. nm .. '_' .. os.date('%Y-%m-%d') .. '.log', 'a')
+    if ok and f then
+        f:write(('[%s] %s\n'):format(os.date('%H:%M:%S'), tostring(line)))
+        f:close()
+    end
+end
+function rf_item_name(id)
+    if not id or id == 0 then return 'none' end
+    local r = res and res.items and res.items[id]
+    return ((r and r.en) or 'item') .. ' #' .. tostring(id)   -- always carry the id so a wrong-id bug can't hide behind a name
+end
+-- Total count across the reachable carry bags (inventory + satchel/sack/case + wardrobes). The delta across a
+-- trade is the TRUE amount consumed, regardless of which bag the addon pulled the item from.
+function rf_carry_count(id)
+    if not id or id == 0 then return 0 end
+    local n = 0
+    for _, bag in ipairs({ 0, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16 }) do
+        local items = windower.ffxi.get_items(bag)
+        if type(items) == 'table' then
+            for s = 1, (items.max or 80) do
+                local it = items[s]
+                if type(it) == 'table' and it.id == id then n = n + (it.count or 0) end
+            end
+        end
+    end
+    return n
+end
+function rf_snapshot(st)
+    local snap = { output = rf_carry_count(st.output_id), input = rf_carry_count(st.input_id or 0), ings = {} }
+    for _, ig in ipairs(st.ingredients or {}) do snap.ings[ig.id] = rf_carry_count(ig.id) end
+    return snap
+end
+-- Verify a collected step against its pre-trade snapshot, then advance on success or HALT (never silently
+-- proceed) when the piece did not upgrade. `why` = 'ok' (output already in inventory) or 'timeout'.
+function rf_verify_advance(st, why)
+    local snap = rf.snap
+    local out_gain = rf_carry_count(st.output_id) - ((snap and snap.output) or 0)
+    if st.advance or out_gain >= 1 or not snap then
+        -- Success, an advance step (yields no item), or a resumed/collect-only step we have no snapshot for.
+        if snap then
+            local parts = {}
+            for _, ig in ipairs(st.ingredients or {}) do parts[#parts + 1] = ('%s -%d'):format(rf_item_name(ig.id), (snap.ings[ig.id] or 0) - rf_carry_count(ig.id)) end
+            rf_log(('OK step %d/%d (%s): %s +%d; input -%d; mats: %s'):format(rf.step_index, #rf.steps, why, rf_item_name(st.output_id), out_gain, (snap.input or 0) - rf_carry_count(st.input_id or 0), table.concat(parts, ', ')))
+        else
+            rf_log(('OK step %d/%d (%s): %s (resumed step, no pre-trade snapshot)'):format(rf.step_index, #rf.steps, why, rf_item_name(st.output_id)))
+        end
+        rf.snap = nil
+        rf_advance()
+        return
+    end
+    -- No upgraded piece: diff the materials to distinguish a real loss from a trade that never landed.
+    local consumed = {}
+    local any = false
+    for _, ig in ipairs(st.ingredients or {}) do
+        local d = (snap.ings[ig.id] or 0) - rf_carry_count(ig.id)
+        if d ~= 0 then any = true end
+        consumed[#consumed + 1] = ('%s -%d (of %d)'):format(rf_item_name(ig.id), d, ig.qty)
+    end
+    local in_d = (snap.input or 0) - rf_carry_count(st.input_id or 0)
+    if in_d ~= 0 then any = true end
+    local detail = ('%s +%d; input %s -%d; mats: %s'):format(rf_item_name(st.output_id), out_gain, rf_item_name(st.input_id or 0), in_d, table.concat(consumed, ', '))
+    rf.active = false; rf.phase = 'error'; rf.snap = nil; rf_dirty = true
+    if any then
+        rf_log(('LOSS step %d/%d (%s): NO upgraded piece but materials were consumed -> %s'):format(rf.step_index, #rf.steps, why, detail))
+        rf.status = 'HALTED: materials consumed, no upgrade -- see debug/reforge log'
+        alex_chat(207, ('[Alexandria] reforge HALTED: %s did not upgrade but materials were consumed. Stopped to protect the rest of your queue. See debug/reforge log.'):format(rf_item_name(st.output_id)), 'error')
+    else
+        rf_log(('ANOMALY step %d/%d (%s): no upgraded piece and nothing consumed -> %s'):format(rf.step_index, #rf.steps, why, detail))
+        rf.status = 'HALTED: no result detected -- see debug/reforge log'
+        alex_chat(207, '[Alexandria] reforge HALTED: no result detected for this step (nothing was consumed). Stopped to be safe. See debug/reforge log.', 'error')
+    end
+end
+
+function rf_fail(msg)
+    if rf then rf_log(('FAIL step %d/%d: %s'):format(rf.step_index or 0, (rf.steps and #rf.steps) or 0, tostring(msg))); rf.active = false; rf.phase = 'error'; rf.status = msg end
+    rf_dirty = true
+    alex_chat(207, '[Alexandria] reforge: ' .. tostring(msg), 'progress')
+end
+
+function rf_stop()
+    if rf then rf.active = false; rf.phase = 'stopped'; rf.status = 'stopped' end
+    rf_dirty = true
+    alex_chat(207, '[Alexandria] reforge stopped', 'progress')
+end
+
+function rf_setup_step()
+    local st = rf.steps[rf.step_index]
+    local rfx = RF_NPC_FIXED[st.npc]
+    local fx = rfx or STORE_FIXED_NPCS[st.npc]
+    local live = windower.ffxi.get_mob_by_name and windower.ffxi.get_mob_by_name(st.npc)
+    -- Ambiguous names (RF_NPC_FIXED, e.g. "???") appear on many nameless mobs, so only trust a live match
+    -- with the known id; otherwise fall back to the fixed entry so we never target the wrong NPC.
+    if rfx and live and live.id and live.id ~= rfx.id then live = nil end
+    if live and live.id then
+        rf.npc_id, rf.npc_index = live.id, live.index
+        rf.zone = (windower.ffxi.get_info() or {}).zone or (fx and fx.zone) or 0
+    elseif fx then
+        rf.npc_id, rf.npc_index, rf.zone = fx.id, fx.index, fx.zone
+    else
+        rf.npc_id, rf.npc_index, rf.zone = nil, nil, (windower.ffxi.get_info() or {}).zone or 0
+    end
+    -- An advance step (non-final day of a multi-day reforge) waits on the ADVANCE menu and confirms with
+    -- the advance option, returning no item; a normal step waits on the ready menu and collects with 0.
+    rf.ready_menu = st.advance and RF_ADVANCE_MENU[st.npc] or RF_READY_MENU[st.npc]
+    rf.collect_option = st.advance and (RF_ADVANCE_OPTION[st.npc] or 0) or 0
+    rf.rem_done = {}   -- chapters we already fired a Monisette retrieve for this step (avoid re-looping)
+    if st.pending then
+        -- Already-traded / in-flight piece: skip the trade and go straight to collecting. Use the saved
+        -- ready time when resuming a pause (so the countdown is exact); otherwise 0 = try now, and if it
+        -- isn't done, rf_incoming reschedules for the next Vana'diel day.
+        rf.phase = 'wait'; rf.awaiting = false; rf.status = 'collecting in-flight piece'; rf.ready_at = st.pending_ready_at or 0
+    else
+        rf.phase = 'prep'; rf.awaiting = false; rf.status = 'preparing'
+    end
+    rf.prep_since = os.clock()
+end
+
+function rf_do_trade()
+    local st = rf.steps[rf.step_index]
+    -- SAFETY: the FIRST trade of a piece MUST include the gear. If step 1 carries materials but no input piece
+    -- (input_id 0/nil -- a desktop bug where the gear id did not resolve), trading the materials alone hands
+    -- them to the NPC for nothing: the "only the Etched Memories vanished, the feet were untouched" report.
+    -- Refuse and halt so nothing is lost. (Day-2+ advance steps legitimately trade materials only.)
+    if rf.step_index == 1 and not st.pending and not rf.collect_only and (not st.input_id or st.input_id == 0)
+       and st.ingredients and #st.ingredients > 0 then
+        rf_log('ABORT step 1: materials but NO gear piece (input missing) -- refusing to trade to avoid losing them')
+        rf_fail('no gear piece to trade (input id missing) -- refused to trade the materials alone')
+        return
+    end
+    -- SAFETY: step 1's input gear must be present in a reachable bag. Nothing before step 1 produces it (later
+    -- chained steps consume a piece the PREVIOUS step made, but step 1 does not), so if it is nowhere in your
+    -- bags it was already traded -- the piece is in flight / cooking at the NPC from an earlier run, or you no
+    -- longer have it. Re-handing it is impossible, so refuse instead of wedging on a 20s gather that can never
+    -- succeed, and tell the user to collect the in-flight piece at the NPC. 2s grace lets a just-loaded bag settle.
+    if rf.step_index == 1 and not st.pending and not rf.collect_only
+       and st.input_id and st.input_id > 0 and rf_carry_count(st.input_id) < 1
+       and (os.clock() - (rf.prep_since or os.clock())) > 2 then
+        rf_log(('ABORT step 1: input %s not in any bag -- already traded (in flight) or missing; refusing to re-trade'):format(rf_item_name(st.input_id)))
+        rf_fail(('%s is not in your bags -- looks already traded (in flight at %s). Collect it there when ready; nothing was re-traded.'):format(rf_item_name(st.input_id), st.npc))
+        return
+    end
+    -- Day 2 of a multi-day reforge trades materials only -- the piece is already held by the NPC, so an
+    -- input_id of 0/nil means "no piece to hand over".
+    local need = (st.input_id and st.input_id > 0) and { { id = st.input_id, qty = 1 } } or {}
+    for _, ig in ipairs(st.ingredients) do need[#need + 1] = ig end
+    for _, nd in ipairs(need) do
+        if rf_inv_count(nd.id) < nd.qty then
+            -- Rem's Tale chapters can't live in a bag; if enough are stored with Monisette (whom we are
+            -- already standing at), pull the shortfall out of storage automatically before trading.
+            local ch = (nd.id > REM_ITEM_BASE and nd.id <= REM_ITEM_BASE + 10) and (nd.id - REM_ITEM_BASE) or nil
+            if ch then
+                if rem_active() then rf.status = 'retrieving Rems Tale Ch.' .. ch; return end
+                -- Don't judge a chapter "missing" until the currency page is actually loaded (a fresh
+                -- reload starts with none). Ask for it and wait up to 15s before giving up.
+                if not rem_currency_ready() then
+                    currency_request()
+                    if (os.clock() - (rf.prep_since or os.clock())) < 15 then rf.status = 'checking Monisette storage'; return end
+                else
+                    local shortfall = nd.qty - rf_inv_count(nd.id)
+                    if not rf.rem_done[ch] and rem_stored_count(ch) >= shortfall then
+                        rf.rem_done[ch] = true
+                        rem_start({ chapter = ch, count = shortfall }, true)  -- reforge-driven; bypasses the "reforge running" guard
+                        rf.status = 'retrieving Rems Tale Ch.' .. ch
+                        rf.prep_since = os.clock()   -- the retrieve is legitimate progress; don't let the 20s stall fire
+                        return
+                    end
+                end
+                -- currency loaded but not enough stored (or already tried): fall through to missing-item path
+            end
+            local pull = rf_pull(nd.id, nd.qty)   -- 'moving' | 'locked' | 'nospace' | 'none'
+            if pull == 'locked' then
+                -- The piece exists but only in an equipped/bazaared slot the game won't move, so no amount of
+                -- waiting will bring it to inventory. Fail immediately with an actionable message instead of
+                -- the cryptic 20s "missing item id" (the "reforge doesn't recognize my item" report). The log
+                -- line records which of the silent-drop causes it actually was, so we never have to guess.
+                rf_log(('ABORT: %s not movable to inventory | where: %s'):format(rf_item_name(nd.id), rf_where(nd.id)))
+                rf_fail(('%s is equipped or on your bazaar -- take it off, then reforge.'):format(rf_item_name(nd.id)))
+                return
+            end
+            if pull == 'nospace' then
+                rf_log(('ABORT: %s present but inventory full | where: %s'):format(rf_item_name(nd.id), rf_where(nd.id)))
+                rf_fail(('Inventory is full -- free a slot so %s can be moved in to reforge.'):format(rf_item_name(nd.id)))
+                return
+            end
+            -- Do NOT fail instantly: a just-collected chained input, or an in-flight bag move, may still
+            -- be registering. Wait up to 20s (prep_since resets each step) before giving up.
+            if (os.clock() - (rf.prep_since or os.clock())) > 20 then
+                rf_log(('MISSING %s after 20s (pull=%s) | where: %s'):format(rf_item_name(nd.id), tostring(pull), rf_where(nd.id)))
+                rf_fail('missing item id ' .. tostring(nd.id) .. ' (need ' .. tostring(nd.qty) .. ') after 20s')
+            else
+                rf.status = 'gathering items'
+            end
+            return
+        end
+    end
+    local fields = { ['Target'] = rf.npc_id, ['Target Index'] = rf.npc_index }
+    local n = 0
+    for _, nd in ipairs(need) do
+        local slot = rf_inv_slot(nd.id)
+        if not slot then rf.status = 'moving items to inventory'; return end
+        n = n + 1
+        fields['Item Index ' .. n] = slot
+        fields['Item Count ' .. n] = nd.qty
+    end
+    fields['Number of Items'] = n
+    -- Snapshot the exact carry-bag counts of everything we are about to hand over, so after the collect we can
+    -- prove what was consumed vs produced (and HALT if a piece was eaten without upgrading). Money-critical.
+    rf.snap = rf_snapshot(st)
+    local traded = {}
+    for _, nd in ipairs(need) do traded[#traded + 1] = ('%s x%d'):format(rf_item_name(nd.id), nd.qty) end
+    rf_log(('TRADE step %d/%d @ %s: %s | have(out=%d,input=%d)'):format(rf.step_index, #rf.steps, st.npc, table.concat(traded, ', '), rf.snap.output, rf.snap.input))
+    packets.inject(packets.new('outgoing', 0x036, fields))
+    rf.phase = 'await_trade'; rf.awaiting = true; rf.last_progress = os.clock(); rf.status = 'trading'
+end
+
+-- 0x05B option 0 to confirm/close whatever menu id came back (Zone=EventNum, Menu ID=EventPara).
+function rf_send_option(menu, opt)
+    packets.inject(packets.new('outgoing', 0x05B, {
+        ['Target'] = rf.npc_id, ['Option Index'] = opt or 0, ['Target Index'] = rf.npc_index,
+        ['Zone'] = rf.zone, ['Menu ID'] = menu,
+    }))
+end
+
+-- Count how many of an item the player holds across inventory + wardrobes (where a reforged piece lands or
+-- gets organized to). Used to detect that a step's output already arrived, so an already-collected reforge
+-- doesn't loop forever waiting for a collect menu that will never appear.
+function rf_inv_count(id)
+    if not id then return 0 end
+    local n = 0
+    for _, b in ipairs({ 0, 8, 10, 11, 12, 13, 14, 15, 16 }) do
+        local items = windower.ffxi.get_items(b)
+        if type(items) == 'table' then
+            for s = 1, (items.max or 80) do
+                local it = items[s]
+                if type(it) == 'table' and it.id == id then n = n + (it.count or 1) end
+            end
+        end
+    end
+    return n
+end
+
+function rf_do_collect()
+    rf_log(('COLLECT step %d/%d @ %s: talking (%ds since trade, expect ready_menu=0x%03X)'):format(
+        rf.step_index, #rf.steps, rf.steps[rf.step_index].npc, math.floor(os.time() - (rf.trade_at or os.time())), rf.ready_menu or 0))
+    packets.inject(packets.new('outgoing', 0x01A, {
+        ['Target'] = rf.npc_id, ['Target Index'] = rf.npc_index, ['Category'] = 0, ['Param'] = 0,
+    }))
+    rf.phase = 'await_collect'; rf.awaiting = true; rf.last_progress = os.clock(); rf.status = 'collecting'
+end
+
+function rf_advance()
+    rf.steps[rf.step_index].collected = true
+    if rf.step_index >= #rf.steps then
+        rf.active = false; rf.phase = 'done'; rf.status = 'done'
+        rf_log(('DONE: queue complete (%d step(s))'):format(#rf.steps))
+        alex_chat(207, '[Alexandria] reforge queue complete', 'progress'); rf_dirty = true; return
+    end
+    if rf.confirm_steps then
+        rf.await_step = true; rf.phase = 'confirm'; rf.status = 'confirm to continue'; rf_dirty = true; return
+    end
+    rf.step_index = rf.step_index + 1; rf_setup_step(); rf_dirty = true
+end
+
+function rf_step_continue()
+    if not rf or not rf.active or not rf.await_step then return end
+    rf.await_step = false; rf.step_index = rf.step_index + 1; rf_setup_step(); rf_dirty = true
+end
+
+function rf_start(msg)
+    if not packets_ok then return end
+    if type(msg.steps) ~= 'table' or #msg.steps == 0 then
+        if not (rf and rf.active) then rf_fail('no steps') end   -- never tear down a running queue over an empty add
+        return
+    end
+    local steps = {}
+    for _, s in ipairs(msg.steps) do
+        local ings = {}
+        if type(s.ingredients) == 'table' then
+            for _, ig in ipairs(s.ingredients) do
+                if ig.id and ig.qty then ings[#ings + 1] = { id = tonumber(ig.id), qty = tonumber(ig.qty) } end
+            end
+        end
+        steps[#steps + 1] = { npc = tostring(s.npc or 'Monisette'), input_id = tonumber(s.input_id),
+            output_id = tonumber(s.output_id), ingredients = ings, currency = s.currency,
+            pending = s.pending and true or false, pending_ready_at = tonumber(s.ready_at),
+            advance = s.advance and true or false, collected = false }
+    end
+    for _, s in ipairs(steps) do
+        local needed = s.advance and RF_ADVANCE_MENU[s.npc] or RF_READY_MENU[s.npc]
+        if not needed then
+            -- Unsupported NPC: reject just this request. Only fail (stop) an idle attempt; never kill a
+            -- running queue, or we would orphan the piece it already traded.
+            if rf and rf.active then alex_chat(207, '[Alexandria] reforge: ' .. tostring(s.npc) .. ' not supported; nothing added', 'progress')
+            else rf_fail(tostring(s.npc) .. ' reforges are not supported yet (needs a packet capture)') end
+            return
+        end
+    end
+    if rf and rf.active then
+        -- Add-more-while-running: APPEND to the live queue instead of clobbering it. The current piece
+        -- keeps cooking and the new steps run after it. (This branch previously called rf_fail, which set
+        -- rf.active = false and silently killed the in-flight reforge, so it never collected the traded
+        -- piece -- the "stuck at collecting, doesn't detect what was picked up" bug.)
+        for _, s in ipairs(steps) do rf.steps[#rf.steps + 1] = s end
+        rf_dirty = true
+        alex_chat(207, '[Alexandria] reforge: added ' .. #steps .. ' step(s) to the running queue', 'progress')
+        return
+    end
+    rf = { active = true, steps = steps, step_index = 1,
+        confirm_steps = msg.confirm_steps and true or false,
+        timing = (msg.timing == 'fixed') and 'fixed' or 'smart',
+        phase = 'prep', last_progress = os.clock() }
+    currency_request()   -- refresh the currency page up front so Rem's Tale stored counts are current
+    rf_setup_step(); rf_dirty = true
+    local plan = {}
+    for i, s in ipairs(steps) do plan[i] = ('%s->%s'):format(rf_item_name(s.input_id), rf_item_name(s.output_id)) end
+    rf_log(('START: %d step(s) [%s] timing=%s'):format(#steps, table.concat(plan, ', '), rf.timing))
+    alex_chat(207, '[Alexandria] reforge started: ' .. #steps .. ' step(s)', 'progress')
+end
+
+-- Per-character paused-reforge file, so several characters can each hold their own paused queue.
+function rf_paused_path()
+    local me = windower.ffxi.get_player()
+    local nm = ((me and me.name) or 'unknown'):gsub('[^%w]', '')
+    return windower.addon_path .. 'data/reforge_paused_' .. nm .. '.json'
+end
+
+function rf_load_paused()
+    rf_paused = nil
+    local f = io.open(rf_paused_path(), 'r')
+    if f then
+        local raw = f:read('*a'); f:close()
+        if json_ok and raw and #raw > 0 then
+            local ok, d = pcall(json.decode, raw)
+            if ok and type(d) == 'table' and type(d.steps) == 'table' and #d.steps > 0 then rf_paused = d end
+        end
+    end
+    rf_dirty = true
+end
+
+function rf_clear_paused()
+    pcall(os.remove, rf_paused_path())
+    rf_paused = nil
+    rf_dirty = true
+end
+
+-- Save the remaining work and stop. The current step, if already traded (phase is past the trade), is
+-- flagged pending so resume collects it; steps not yet reached are saved as normal trades.
+function rf_pause()
+    if not rf or not rf.active then return end
+    if not json_ok then alex_chat(207, '[Alexandria] cannot save paused reforge (json unavailable)', 'error') return end
+    local out = { confirm_steps = rf.confirm_steps, timing = rf.timing, steps = {} }
+    for i = (rf.step_index or 1), #rf.steps do
+        local st = rf.steps[i]
+        local step = { npc = st.npc, input_id = st.input_id, output_id = st.output_id, ingredients = st.ingredients, currency = st.currency,
+            pending = st.pending and true or false }
+        if i == rf.step_index then
+            local traded = (rf.phase == 'wait' or rf.phase == 'await_collect' or rf.phase == 'collected')
+            if traded or st.pending then step.pending = true; step.ready_at = rf.ready_at end
+        end
+        out.steps[#out.steps + 1] = step
+    end
+    local f = io.open(rf_paused_path(), 'w')
+    if f then f:write(json.encode(out)); f:close() end
+    rf_paused = out
+    rf.active = false; rf = nil; rf_dirty = true
+    alex_chat(207, ('[Alexandria] reforge paused -- %d step(s) saved. Resume near the NPC.'):format(#out.steps), 'progress')
+end
+
+function rf_resume()
+    if rf and rf.active then return end
+    rf_load_paused()
+    if not rf_paused then alex_chat(207, '[Alexandria] no paused reforge to resume', 'error') return end
+    local msg = { steps = rf_paused.steps, confirm_steps = rf_paused.confirm_steps, timing = rf_paused.timing }
+    rf_clear_paused()
+    rf_start(msg)
+end
+
+-- Collect a reforge that was ALREADY traded (piece is in flight / cooking at the NPC) but whose queue
+-- was lost. Skips the trade entirely: talk -> if the ready menu comes back, collect; otherwise report
+-- that nothing is ready and stop (never loops). output_id (optional) lets us verify the returned piece.
+function rf_collect_start(msg)
+    if not packets_ok then return end
+    if rf and rf.active then rf_fail('already running') return end
+    local npc = tostring(msg.npc or 'Monisette')
+    if not RF_READY_MENU[npc] then rf_fail(npc .. ' collect is not supported yet') return end
+    rf = { active = true, collect_only = true, step_index = 1,
+        steps = { { npc = npc, output_id = tonumber(msg.output_id) or 0, input_id = 0, ingredients = {}, collected = false } },
+        confirm_steps = false, timing = 'smart', phase = 'prep', last_progress = os.clock() }
+    rf_setup_step()
+    rf.phase = 'wait'; rf.awaiting = false; rf.ready_at = 0   -- try to collect the in-flight piece right now
+    rf_dirty = true
+    alex_chat(207, '[Alexandria] collecting pending reforge from ' .. npc .. '...', 'progress')
+end
+
+function rf_tick(now)
+    if not rf or not rf.active or rf.await_step then return end
+    local st = rf.steps[rf.step_index]
+    if rf.phase == 'prep' then
+        if not rf_npc_near() then rf.status = 'go to ' .. st.npc; return end
+        rf_do_trade(); rf_dirty = true
+    elseif rf.phase == 'await_trade' then
+        if (os.clock() - (rf.last_progress or now)) > 20 then rf_fail('trade timed out') end
+    elseif rf.phase == 'wait' then
+        if os.time() >= (rf.ready_at or 0) then
+            if not rf_npc_near() then rf.status = 'ready -- return to ' .. st.npc; return end
+            rf_do_collect(); rf_dirty = true
+        else
+            rf.status = 'waiting'
+        end
+    elseif rf.phase == 'await_collect' then
+        if (os.clock() - (rf.last_progress or now)) > 20 then rf.phase = 'wait'; rf.awaiting = false end
+    elseif rf.phase == 'collected' then
+        -- Advance only once the reforged piece has actually registered in inventory (it returns via a
+        -- 0x020 a moment after the collect confirm), so the next chained step can trade it in. 8s cap is
+        -- a safety net so a missed 0x020 never wedges the queue. An ADVANCE step returns no item, so it
+        -- moves on right away.
+        -- Verify against the pre-trade snapshot instead of blindly advancing: a piece that never came back
+        -- (materials consumed, no upgrade) now HALTS the queue with a logged LOSS line instead of silently
+        -- moving on and eating the next step's materials too.
+        if st.advance or rf_inv_count(st.output_id) >= 1 then
+            rf_verify_advance(st, 'ok')
+        elseif (os.clock() - (rf.collect_at or now)) > RF_VERIFY_SECS then
+            rf_verify_advance(st, 'timeout')
+        end
+    end
+end
+
+function rf_incoming(id, data)
+    if not rf or not rf.active then return nil end
+    if id ~= 0x034 and id ~= 0x032 then return nil end
+    local ok, p = pcall(packets.parse, 'incoming', data)
+    if not (ok and p) then return nil end
+    if p['NPC Index'] ~= nil and p['NPC Index'] ~= rf.npc_index then return nil end
+    local menu = p['Menu ID']
+    if rf.phase == 'await_trade' then
+        local tst = rf.steps[rf.step_index]
+        rf_log(('CONFIRM step %d: menu=0x%03X opt=%d'):format(rf.step_index, menu or 0x184, (tst and RF_TRADE_OPTION[tst.npc]) or 0))
+        rf_send_option(menu or 0x184, tst and RF_TRADE_OPTION[tst.npc] or 0)
+        rf.trade_at = os.time(); rf.ready_at = rf_ready_at(rf.trade_at, rf.timing)
+        if tst then tst.out_baseline = rf_inv_count(tst.output_id) end   -- how many of the +1 we hold BEFORE it comes back
+        rf.phase = 'wait'; rf.awaiting = false; rf.last_progress = os.clock(); rf_dirty = true
+        return true
+    elseif rf.phase == 'await_collect' then
+        rf_log(('COLLECT-RESP step %d: menu=0x%03X %s (expected 0x%03X)'):format(
+            rf.step_index, menu or 0, (menu == rf.ready_menu) and 'READY' or 'NOT-ready', rf.ready_menu or 0))
+        if menu == rf.ready_menu then
+            rf_send_option(menu, rf.collect_option or 0)   -- advance step uses its advance option; a normal collect uses 0
+            rf.phase = 'collected'; rf.awaiting = false; rf.collect_at = os.clock(); rf.status = rf.steps[rf.step_index].advance and 'advancing' or 'collecting'; rf_dirty = true
+        else
+            rf_send_option(menu or rf.ready_menu)   -- option 0 exits the menu
+            local st = rf.steps[rf.step_index]
+            -- Already collected? If the +1 output is now in inventory (beyond the pre-trade baseline), the
+            -- reforge finished and the piece was picked up (auto or manual). The ready menu (0x182) will never
+            -- appear again, so stop waiting on it and advance the queue instead of looping forever.
+            if st and not st.advance and st.output_id and rf_inv_count(st.output_id) > (st.out_baseline or 0) then
+                rf_log(('COLLECT step %d: output #%d already in inventory -> already collected, advancing'):format(rf.step_index, st.output_id))
+                rf.awaiting = false; rf_advance(); rf_dirty = true
+                return true
+            end
+            if rf.collect_only then
+                -- A one-shot "collect what's in flight": if it isn't ready, don't loop -- just report and stop.
+                rf.active = false; rf.phase = 'done'; rf.status = 'nothing ready to collect'
+                alex_chat(207, '[Alexandria] nothing ready to collect there yet (still cooking, or nothing pending)', 'progress')
+            elseif st and st.pending and (rf.ready_at or 0) == 0 then
+                -- In-flight queue step, not done yet: wait for the next Vana'diel day, then collect.
+                rf.ready_at = rf_ready_at(os.time(), rf.timing); rf.phase = 'wait'; rf.awaiting = false; rf.status = 'waiting for next day'
+            else
+                rf.phase = 'wait'; rf.awaiting = false; rf.ready_at = os.time() + 60; rf.status = 'not ready yet'   -- still working / idle: keep waiting
+            end
+            rf_dirty = true
+        end
+        return true
+    end
+    return nil
+end
+
+function build_reforge()
+    if not rf then
+        if rf_paused and rf_paused.steps and #rf_paused.steps > 0 then
+            return string.format('{"t":"reforge","active":false,"paused":{"steps":%d,"npc":"%s"}}\n', #rf_paused.steps, esc(rf_paused.steps[1].npc or ''))
+        end
+        return '{"t":"reforge","active":false}\n'
+    end
+    local st = rf.steps[rf.step_index]
+    -- readyAt is an absolute os.time() (Earth unix seconds); the desktop counts down live from it.
+    local ready_at = (rf.phase == 'wait' and rf.ready_at) or 0
+    local outs = {}
+    for _, s in ipairs(rf.steps or {}) do outs[#outs + 1] = tostring(s.output_id or 0) end
+    return string.format('{"t":"reforge","active":%s,"phase":"%s","step":%d,"steps":%d,"status":"%s","readyAt":%d,"awaitStep":%s,"timing":"%s","output":%d,"outputs":[%s]}\n',
+        rf.active and 'true' or 'false', esc(rf.phase or ''), rf.step_index or 1, (rf.steps and #rf.steps) or 0,
+        esc(rf.status or ''), ready_at, rf.await_step and 'true' or 'false', esc(rf.timing or 'smart'),
+        (st and st.output_id) or 0, table.concat(outs, ','))
+end
+
+function rem_active() return rem ~= nil and rem.active end
+
+function rem_near()
+    if not rem then return false end
+    local info = windower.ffxi.get_info()
+    if not info or info.zone ~= rem.zone then return false end
+    local m = rem.npc_id and windower.ffxi.get_mob_by_id(rem.npc_id)
+    if not m then m = rem.npc_index and windower.ffxi.get_mob_by_index(rem.npc_index) end
+    local me = windower.ffxi.get_mob_by_target('me')
+    if not (m and me) then return false end
+    local dx, dy = (m.x or 0) - (me.x or 0), (m.y or 0) - (me.y or 0)
+    return (dx * dx + dy * dy) <= 36  -- within 6 yalms
+end
+
+function rem_fail(msg)
+    rem = nil
+    alex_chat(207, '[Alexandria] rem: ' .. tostring(msg), 'progress')
+end
+
+-- How many of Rem's Tale Ch.<ch> this character has stored with Monisette (from the 0x113 currency
+-- page). Used by the reforge executor to decide whether a short chapter can be auto-retrieved.
+function rem_stored_count(ch)
+    local pid = (windower.ffxi.get_player() or {}).id
+    if not (currency_cur1 and currency_cur1_id == pid) then return 0 end
+    local v = currency_cur1['Rems Tale Chapter ' .. ch]
+    return (type(v) == 'number') and v or 0
+end
+
+-- Is our currency page loaded for THIS character? A fresh //lua reload starts with none (the server
+-- only resends 0x113 on a currency change), so stored counts read 0 until we ask for a refresh.
+function rem_currency_ready()
+    return currency_cur1 ~= nil and currency_cur1_id == (windower.ffxi.get_player() or {}).id
+end
+
+function rem_poke()
+    packets.inject(packets.new('outgoing', 0x01A, { ['Target'] = rem.npc_id, ['Target Index'] = rem.npc_index, ['Category'] = 0, ['Param'] = 0 }))
+    rem.before = rf_inv_count(rem.item_id)
+    rem.phase = 'await_menu'; rem.t = os.clock()
+end
+
+function rem_start(msg, from_reforge)
+    if not packets_ok then return end
+    if rem and rem.active then return end
+    if not from_reforge and rf and rf.active then rem_fail('reforge running') return end
+    local ch = tonumber(msg.chapter)
+    local want = math.floor(tonumber(msg.count) or 1)
+    if not ch or ch < 1 or ch > 10 then rem_fail('bad chapter') return end
+    want = math.max(1, math.min(want, 255))  -- up to 255 can be stored; a step may need e.g. 10 for a headpiece
+    local live = windower.ffxi.get_mob_by_name and windower.ffxi.get_mob_by_name('Monisette')
+    local fx = STORE_FIXED_NPCS['Monisette']
+    local id, index, zone
+    if live and live.id then id, index, zone = live.id, live.index, (windower.ffxi.get_info() or {}).zone
+    elseif fx then id, index, zone = fx.id, fx.index, fx.zone end
+    if not id then rem_fail('Monisette not found in this zone') return end
+    rem = { active = true, ch = ch, item_id = REM_ITEM_BASE + ch, want = want,
+        npc_id = id, npc_index = index, zone = zone or 246, phase = 'prep', t = os.clock() }
+    alex_chat(207, ('[Alexandria] retrieving %dx Rems Tale Ch.%d'):format(want, ch), 'progress')
+end
+
+function rem_tick(now)
+    if not rem or not rem.active then return end
+    if rem.phase == 'prep' then
+        if not rem_near() then rem.status = 'go to Monisette'; return end
+        rem_poke()
+    elseif rem.phase == 'await_menu' then
+        if (os.clock() - (rem.t or now)) > 8 then rem_fail('menu did not open') end
+    elseif rem.phase == 'await_item' then
+        -- One talk/select pulls the whole requested quantity at once (count is packed into the option),
+        -- so wait for all `want` to land in inventory, then finish.
+        local got = rf_inv_count(rem.item_id) - (rem.before or 0)
+        if got >= rem.want then
+            alex_chat(207, ('[Alexandria] retrieved %dx Rems Tale Ch.%d'):format(rem.want, rem.ch), 'progress')
+            rem = nil
+        elseif (os.clock() - (rem.t or now)) > 8 then
+            if got > 0 then
+                alex_chat(207, ('[Alexandria] retrieved %dx Rems Tale Ch.%d (wanted %d)'):format(got, rem.ch, rem.want), 'progress')
+            else
+                rem_fail('chapters did not arrive')
+            end
+            rem = nil
+        end
+    end
+end
+
+-- Answer Monisette's storage menu (0x181). The option packs BOTH the chapter and the quantity:
+-- low byte = chapter (1-10), high byte = how many to withdraw (captures only ever took 1 -> 0x01xx).
+-- So `want` chapters come out in a single sequence. Any other menu = wrong event -> option 0 and abort.
+function rem_incoming(id, data)
+    if not rem or not rem.active or rem.phase ~= 'await_menu' then return nil end
+    if id ~= 0x034 and id ~= 0x032 then return nil end
+    local ok, p = pcall(packets.parse, 'incoming', data)
+    if not (ok and p) then return nil end
+    if p['NPC Index'] ~= nil and p['NPC Index'] ~= rem.npc_index then return nil end
+    local menu = p['Menu ID']
+    if menu ~= REM_MENU then
+        packets.inject(packets.new('outgoing', 0x05B, { ['Target'] = rem.npc_id, ['Option Index'] = 0, ['Target Index'] = rem.npc_index, ['Zone'] = rem.zone, ['Menu ID'] = menu or REM_MENU }))
+        rem_fail('unexpected menu ' .. tostring(menu))
+        return true
+    end
+    packets.inject(packets.new('outgoing', 0x05B, { ['Target'] = rem.npc_id, ['Option Index'] = rem.want * 256 + rem.ch, ['Target Index'] = rem.npc_index, ['Zone'] = rem.zone, ['Menu ID'] = REM_MENU }))
+    rem.phase = 'await_item'; rem.t = os.clock()
+    return true
+end
+
 windower.register_event('incoming chunk', function(id, data, modified, injected)
     if capture then capture_record('in', id, data) end
     if po_state ~= 0 and packets_ok then
-        local r = po_incoming(id, data)
+        local ok, r = xpcall(function() return po_incoming(id, data) end, debug.traceback)
+        if not ok then pull_log('PO_INCOMING CRASH (id=' .. tostring(id) .. '):\n' .. tostring(r)); r = nil end
         if r ~= nil then return r end
     end
     if aug_active() and packets_ok then
         local r = aug_incoming(id, data)
+        if r ~= nil then return r end
+    end
+    if rf_active() and packets_ok then
+        local r = rf_incoming(id, data)
+        if r ~= nil then return r end
+    end
+    if rem_active() and packets_ok then
+        local r = rem_incoming(id, data)
         if r ~= nil then return r end
     end
     if gobbie_run and packets_ok then
@@ -7258,7 +8618,24 @@ windower.register_event('incoming chunk', function(id, data, modified, injected)
         if next(shop.items) ~= nil then shop.items = {}; shop_dirty = true end
     elseif id == 0x113 then
         local ok, p = pcall(packets.parse, 'incoming', data)
-        if ok and p then currency_cur1 = p; currency_cur1_id = (windower.ffxi.get_player() or {}).id; currency_dirty = true end
+        if ok and p then
+            currency_cur1 = p; currency_cur1_id = (windower.ffxi.get_player() or {}).id
+            -- Windower's 0x113 definition is stale and only names Rem's Tale Chapters 1-5, so 6-10 come
+            -- back nil (read as 0 stored). They are ten consecutive u8 in the packet (XiPackets: byte
+            -- 207..216, 1-indexed), so read all ten from the raw bytes. Only trust the offset if the raw
+            -- 1-5 agree with Windower's parse, so a wrong offset can never silently corrupt the counts.
+            if #data >= 216 then
+                local match = true
+                for n = 1, 5 do
+                    local wv = p['Rems Tale Chapter ' .. n]
+                    if type(wv) == 'number' and wv ~= data:byte(206 + n) then match = false; break end
+                end
+                if match then
+                    for n = 1, 10 do currency_cur1['Rems Tale Chapter ' .. n] = data:byte(206 + n) end
+                end
+            end
+            currency_dirty = true
+        end
     elseif id == 0x118 then
         local ok, p = pcall(packets.parse, 'incoming', data)
         if ok and p then currency_cur2 = p; currency_cur2_id = (windower.ffxi.get_player() or {}).id; currency_dirty = true end
@@ -7292,6 +8669,10 @@ end)
 
 windower.register_event('outgoing chunk', function(id, original, modified, injected)
     if capture then capture_record('out', id, modified or original) end
+    -- A real appraise/confirm means the player is working the sell menu by hand. Hold off our
+    -- own auto-sell for a few seconds so an injected 0x085 can't confirm the item they are only
+    -- price-checking (0x084 appraise and 0x085 confirm share one server-side selected-item slot).
+    if not injected and (id == 0x84 or id == 0x85) then shop_manual_until = os.clock() + 5 end
     if trade_debug and (id == 0x032 or id == 0x033 or id == 0x034) then
         local src = modified or original
         trade_log(('OUT 0x%03X %s'):format(id, injected and 'INJ ' or 'REAL') .. dbox_hex(src))
@@ -7355,6 +8736,10 @@ windower.register_event('status change', function(new, old)
     end
 end)
 
+windower.register_event('login', function()
+    rf_paused_checked = false; rf_paused = nil; rf_dirty = true   -- reload the paused reforge for the new character
+end)
+
 prof_on = false
 prof = {}
 prof_frames = 0
@@ -7392,8 +8777,86 @@ function mem_log_sample()
     if ok then mem_log_write(line) end
 end
 
-windower.register_event('prerender', function()
+-- ===== Self-trigger channel =====================================================================
+-- Lets an external driver run organize/preview/reload without the desktop app pressing the button.
+-- Preview/organize REPLAY the last rules the desktop sent (cached in memory + persisted to
+-- debug/last_org.json so they survive a //lua reload); routing (name->ids, layout_map) is recomputed
+-- from those rules every run, so an addon-side fix is validated just by writing "preview". Control file
+-- debug/trigger.txt holds one word: "preview" | "organize" | "reload". It fires once, then is deleted.
+org_last_rules = nil
+org_trigger_t = 0
+function org_cache_rules(msg)
+    org_last_rules = msg
+    if not json_ok then return end
+    local ok, raw = pcall(json.encode, msg)
+    if not ok or type(raw) ~= 'string' then return end
+    local base = windower.addon_path .. 'debug'
+    if windower.dir_exists and not windower.dir_exists(base) then windower.create_dir(base) end
+    local f = io.open(base .. '/last_org.json', 'w')
+    if f then f:write(raw); f:close() end
+end
+function org_trigger_check(now)
+    if (now - org_trigger_t) < 1.0 then return end
+    org_trigger_t = now
+    local base = windower.addon_path .. 'debug'
+    local path = base .. '/trigger.txt'
+    local f = io.open(path, 'r')
+    if not f then return end
+    local cmd = (f:read('*a') or ''):gsub('%s+', ''):lower()
+    f:close()
+    os.remove(path)   -- fire exactly once
+    if cmd == '' then return end
+    if cmd == 'reload' then windower.send_command('lua r Alexandria'); return end
+    if cmd ~= 'preview' and cmd ~= 'organize' then return end
+    local rules = org_last_rules
+    if not rules and json_ok then
+        local lf = io.open(base .. '/last_org.json', 'r')
+        if lf then
+            local raw = lf:read('*a'); lf:close()
+            local ok, m = pcall(json.decode, raw)
+            if ok and type(m) == 'table' then rules = m; org_last_rules = m end
+        end
+    end
+    org_debug = true   -- a self-triggered run always emits debug/organize_snapshot.json for the analyzer
+    if rules and not org_active then do_organize(rules, cmd == 'preview') end
+end
+
+-- Authoritative "past the loading screen and playable" check (mirrors Project Cadmus IS_LOADED): on a load
+-- screen get_player() is nil; at the TAIL of a zone-in get_player() can repopulate BEFORE the local player
+-- entity is placed in the mob array, so also require the player mob to exist with a real (non-0,0,0) position.
+-- A non-zero zone id rules out the sentinel transient. This is the state that was still injecting and crashing.
+function is_loaded()
+    local p = windower.ffxi.get_player()
+    if not p or not p.id then return false end
+    local info = windower.ffxi.get_info()
+    if not info or not info.logged_in or (info.zone or 0) == 0 then return false end
+    local mob = windower.ffxi.get_mob_by_id(p.id)
+    if not mob or not mob.x or (mob.x == 0 and mob.y == 0 and mob.z == 0) then return false end
+    return true
+end
+
+-- Safe only when fully in-world (is_loaded), idle or engaged (not cutscene/dead/mounted), and AUTO_SETTLE
+-- seconds have passed SINCE the world finished loading (loaded_since, reset to 0 on every zone / whenever we
+-- fall out of the loaded state). Gates every periodic auto injector.
+function world_ready(now)
+    if loaded_since == 0 then return false end
+    if (now - loaded_since) < AUTO_SETTLE then return false end
+    local p = windower.ffxi.get_player()
+    return p and (p.status == 0 or p.status == 1) or false
+end
+
+windower.register_event('zone change', function()
+    loaded_since = 0         -- force a fresh settle after the new zone finishes loading
+    shop_session = false     -- any open shop is gone after a zone
+    shop_sold = {}
+end)
+
+function alex_prerender()
     local now = os.clock()
+    -- Track when the world finished loading: stamp on the first fully-loaded frame, reset to 0 the moment we
+    -- fall out of the loaded state (load screen / mid-zone). The auto-action buffer counts from this stamp.
+    if is_loaded() then if loaded_since == 0 then loaded_since = now end else loaded_since = 0 end
+    org_trigger_check(now)   -- self-trigger channel (runs even while the desktop is disconnected)
     if prof_on then prof_frames = prof_frames + 1 end
     if mem_log_on and (now - mem_sample_t) >= mem_log_interval then
         mem_sample_t = now
@@ -7582,6 +9045,7 @@ windower.register_event('prerender', function()
     PF('cfarm_tick', cfarm_tick, now)
     PF('curio_scan_tick', curio_scan_tick, now)
     PF('store_tick', store_tick, now)
+    PF('store_drop_tick', store_drop_tick, now)
     PF('gobbie_tick', gobbie_tick, now)
     local store_zid = (windower.ffxi.get_info() or {}).zone or 0
     if store_zid ~= 0 then
@@ -7731,11 +9195,17 @@ windower.register_event('prerender', function()
             if invf then queue_send(invf) end
             if prof_on then prof_mark('build_inventory', ist) end
         end
-        if next(autosort_bags) then autosort_check() end
-        if auto_drop then scan_drops() end
-        if clean_set then if now < clean_until then scan_drops(clean_set) else clean_set = nil end end
-        if (sell_anywhere and in_town()) or (shop_session and shop_autosell) then shop_autosell_run() end
-        if cfarm then cfarm_sell(cfarm.item) end
+        -- Auto packet actions must NEVER fire mid-zone / on the loading screen: inventory reloads on zone-in
+        -- and would burst-inject sort/drop/sell before the player is in-world, which can crash the client.
+        if world_ready(now) then
+            if next(autosort_bags) then autosort_check() end
+            if auto_drop then scan_drops() end
+            if clean_set then if now < clean_until then scan_drops(clean_set) else clean_set = nil end end
+            if (sell_anywhere and in_town()) or (shop_session and shop_autosell) then shop_autosell_run() end
+            if cfarm then cfarm_sell(cfarm.item) end
+        elseif clean_set and now >= clean_until then
+            clean_set = nil   -- let a timed clean expire even while auto actions are held
+        end
     end
 
     if ki_dirty and now - ki_dirty_at >= 1.0 then
@@ -7752,7 +9222,8 @@ windower.register_event('prerender', function()
 
     if slips_dirty and (now - slips_dirty_at >= 1.0 or now - slips_first_dirty >= 2.5) then
         slips_dirty = false
-        queue_send(build_slips())
+        local ok, out = xpcall(build_slips, debug.traceback)
+        if ok then queue_send(out) else pull_log('BUILD_SLIPS CRASH:\n' .. tostring(out)) end
     end
 
     if po_consolidate_state then
@@ -7850,6 +9321,26 @@ windower.register_event('prerender', function()
         aug_info_dirty = false
         queue_send(build_auginfo())
     end
+    PF('rf_tick', rf_tick, now)
+    if rem then PF('rem_tick', rem_tick, now) end
+    -- Once the player is known (post-login), load any paused reforge saved for this character so the
+    -- desktop can offer to resume it. Cheap one-shot; reset on login for a character swap.
+    if not rf_paused_checked and not rf then
+        local me = windower.ffxi.get_player()
+        if me and me.name then rf_paused_checked = true; rf_load_paused() end
+    end
+    -- Emit a reforge frame on ANY state change, not only when a code path remembered to set rf_dirty.
+    -- Several prep/wait status transitions (go-to-NPC, gathering, waiting) return without dirtying, which
+    -- froze the desktop panel on a stale countdown. Diffing the built frame guarantees the UI tracks the
+    -- true state; identical frames are suppressed so we never spam the socket. Only build while a reforge
+    -- exists (or dirty forces the one-shot inactive frame) so an idle client does no per-tick work.
+    if rf or rf_paused or rf_dirty then
+        local rframe = build_reforge()
+        if rf_dirty or rframe ~= rf_last_frame then
+            rf_dirty = false; rf_last_frame = rframe
+            queue_send(rframe)
+        end
+    end
 
     PF('bz_tick', bz_tick, now)
     if bz_sellers_dirty then
@@ -7893,7 +9384,19 @@ windower.register_event('prerender', function()
         if n and n > 0 then txbuf = txbuf:sub(n + 1) end
         if serr == 'closed' then disconnect() return end
     end
+    sage_tick(now)   -- Sage master-overlay fan-out (tee frames + read pool commands)
     if prof_on then prof_mark('TOTAL_FRAME', now) end
+end
+
+-- Wrap the whole frame so a single bad call (e.g. a lib table.it crash) can't abort the loop every frame,
+-- which silently stalls the move queue and spams chat. Capture the full stack once so the culprit is exact.
+alex_prerender_crashes = 0
+windower.register_event('prerender', function()
+    local ok, err = xpcall(alex_prerender, debug.traceback)
+    if not ok then
+        alex_prerender_crashes = alex_prerender_crashes + 1
+        if alex_prerender_crashes <= 5 then pull_log('PRERENDER CRASH #' .. alex_prerender_crashes .. ':\n' .. tostring(err)) end
+    end
 end)
 
 function ax_forward(a)
@@ -8115,11 +9618,10 @@ windower.register_event('addon command', function(...)
                 alex_chat(207, '[Alexandria] capture not running; //ax capture start first', 'error')
             else
                 local c = capture; capture = nil
-                local r = store_capture_commit(c)
+                local r = store_capture_commit(c, true)  -- record packets only; NEVER register a storage NPC (that is //ax learn)
                 local npcname, eid, eidx, item_names, primary = r.npcname, r.eid, r.eidx, r.item_names, r.primary
 
                 local lines = {}
-                lines[#lines + 1] = '=== Alexandria storage capture ==='
                 lines[#lines + 1] = ('when=%s  zone=%d  packets=%d'):format(os.date('%Y-%m-%d %H:%M:%S'), c.zone, #c.events)
                 lines[#lines + 1] = ('NPC: name=%s id=%s index=%s menu=%s'):format(tostring(npcname), tostring(eid), tostring(eidx), tostring(c.npc.menu))
                 lines[#lines + 1] = ('item(s) traded: %s'):format(#item_names > 0 and table.concat(item_names, ', ') or '(none detected)')
@@ -8127,10 +9629,27 @@ windower.register_event('addon command', function(...)
                     lines[#lines + 1] = 'STORE_FIXED_NPCS entry:'
                     lines[#lines + 1] = ("    ['%s'] = { zone = %d, id = %d, index = %d },"):format(tostring(npcname), c.zone, eid, eidx)
                 end
-                lines[#lines + 1] = '--- sequence ---'
+                -- PII scrub: redact the capturing character's OWN server id + name from the hex/notes so
+                -- the file is safe to hand to the dev. NPC ids/indices are kept -- the executor needs them.
+                local me = windower.ffxi.get_player()
+                local reds = {}
+                if me and me.id and me.id > 0 then
+                    local id = me.id
+                    reds[#reds + 1] = { ('%02X %02X %02X %02X'):format(id % 256, math.floor(id / 256) % 256, math.floor(id / 65536) % 256, math.floor(id / 16777216) % 256), 'ID ID ID ID' }
+                end
+                if me and me.name and #me.name > 0 then
+                    local nb, nm = {}, {}
+                    for i = 1, #me.name do nb[i] = ('%02X'):format(me.name:byte(i)); nm[i] = 'NM' end
+                    reds[#reds + 1] = { table.concat(nb, ' '), table.concat(nm, ' ') }
+                end
+                local function cap_scrub(s)
+                    if type(s) ~= 'string' then return s end
+                    for _, r in ipairs(reds) do s = s:gsub(r[1], r[2]) end
+                    return s
+                end
                 for _, ev in ipairs(c.events) do
-                    lines[#lines + 1] = ('[+%7.3f] %s 0x%03X len=%-3d %s'):format(ev.t, ev.dir == 'in' and 'IN ' or 'OUT', ev.id, ev.len, ev.note)
-                    lines[#lines + 1] = '            ' .. ev.hex
+                    lines[#lines + 1] = ('[+%7.3f] %s 0x%03X len=%-3d %s'):format(ev.t, ev.dir == 'in' and 'IN ' or 'OUT', ev.id, ev.len, cap_scrub(ev.note))
+                    lines[#lines + 1] = '            ' .. cap_scrub(ev.hex)
                 end
 
                 local base = windower.addon_path .. 'debug'

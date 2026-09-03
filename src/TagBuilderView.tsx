@@ -6,8 +6,9 @@ import { useKnownCharacters, useAvailableIcons, useAcMap } from './bridge';
 import { useItemNames, itemNameMatches } from './itemNames';
 import { IconInner } from './atlasIcon';
 import { AH_CATEGORY_TREE, AH_CATEGORY_TOP } from './ahCategories';
-import { Segmented, Select } from './ui';
+import { Segmented, Select, Button } from './ui';
 import { setTip, clearTip, suppressTip, HoverTip } from './hoverTip';
+import { logicalRect, logicalViewport } from './uiZoom';
 import { useItemTags, createTag, renameTag, recolorTag, deleteTag, reorderTags, bulkSetTag, countForTag, TAG_COLORS, type TagDef } from './itemTags';
 import { TEMPORARY_BAG } from './bagConstants';
 
@@ -15,10 +16,6 @@ type Row = { id: number; n: string };
 type Box = { x0: number; y0: number; x1: number; y1: number };
 
 const inputCls = 'bg-field border border-line rounded-md px-3 py-1.5 text-xs text-fg-2 placeholder-fg-4 outline-none focus:border-accent/50 transition-colors';
-const btn = 'shrink-0 inline-flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-semibold rounded-md border border-line bg-field text-fg-3 hover:text-fg hover:border-line-2 transition-colors disabled:opacity-40 disabled:cursor-not-allowed';
-const btnPrimary = 'shrink-0 inline-flex items-center gap-1 px-3 py-1.5 text-[11px] font-semibold rounded-md bg-accent text-on-accent hover:bg-accent-hover transition-colors disabled:opacity-40 disabled:cursor-not-allowed';
-const btnFill = 'flex-1 inline-flex items-center justify-center gap-1 whitespace-nowrap px-2 py-1.5 text-[11px] font-semibold rounded-md border border-line bg-field text-fg-3 hover:text-fg hover:border-line-2 transition-colors disabled:opacity-40 disabled:cursor-not-allowed';
-const btnFillPrimary = 'flex-1 inline-flex items-center justify-center gap-1 whitespace-nowrap px-2 py-1.5 text-[11px] font-semibold rounded-md bg-accent text-on-accent hover:bg-accent-hover transition-colors disabled:opacity-40 disabled:cursor-not-allowed';
 const caret = <svg viewBox="0 0 24 24" className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2.4} strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6" /></svg>;
 
 function TagDropdown({ label, primary, fill, tags, empty, disabled, onPick }: { label: string; primary?: boolean; fill?: boolean; tags: TagDef[]; empty: string; disabled?: boolean; onPick: (id: string) => void }) {
@@ -28,8 +25,10 @@ function TagDropdown({ label, primary, fill, tags, empty, disabled, onPick }: { 
   const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
   useEffect(() => {
     if (!open) return;
-    const r = btnRef.current?.getBoundingClientRect();
-    if (r) setPos({ left: Math.max(6, Math.min(r.left, window.innerWidth - 186)), top: r.bottom + 4 });
+    const raw = btnRef.current?.getBoundingClientRect();
+    // Position in the menu's own (zoom-adjusted) coordinate space so a uiScale > 1 never throws it off-screen;
+    // see uiZoom.ts. No-op at 100%.
+    if (raw) { const r = logicalRect(raw); setPos({ left: Math.max(6, Math.min(r.left, logicalViewport().w - 186)), top: r.bottom + 4 }); }
     const away = (e: MouseEvent) => { const t = e.target as Node; if (!btnRef.current?.contains(t) && !menuRef.current?.contains(t)) setOpen(false); };
     const key = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
     document.addEventListener('mousedown', away);
@@ -38,7 +37,7 @@ function TagDropdown({ label, primary, fill, tags, empty, disabled, onPick }: { 
   }, [open]);
   return (
     <>
-      <button ref={btnRef} disabled={disabled} onClick={() => setOpen((o) => !o)} className={fill ? (primary ? btnFillPrimary : btnFill) : (primary ? btnPrimary : btn)}>{label}{caret}</button>
+      <Button ref={btnRef} variant={primary ? 'primary' : 'secondary'} size="sm" disabled={disabled} onClick={() => setOpen((o) => !o)} className={fill ? 'flex-1 whitespace-nowrap' : 'shrink-0'}>{label}{caret}</Button>
       {open && pos && createPortal(
         <div ref={menuRef} className="fixed z-[9990] w-[180px] rounded-md border border-line bg-popover shadow-2xl p-1 max-h-72 overflow-y-auto" style={{ left: pos.left, top: pos.top }}>
           {tags.length === 0 ? <div className="px-2 py-2 text-[11px] text-fg-4">{empty}</div> : tags.map((t) => (
@@ -291,7 +290,7 @@ export default function TagBuilderView() {
         <aside className="w-44 @min-[760px]:w-56 shrink-0 flex flex-col border-r border-line">
           <form onSubmit={(e) => { e.preventDefault(); const id = createTag(newName); if (id) { setNewName(''); setFilter(id); } }} className="flex gap-1.5 p-2.5 border-b border-line">
             <input value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="New tag…" className={`flex-1 min-w-0 ${inputCls}`} />
-            <button type="submit" disabled={!newName.trim()} className={btnPrimary} aria-label="Add tag">+</button>
+            <Button type="submit" variant="primary" size="sm" disabled={!newName.trim()} className="shrink-0" aria-label="Add tag">+</Button>
           </form>
           <div ref={tagListRef} className="flex-1 min-h-0 overflow-y-auto p-2 flex flex-col gap-0.5">
             <button onClick={() => setFilter((f) => (f === 'untagged' ? null : 'untagged'))} className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-[12px] font-semibold transition-colors ${filter === 'untagged' ? 'bg-accent/15 text-accent' : 'text-fg-3 hover:bg-field/50'}`}>
@@ -326,10 +325,10 @@ export default function TagBuilderView() {
               <div className="flex-1"><Select value={catTop} onChange={setCatTop} options={catOptions} full /></div>
             </div>
             <div className="flex flex-wrap items-center gap-1.5">
-              <button onClick={() => setSel(new Set(view.map((r) => r.id)))} disabled={view.length === 0 || allSelected} className={btnFill}>Select All</button>
+              <Button variant="secondary" size="sm" className="flex-1 whitespace-nowrap" onClick={() => setSel(new Set(view.map((r) => r.id)))} disabled={view.length === 0 || allSelected}>Select All</Button>
               <TagDropdown label="Tag" primary fill tags={tags} empty="No tags yet." disabled={sel.size === 0} onPick={(id) => bulkSetTag(selArr, id, true)} />
               <TagDropdown label="Untag" fill tags={tagsOnSel} empty="Selection has no tags." disabled={sel.size === 0} onPick={(id) => bulkSetTag(selArr, id, false)} />
-              <button onClick={() => setSel(new Set())} disabled={sel.size === 0} className={btnFill}>Clear</button>
+              <Button variant="secondary" size="sm" className="flex-1 whitespace-nowrap" onClick={() => setSel(new Set())} disabled={sel.size === 0}>Clear</Button>
             </div>
             <div className="relative">
               <input value={q} onChange={(e) => setQ(e.target.value)} placeholder={source === 'all' && !filter ? 'Search all items…' : 'Search…'} className={`w-full pr-8 ${inputCls}`} />

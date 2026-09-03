@@ -53,12 +53,50 @@ export function addConsolidateItem(name: string, itemName: string) {
   void save();
 }
 
+// Add many items to one character in a single write (bulk-add from a tag or a bag). Each item is moved off
+// every other character's list (an item belongs to exactly one recipient), then appended to `name`, de-duped
+// and preserving the existing order.
+export function addConsolidateItems(name: string, itemNames: string[]) {
+  if (!name || !itemNames.length) return;
+  const incoming = new Set(itemNames.map((n) => n.toLowerCase()));
+  const s: Store = {};
+  for (const k in store) {
+    const filtered = store[k].filter((n) => !incoming.has(n.toLowerCase()));
+    if (filtered.length) s[k] = filtered;
+  }
+  const kept = s[name] ?? [];
+  const have = new Set(kept.map((n) => n.toLowerCase()));
+  const additions: string[] = [];
+  for (const n of itemNames) { const lc = n.toLowerCase(); if (!have.has(lc)) { have.add(lc); additions.push(n); } }
+  s[name] = [...kept, ...additions];
+  store = s;
+  notify();
+  void save();
+}
+
 export function removeConsolidateItem(name: string, itemName: string) {
   const cur = store[name];
   if (!cur) return;
   const next = cur.filter((n) => n.toLowerCase() !== itemName.toLowerCase());
   const s = { ...store };
   if (next.length) s[name] = next; else delete s[name];
+  store = s;
+  notify();
+  void save();
+}
+
+// Remove many items across characters in a single write (bulk delete from the preference lists). `byChar`
+// maps a character to the item names to drop from its list.
+export function removeConsolidateItems(byChar: Record<string, string[]>) {
+  const s: Store = {};
+  let changed = false;
+  for (const k in store) {
+    const rm = new Set((byChar[k] ?? []).map((n) => n.toLowerCase()));
+    const kept = rm.size ? store[k].filter((n) => !rm.has(n.toLowerCase())) : store[k];
+    if (kept.length !== store[k].length) changed = true;
+    if (kept.length) s[k] = kept;
+  }
+  if (!changed) return;
   store = s;
   notify();
   void save();

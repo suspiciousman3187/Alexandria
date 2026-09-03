@@ -5,6 +5,7 @@ import { IconInner } from './atlasIcon';
 import { useItemDescription, useAhCatalog } from './bridge';
 import { acPathLabel } from './ahCategories';
 import { RichDescription, WhereOwned } from './ItemTooltip';
+import { logicalRect, logicalViewport } from './uiZoom';
 import { getCachedValue } from './priceStore';
 
 const fmtGil = (n: number) => Math.round(n).toLocaleString();
@@ -36,14 +37,18 @@ export function HoverTip({ assets, iconSet, server }: { assets?: string; iconSet
   const desc = useItemDescription(st?.meta.id ?? 0);
   const ahCat = useAhCatalog();
   if (!st) return null;
-  const { meta, rect } = st;
+  const { meta } = st;
   const W = 256;
+  // Position in the tooltip's own (zoom-adjusted) coordinate space so a uiScale > 1 never throws it off-screen;
+  // see uiZoom.ts. No-op at 100%.
+  const rect = logicalRect(st.rect);
+  const vp = logicalViewport();
   let left = rect.left - 4;
-  if (left + W > window.innerWidth) left = window.innerWidth - W - 6;
+  if (left + W > vp.w) left = vp.w - W - 6;
   if (left < 6) left = 6;
-  const below = rect.bottom + 240 < window.innerHeight;
+  const below = rect.bottom + 240 < vp.h;
   const top = below ? rect.bottom + 6 : Math.max(6, rect.top - 6);
-  const maxH = Math.max(200, below ? window.innerHeight - top - 8 : rect.top - 12);
+  const maxH = Math.max(200, below ? vp.h - top - 8 : rect.top - 12);
   const badges = flagBadges(meta.f);
   const ahItem = ahCat.items.find((i) => i.id === meta.id);
   const gear = ahItem && (ahItem.lvl > 0 || (ahItem.j && ahItem.j.length > 0));

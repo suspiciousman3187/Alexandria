@@ -1,8 +1,9 @@
-import { useState, useRef, useEffect, useId, type ReactNode, type CSSProperties, type InputHTMLAttributes } from 'react';
+import { useState, useRef, useEffect, useId, forwardRef, type ReactNode, type CSSProperties, type InputHTMLAttributes, type ButtonHTMLAttributes } from 'react';
 import { createPortal } from 'react-dom';
 import { AnimatePresence, motion } from 'motion/react';
 import { bagColor } from './bagColors';
 import { useAnon } from './anonymize';
+import { logicalRect, logicalViewport } from './uiZoom';
 
 // Text/search input with a built-in clear (×) button that appears once there's text.
 // `wrap` styles the relative container (layout); `className` styles the input (visual).
@@ -20,6 +21,39 @@ export function SearchInput({ value, onChange, className = '', wrap = 'flex-1 mi
     </div>
   );
 }
+
+// Canonical action button. Encodes the house style so no view has to hand-roll (and so a bare
+// text-link "button" never slips through again). Variants: primary (accent fill), secondary (bordered
+// field, the default), ghost (subtle bordered, for small header actions like All/None/Clear), danger
+// (soft red), link (bare text link, e.g. external wiki links). Sizes: sm / md. It forwards every native
+// button attribute, so onClick/disabled/title/aria-* just work.
+type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger' | 'link';
+type ButtonSize = 'xs' | 'sm' | 'md';
+
+const BTN_SIZE: Record<ButtonSize, string> = {
+  xs: 'px-2 py-0.5 text-[10px]',   // tiny header controls (All / None / Clear)
+  sm: 'px-2.5 py-1 text-[11px]',
+  md: 'px-3.5 py-1.5 text-[12px]',
+};
+const BTN_VARIANT: Record<ButtonVariant, string> = {
+  primary: 'bg-accent text-on-accent enabled:hover:bg-accent-hover',
+  secondary: 'border border-line bg-field text-fg-2 enabled:hover:text-fg enabled:hover:border-line-2',
+  ghost: 'border border-line/70 text-fg-3 enabled:hover:text-fg enabled:hover:bg-field',
+  danger: 'border border-red-500/40 bg-red-500/15 text-red-300 enabled:hover:bg-red-500/25',
+  link: '', // handled below (no chrome)
+};
+// `active` (toggle-selected) look. Replaces the variant chrome outright rather than layering over it, so
+// there is no Tailwind same-specificity override fight. Pass `active` for on/off toggle buttons.
+const BTN_ACTIVE = 'border border-accent bg-accent/15 text-accent';
+
+export const Button = forwardRef<HTMLButtonElement,
+  { variant?: ButtonVariant; size?: ButtonSize; active?: boolean } & ButtonHTMLAttributes<HTMLButtonElement>>(
+  function Button({ variant = 'secondary', size = 'md', active = false, className = '', type = 'button', ...rest }, ref) {
+    const base = variant === 'link'
+      ? 'le-tap inline-flex items-center gap-1 font-semibold text-sky-300 enabled:hover:text-sky-200 enabled:hover:underline transition-colors disabled:opacity-40'
+      : `le-tap inline-flex items-center justify-center gap-1.5 font-semibold rounded-md transition-colors disabled:opacity-40 disabled:cursor-default ${BTN_SIZE[size]} ${active ? BTN_ACTIVE : BTN_VARIANT[variant]}`;
+    return <button ref={ref} type={type} className={`${base} ${className}`} {...rest} />;
+  });
 
 // Bag identity tag: a per-bag color-coded label so bag origin is scannable wherever
 // items from multiple bags are shown together.
@@ -272,10 +306,14 @@ export function Select({
 
   useEffect(() => {
     if (!open) return;
-    const r = btn.current?.getBoundingClientRect();
-    if (r) {
+    const raw = btn.current?.getBoundingClientRect();
+    if (raw) {
+      // Position in the menu's own (zoom-adjusted) coordinate space so a uiScale > 1 never throws it
+      // off-screen; see uiZoom.ts. No-op at 100%.
+      const r = logicalRect(raw);
+      const vh = logicalViewport().h;
       const menuH = Math.min(options.length * 30 + 8, menuMaxH);
-      const up = r.bottom + menuH > window.innerHeight && r.top > menuH;
+      const up = r.bottom + menuH > vh && r.top > menuH;
       setPos({ left: r.left, top: up ? r.top : r.bottom, width: r.width, up });
     }
     // Close when the PAGE scrolls (the fixed menu can't track the button), but
@@ -300,7 +338,7 @@ export function Select({
 
   const menuStyle: CSSProperties = pos
     ? (pos.up
-      ? { left: pos.left, width: pos.width, bottom: window.innerHeight - pos.top + 4 }
+      ? { left: pos.left, width: pos.width, bottom: logicalViewport().h - pos.top + 4 }
       : { left: pos.left, width: pos.width, top: pos.top + 4 })
     : {};
 

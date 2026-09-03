@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
-import { Group, Row, RowStacked, Toggle, Chip, Select, SectionTabs, Stepper } from './ui';
+import { Group, Row, RowStacked, Toggle, Chip, Select, SectionTabs, Stepper, Button } from './ui';
 import { Collapse } from './overlay';
 import { useSticky } from './sticky';
 import { useSettings, setSettings } from './settings';
@@ -23,6 +23,7 @@ import { useBoxes, useKnownCharacters, useAvailableIcons, retrieveItems, broadca
 import { useStoragePrefs, setCharLayout, STORABLE_BAGS, ALL_PLAYERS_KEY, ALL_PLAYERS_LABEL, type LayoutEntry } from './storagePrefs';
 import { ItemSearchAdd } from './ItemSearchAdd';
 import { useOrganize } from './useOrganize';
+import { SlotRoutingEditor } from './SlotRoutingEditor';
 
 function OrgIcon({ id, n, assets, sm }: { id: number; n: string; assets?: string; sm?: boolean }) {
   const [broken, setBroken] = useState(false);
@@ -141,7 +142,7 @@ function StorageLayoutEditor({ storeKey, isAll, nameToId, assets }: { storeKey: 
                 <OrgIcon id={nameToId.get(e.item.toLowerCase()) ?? 0} n={e.item} assets={assets} sm />
                 <span className="min-w-0 flex-1 truncate text-[11px] text-fg-3">{e.item}</span>
                 <span className="shrink-0 text-[10px] text-fg-4">{e.bags.map((b) => STORABLE_BAGS.find((x) => x.id === b)?.name ?? b).join(' › ')}</span>
-                <button onClick={() => commit([...entries, { item: e.item, bags: e.bags.slice() }])} className="shrink-0 text-[10px] font-semibold text-accent hover:text-accent-hover transition-colors">Override</button>
+                <Button variant="ghost" size="sm" className="shrink-0" onClick={() => commit([...entries, { item: e.item, bags: e.bags.slice() }])}>Override</Button>
               </div>
             ))}
           </div>
@@ -362,6 +363,11 @@ export default function OrganizeView() {
       <Group title="Storage Presets">
         <RowStacked label="Send Specific Items To Bags" desc="Route an individual item. This beats any tag rule (set in Tagging → Rules). Bags fill in priority order, overflowing to the next.">
           <StorageLayoutEditor storeKey={scopeKey} isAll={scopeIsAll} nameToId={nameToId} assets={assetsAny} />
+        </RowStacked>
+      </Group>
+      <Group title="Route Equipment By Slot">
+        <RowStacked label="Send A Whole Slot To Bags" desc="Route every equippable piece of a slot (i.e. all Head, all Rings) to a specific set of bags.">
+          <SlotRoutingEditor storeKey={scopeKey} isAll={scopeIsAll} />
         </RowStacked>
       </Group>
       </>

@@ -35,11 +35,17 @@ export function useAutoOrganizeOnMog() {
       const conn = b.conn;
       if (conn == null) continue;
       seen.add(conn);
+      // A box we're seeing for the FIRST time -- app start, or a reconnect after a disconnect / crash / outage
+      // -- must NOT be read as "just walked into a Mog House". A character who was already standing at a Moogle
+      // when the client dropped comes back as a brand-new box with mog=true; without this guard that looked like
+      // a fresh entry and fired an organize NO ONE requested, silently moving items between bags on reconnect.
+      // Seed its state silently; only a genuine not-mog -> mog transition on a box we were already tracking fires.
+      const tracked = prevMog.current.has(conn);
       const was = prevMog.current.get(conn) ?? false;
       const now = !!b.mog;
       prevMog.current.set(conn, now);
 
-      if (enabled && now && !was && !timers.current.has(conn)) {
+      if (enabled && tracked && now && !was && !timers.current.has(conn)) {
         const t = setTimeout(() => {
           timers.current.delete(conn);
           const live = boxesRef.current.find((x) => x.conn === conn);

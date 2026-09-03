@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type CSSProperties } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { useKnownCharacters, broadcastCurrency, type KnownChar } from './bridge';
 import { Segmented, Select } from './ui';
@@ -28,6 +28,10 @@ function Star({ on, onClick }: { on: boolean; onClick: () => void }) {
     </button>
   );
 }
+
+// Skip layout/paint for off-screen currency rows so a long list can't flood the WebView2 GPU compositor on a
+// weak/integrated adapter. Applied to the row header (the always-present element), not the framer wrapper.
+const CURRENCY_ROW_CV: CSSProperties = { contentVisibility: 'auto', containIntrinsicSize: 'auto 30px' };
 
 export default function CurrencyView() {
   const known = useKnownCharacters();
@@ -239,6 +243,7 @@ export default function CurrencyView() {
                       aria-expanded={open}
                       onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleExpand(name); } }}
                       className="le-tap group flex items-center gap-2 px-3 py-1.5 hover:bg-field/40 transition-colors cursor-pointer"
+                      style={CURRENCY_ROW_CV}
                     >
                       <Star on={starSet.has(name)} onClick={() => toggleStar(name)} />
                       <span className="flex-1 min-w-0 truncate text-[12px] text-fg-2 font-medium">{name}</span>

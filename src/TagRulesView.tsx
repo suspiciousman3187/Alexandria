@@ -1,6 +1,6 @@
 import { useMemo } from 'react';
 import { useKnownCharacters } from './bridge';
-import { Group, Row, Select } from './ui';
+import { Group, Row, Select, Button } from './ui';
 import { useSticky } from './sticky';
 import { STORABLE_BAGS, ALL_PLAYERS_KEY, ALL_PLAYERS_LABEL } from './storagePrefs';
 import { useTagRules, setTagRules, type TagRule } from './tagRules';
@@ -46,7 +46,7 @@ function TagRuleCard({ tag, items, own, inherited, isAll, onChange, onClear, onO
         <div className="px-3 py-2.5 flex items-center gap-2">
           <span className="text-[11px] text-fg-4">Follows All Players:</span>
           <span className="min-w-0 flex-1 truncate text-[11px] text-fg-3">{inherited!.bags.map(bagName).join(' › ')}</span>
-          <button onClick={onOverride} className="shrink-0 text-[11px] font-semibold text-accent hover:text-accent-hover transition-colors">Override</button>
+          <Button variant="ghost" size="sm" className="shrink-0" onClick={onOverride}>Override</Button>
         </div>
       ) : (
         <div className="px-3 py-2.5 flex flex-col gap-2.5">
@@ -67,7 +67,7 @@ function TagRuleCard({ tag, items, own, inherited, isAll, onChange, onClear, onO
           {own ? (
             <div className="flex items-center gap-2">
               <span className="min-w-0 flex-1 text-[11px] text-fg-3 rounded-md bg-field/60 px-2.5 py-1.5">{ruleSummary(own)}</span>
-              <button onClick={onClear} className="shrink-0 text-[11px] font-semibold text-fg-4 hover:text-red-300 transition-colors">Clear</button>
+              <Button variant="ghost" size="sm" className="shrink-0" onClick={onClear}>Clear</Button>
             </div>
           ) : (
             <div className="text-[11px] text-fg-4">Not routed yet — pick a bag above to send these items there.{!isAll && inherited ? ' (Overriding the All Players rule.)' : ''}</div>

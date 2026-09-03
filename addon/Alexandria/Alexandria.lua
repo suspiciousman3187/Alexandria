@@ -132,6 +132,7 @@ resupply_opts = {}
 resupply_run = nil
 resupply_cd = 0
 resupply_cd_npc = nil
+resupply_fails = {}         -- curio npc id -> consecutive partial-failure count, to bound retries
 CURIO_NAME = 'Curio Vendor Moogle'
 -- Proximity Buy/Sell vendors. FFXI exposes no shop-detection, so this is a curated map of
 -- NPC name -> the item ids it sells. The run drives them with the same packet engine as
@@ -3699,13 +3700,28 @@ function resupply_sel(opt, unk1)
 end
 
 function resupply_finish(now)
-    local n = resupply_run and resupply_run.bought_n or 0
-    local curio_id = resupply_run and resupply_run.npc_id
-    resupply_cd_npc = npc_near and npc_near.id or nil
-    resupply_cd = now + 30
+    local r = resupply_run
+    local n = r and r.bought_n or 0
+    local curio_id = r and r.npc_id
+    local npc_id = (npc_near and npc_near.id) or curio_id
+    -- Partial failure: a category never opened (multibox contention) AND we're still short. Retry soon
+    -- (bounded) instead of the 30s success cooldown, and tell the desktop this character did NOT finish.
+    local partial = r and (r.failed_cats or 0) > 0 and resupply_needed()
+    local retry = false
+    if partial then
+        local fails = (resupply_fails[npc_id] or 0) + 1
+        resupply_fails[npc_id] = fails
+        retry = fails < 3
+    else
+        resupply_fails[npc_id] = nil
+    end
+    resupply_cd_npc = npc_id
+    resupply_cd = now + (retry and 5 or 30)
     resupply_run = nil
-    emit_resupply(false, 0, 0, 0, 'done')
-    if n > 0 then
+    emit_resupply(false, 0, 0, 0, partial and 'failed' or 'done')
+    if partial then
+        alex_chat(207, '[Alexandria] Curio Moogle: some items did not restock (shop did not open). Retrying.', 'error')
+    elseif n > 0 then
         alex_chat(207, ('[Alexandria] Curio Moogle restock complete. Restocked %d item%s.'):format(n, n == 1 and '' or 's'), 'action')
     else
         alex_chat(207, '[Alexandria] Curio Moogle restock complete.', 'action')
@@ -4049,13 +4065,14 @@ function resupply_tick(now)
     if r.state == 'shop' and now - r.t > 4 then
         resupply_sel(0, 0)
         r.t = os.clock()
-        if (r.retries or 0) < 2 then
+        if (r.retries or 0) < 3 then
             r.retries = (r.retries or 0) + 1
             rs_log('shop stalled opt=' .. tostring(r.cur_opt) .. '; close+retry ' .. r.retries)
             coroutine.schedule(function() if resupply_run == r then resupply_open_cat(r, r.cur_opt) end end, 1.2)
         else
             rs_log('shop never opened opt=' .. tostring(r.cur_opt) .. '; give up')
             r.cat_done[r.cur_opt] = true
+            r.failed_cats = (r.failed_cats or 0) + 1   -- category never opened -> partial restock
             r.retries = 0
             coroutine.schedule(function() if resupply_run == r then resupply_advance(r) end end, 1.2)
         end

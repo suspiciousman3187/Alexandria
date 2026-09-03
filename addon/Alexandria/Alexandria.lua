@@ -150,6 +150,7 @@ pvendor_cd = 0
 pvendor_cd_npc = nil
 pvendor_near = nil          -- { name, id, index } of the nearest cataloged vendor
 pvendor_near_dirty = false
+pvendor_fails = {}          -- npc id -> consecutive shop-did-not-open count, to bound retries
 pvendor_progress = nil
 pvendor_dirty = false
 npc_menu = nil
@@ -3926,14 +3927,20 @@ function pvendor_pick(r)
     return nil
 end
 
-function pvendor_finish(now)
+-- mode: nil = success, 'retry' = shop never opened but worth trying again soon (short cooldown so a
+-- multibox contention miss self-heals), 'giveup' = failed and backed off for the full cooldown. A failed
+-- finish emits phase 'failed' (NOT 'done') so the desktop never counts it as a completed character, and the
+-- caller owns the failure chat line.
+function pvendor_finish(now, mode)
     local r = pvendor_run
+    local failed = (mode == 'retry' or mode == 'giveup')
     pvendor_cd_npc = (r and r.npc_id) or (pvendor_near and pvendor_near.id) or nil
-    pvendor_cd = now + 30
+    pvendor_cd = now + (mode == 'retry' and 5 or 30)
     pvendor_run = nil
     npc_driving = nil
     store_menu_close()            -- release the vendor / close the shop window
-    emit_pvendor(false, 0, 0, 0, 'done')
+    emit_pvendor(false, 0, 0, 0, failed and 'failed' or 'done')
+    if failed then return end
     local n = r and r.bought_n or 0
     local who = (r and r.name) or 'Vendor'
     if n > 0 then
@@ -3986,21 +3993,32 @@ function pvendor_tick(now)
     end
 
     local r = pvendor_run
-    if now - r.start > 45 then pvendor_finish(now); return end
+    if now - r.start > 45 then pvendor_finish(now, 'giveup'); return end
 
     if r.state == 'open' then
         if pvendor_shop_ready(r) then
             r.state = 'buy'; r.t = now
+            pvendor_fails[r.npc_id] = nil       -- opened fine: clear the fail streak for this vendor
             pvendor_buy_step(r, now)
         elseif now - r.t > 3 then
-            -- Poke alone did not open the shop; some vendors gate behind a Buy/Sell menu.
-            -- Answer the captured menu's first option once, then keep waiting for 0x03C.
-            if not r.nudged and npc_menu and npc_menu.id == r.npc_id then
+            -- Shop hasn't opened. Under multibox load the NPC is busy and the first interaction (or its
+            -- 0x03C reply) can be dropped, so we (a) answer a gating Buy/Sell menu if one popped, then
+            -- (b) RE-POKE a few times before giving up, rather than failing after a single attempt.
+            if npc_menu and npc_menu.id == r.npc_id and not r.nudged then
                 r.nudged = true; r.t = now
                 npc_send_select(npc_menu, 0)
-            elseif now - r.t > 6 then
+            elseif (r.pokes or 1) < 4 then
+                r.pokes = (r.pokes or 1) + 1; r.nudged = false; r.t = now
+                store_menu_close()              -- drop any stuck talk menu first
+                local rr, id, idx = r, r.npc_id, r.npc_index
+                coroutine.schedule(function() if pvendor_run == rr then npc_poke(id, idx) end end, 0.3)
+            else
+                local fails = (pvendor_fails[r.npc_id] or 0) + 1
+                pvendor_fails[r.npc_id] = fails
                 alex_chat(207, '[Alexandria] ' .. r.name .. ': shop did not open. Try again at the vendor.', 'error')
-                pvendor_finish(now)
+                -- Keep retrying (short cooldown) for a few rounds so a contention miss self-heals; after
+                -- 3 straight misses back off the full cooldown so a truly unavailable vendor stops looping.
+                pvendor_finish(now, fails < 3 and 'retry' or 'giveup')
             end
         end
     elseif r.state == 'buy' and now - r.t > 4 then

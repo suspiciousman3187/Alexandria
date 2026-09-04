@@ -3718,13 +3718,15 @@ function resupply_finish(now)
     resupply_cd_npc = npc_id
     resupply_cd = now + (retry and 5 or 30)
     resupply_run = nil
-    emit_resupply(false, 0, 0, 0, partial and 'failed' or 'done')
-    if partial then
-        alex_chat(207, '[Alexandria] Curio Moogle: some items did not restock (shop did not open). Retrying.', 'error')
-    elseif n > 0 then
-        alex_chat(207, ('[Alexandria] Curio Moogle restock complete. Restocked %d item%s.'):format(n, n == 1 and '' or 's'), 'action')
-    else
-        alex_chat(207, '[Alexandria] Curio Moogle restock complete.', 'action')
+    -- 'retry' = re-runs itself shortly; 'failed' = backed off but still short. Both are "unfinished" to the
+    -- desktop; a clean restock emits 'done'. No user-facing nag -- Alexandria corrects itself.
+    emit_resupply(false, 0, 0, 0, partial and (retry and 'retry' or 'failed') or 'done')
+    if not partial then
+        if n > 0 then
+            alex_chat(207, ('[Alexandria] Curio Moogle restock complete. Restocked %d item%s.'):format(n, n == 1 and '' or 's'), 'action')
+        else
+            alex_chat(207, '[Alexandria] Curio Moogle restock complete.', 'action')
+        end
     end
     if curio_id then
         for _, t in ipairs({ 1.2, 2.5, 4.0 }) do
@@ -3955,7 +3957,9 @@ function pvendor_finish(now, mode)
     pvendor_run = nil
     npc_driving = nil
     store_menu_close()            -- release the vendor / close the shop window
-    emit_pvendor(false, 0, 0, 0, failed and 'failed' or 'done')
+    -- 'retry' = will re-run itself shortly (not finished, but not a hard failure); 'giveup' = backed off but
+    -- still short. Both are "unfinished" to the desktop; only a clean run emits 'done'.
+    emit_pvendor(false, 0, 0, 0, (mode == 'giveup' and 'failed') or (mode == 'retry' and 'retry') or 'done')
     if failed then return end
     local n = r and r.bought_n or 0
     local who = (r and r.name) or 'Vendor'
@@ -4031,9 +4035,9 @@ function pvendor_tick(now)
             else
                 local fails = (pvendor_fails[r.npc_id] or 0) + 1
                 pvendor_fails[r.npc_id] = fails
-                alex_chat(207, '[Alexandria] ' .. r.name .. ': shop did not open. Try again at the vendor.', 'error')
-                -- Keep retrying (short cooldown) for a few rounds so a contention miss self-heals; after
-                -- 3 straight misses back off the full cooldown so a truly unavailable vendor stops looping.
+                -- No "try again" nag: Alexandria retries itself on a short cooldown for a few rounds so a
+                -- contention miss self-heals, then backs off the full cooldown (and keeps trying after that).
+                -- The desktop batch summary is the only place a still-unfinished character is surfaced.
                 pvendor_finish(now, fails < 3 and 'retry' or 'giveup')
             end
         end

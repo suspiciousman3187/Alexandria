@@ -91,15 +91,15 @@ export function useVendorDone() {
   const activeKey = activeConns.join(',');
   const wasActive = useRef(false);
   const participants = useRef<Set<number>>(new Set());
-  const failed = useRef<Set<number>>(new Set());
+  const unfinished = useRef<Set<number>>(new Set());
   const timer = useRef<number | null>(null);
   useEffect(() => {
-    // Record each participant's latest outcome as it goes idle: 'failed' (shop never opened) marks it, a
-    // later 'done' (a retry that succeeded) clears the mark. So the summary reflects who actually finished.
+    // As each participant goes idle, record whether it finished: only phase 'done' clears it; 'retry'/'failed'
+    // (Alexandria is still auto-retrying that character) leaves it unfinished.
     for (const c of getKnownCharacters()) {
       if (c.conn == null || !participants.current.has(c.conn) || c.pvendor?.active) continue;
-      if (c.pvendor?.phase === 'failed') failed.current.add(c.conn);
-      else if (c.pvendor?.phase === 'done') failed.current.delete(c.conn);
+      if (c.pvendor?.phase === 'done') unfinished.current.delete(c.conn);
+      else unfinished.current.add(c.conn);
     }
     if (activeConns.length > 0) {
       wasActive.current = true;
@@ -111,13 +111,13 @@ export function useVendorDone() {
         if (!wasActive.current) return;
         wasActive.current = false;
         const n = participants.current.size;
-        const failN = failed.current.size;
+        const leftN = unfinished.current.size;
         participants.current = new Set();
-        failed.current = new Set();
+        unfinished.current = new Set();
         for (const c of getKnownCharacters()) {
           if (!(c.online && c.conn != null)) continue;
-          if (failN === 0) axEcho(c.conn, `[Alexandria] Vendor restock complete on all ${n} character${n === 1 ? '' : 's'}.`);
-          else axEcho(c.conn, `[Alexandria] Vendor restock: ${n - failN}/${n} done; ${failN} could not open the shop -- retry at the vendor.`);
+          if (leftN === 0) axEcho(c.conn, `[Alexandria] Vendor restock complete on all ${n} character${n === 1 ? '' : 's'}.`);
+          else axEcho(c.conn, `[Alexandria] Vendor restock: ${n - leftN}/${n} done; still retrying ${leftN}.`);
         }
       }, 6000); // > the addon's 5s retry cooldown, so a self-healing retry re-activates before we summarize
     }

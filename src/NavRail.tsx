@@ -9,7 +9,7 @@ const DISCORD_URL = 'https://discord.com/invite/vSgYvdh8gT';
 
 export type Section =
   | 'inventory' | 'library' | 'recent' | 'watch' | 'drop' | 'dupe' | 'keyitems' | 'currency' | 'trade'
-  | 'pool' | 'lotlist' | 'passlist' | 'pricelist'
+  | 'pool' | 'lotlist' | 'passlist' | 'pricelist' | 'alertlist'
   | 'shop' | 'selllist' | 'resupply' | 'vendors' | 'auction' | 'bazaar' | 'delivery' | 'sparks' | 'networth'
   | 'organize' | 'sequences' | 'commands' | 'store' | 'tags'
   | 'slips' | 'ambuscade' | 'skirmish' | 'reive' | 'geasfete' | 'reforge'
@@ -39,6 +39,7 @@ const ICONS: Record<Section, ReactElement> = {
   lotlist:   rulesIcon,
   passlist:  passIcon,
   pricelist: (<svg viewBox="0 0 24 24" {...S}><rect x="3" y="9" width="12" height="12" rx="1.5" /><path d="M9 9V4.5A1.5 1.5 0 0 1 10.5 3h9A1.5 1.5 0 0 1 21 4.5v9a1.5 1.5 0 0 1-1.5 1.5H15" /></svg>),
+  alertlist: (<svg viewBox="0 0 24 24" {...S}><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" /><path d="M13.7 21a2 2 0 0 1-3.4 0" /></svg>),
   shop:      (<svg viewBox="0 0 24 24" {...S}><path d="M3 9 4.5 4h15L21 9" /><path d="M4 9h16v10a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1z" /><path d="M3 9a2.5 2.5 0 0 0 5 0 2.5 2.5 0 0 0 5 0 2.5 2.5 0 0 0 5 0 2.5 2.5 0 0 0 3 0" /><path d="M9 20v-5h6v5" /></svg>),
   auction:   (<svg viewBox="0 0 24 24" {...S}><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z" /><circle cx="7" cy="7" r="1.2" /></svg>),
   bazaar:    (<svg viewBox="0 0 24 24" {...S}><path d="M5 8h14l-1 4H6z" /><path d="M6 12v7h12v-7" /><path d="M9 8V5a3 3 0 0 1 6 0v3" /></svg>),
@@ -65,7 +66,7 @@ const ICONS: Record<Section, ReactElement> = {
 
 const LABELS: Record<Section, string> = {
   inventory: 'Inventory', library: 'Library', recent: 'Recent Items', watch: 'Watch List', drop: 'Drop List', dupe: 'Consolidate', keyitems: 'Key Items',
-  currency: 'Currency', trade: 'Trade', pool: 'Pool', lotlist: 'Lot List', passlist: 'Pass List', pricelist: 'Price Display',
+  currency: 'Currency', trade: 'Trade', pool: 'Pool', lotlist: 'Lot List', passlist: 'Pass List', pricelist: 'Price Display', alertlist: 'Alerts',
   shop: 'Shop', selllist: 'Sell List', resupply: 'Curio', vendors: 'Vendors', auction: 'Auction', bazaar: 'Bazaar', delivery: 'Delivery', sparks: 'Sparks/Unity', networth: 'Net Worth',
   organize: 'Organize', sequences: 'Sequences', commands: 'Commands', store: 'Storage NPC', tags: 'Tagging',
   slips: 'Storage Slips', ambuscade: 'Ambuscade', skirmish: 'Skirmish', reive: 'Reive', geasfete: 'Geas Fete', reforge: 'Reforge',
@@ -87,7 +88,7 @@ type NavGroup = { id: string; label: string; icon: ReactElement; primary?: Secti
 const GROUPS: NavGroup[] = [
   { id: 'inventory', label: 'Inventory', icon: ICONS.inventory, primary: 'inventory', children: ['recent', 'keyitems', 'currency', 'watch', 'drop', 'selllist'] },
   { id: 'library', label: 'Library', icon: ICONS.library, primary: 'library', children: [] },
-  { id: 'pool', label: 'Pool', icon: ICONS.pool, primary: 'pool', children: ['lotlist', 'passlist', 'pricelist'] },
+  { id: 'pool', label: 'Pool', icon: ICONS.pool, primary: 'pool', children: ['lotlist', 'passlist', 'pricelist', 'alertlist'] },
   { id: 'market', label: 'Market', icon: GROUP_ICON.market, primary: 'auction', children: ['delivery', 'bazaar', 'shop', 'networth'] },
   { id: 'tools', label: 'Tools', icon: GROUP_ICON.tools, primary: 'organize', children: ['tags', 'dupe', 'store', 'slips', 'resupply', 'vendors', 'sparks'] },
   { id: 'augment', label: 'Augment', icon: armor, primary: 'ambuscade', children: ['reive', 'skirmish', 'geasfete', 'reforge'] },

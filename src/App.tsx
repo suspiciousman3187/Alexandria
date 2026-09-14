@@ -22,6 +22,7 @@ import { useDropSync, useDrop, setDrop } from './drop';
 import { useShopSellSync } from './shop';
 import { useShopNpcSync } from './menuShortcuts';
 import { usePoolRulesSync } from './poolRules';
+import { usePoolAlert } from './poolAlerts';
 import { usePoolPriceTee } from './poolPriceTee';
 import { usePoolSageBridge } from './poolSageBridge';
 import { useSettings, setSettings, useSettingsSync } from './settings';
@@ -407,6 +408,7 @@ const VIEWS: Record<Section, ReactElement> = {
   lotlist: <PoolView view="lotlist" />,
   passlist: <PoolView view="passlist" />,
   pricelist: <PoolView view="pricelist" />,
+  alertlist: <PoolView view="alertlist" />,
   shop: <ShopView />,
   selllist: <SellView />,
   resupply: <ResupplyView />,
@@ -440,6 +442,7 @@ export default function App() {
   useShopSellSync();
   useShopNpcSync();
   usePoolRulesSync();
+  usePoolAlert();
   usePoolPriceTee();   // forward pool-item AH prices to Sage's overlay
   usePoolSageBridge(); // tee pool settings to Sage + apply its overlay's rule/drop/price-mode clicks
   useSettingsSync();

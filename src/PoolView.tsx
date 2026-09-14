@@ -13,6 +13,7 @@ import { openAhDetail } from './ahNav';
 import { useDrop, setDrop } from './drop';
 import { usePoolStore, setCharRules, addRuleToChars, emptyRules, usePassOnLot, setPassOnLot, useAutoLotEnabled, setAutoLotEnabled, useAutoLotOff, setAutoLotChar } from './poolRules';
 import { usePoolPriceMode, setPoolPriceMode, usePoolPriceDefault, setPoolPriceDefault } from './poolPriceMode';
+import { useAlertNames, setAlertNames, useAlertOn, setAlertOn, useAlertVolume, setAlertVolume, testAlertTone, toggleAlert, hasAlert, useAlertActiveNames, dismissAlerts } from './poolAlerts';
 import { useSticky, useStickyChar } from './sticky';
 import { logicalRect, logicalViewport } from './uiZoom';
 import { Group, CharacterSelect, Select, Row, Toggle, SearchInput, Segmented } from './ui';
@@ -24,7 +25,7 @@ import { IconInner } from './atlasIcon';
 import { useItemHover } from './ItemTooltip';
 import { useAnon } from './anonymize';
 
-type PoolViewMode = 'pool' | 'lotlist' | 'passlist' | 'pricelist';
+type PoolViewMode = 'pool' | 'lotlist' | 'passlist' | 'pricelist' | 'alertlist';
 
 function useNow(intervalMs = 1000) {
   const [, force] = useState(0);
@@ -343,6 +344,10 @@ export default function PoolView({ view = 'pool', compact = false, dense = false
   const passOnLot = usePassOnLot();
   const autoLotEnabled = useAutoLotEnabled();
   const autoLotOff = useAutoLotOff();
+  const alertNames = useAlertNames();
+  const alertOn = useAlertOn();
+  const alertVol = useAlertVolume();
+  const alertActive = useAlertActiveNames();
   const iconMap = useDropIconMap();
   const now = useNow();
   const [menu, setMenu] = useState<{ item: PoolItem; rect: DOMRect; kind: 'lot' | 'pass' | 'rules' } | null>(null);
@@ -489,6 +494,13 @@ export default function PoolView({ view = 'pool', compact = false, dense = false
       )}
 
       <div className={`flex-1 min-h-0 overflow-y-auto ${dense ? 'p-1' : compact ? 'p-2' : 'p-4'}`}>
+        {alertActive.length > 0 && (
+          <div className="mb-2 flex items-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2">
+            <svg viewBox="0 0 24 24" className="w-4 h-4 shrink-0 text-amber-300 animate-pulse" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" /><path d="M13.7 21a2 2 0 0 1-3.4 0" /></svg>
+            <span className="text-[11px] text-amber-100 flex-1 min-w-0 truncate">In pool: {alertActive.join(', ')}</span>
+            <button onClick={dismissAlerts} className="le-tap shrink-0 px-2.5 py-1 text-[11px] font-bold rounded-md bg-amber-500/20 text-amber-100 hover:bg-amber-500/30 transition-colors">Silence</button>
+          </div>
+        )}
         <Crossfade id={view}>
         {view === 'pool' ? (
           <div className={compact ? 'overflow-hidden' : 'rounded-xl bg-surface border border-line overflow-hidden'}>
@@ -567,6 +579,26 @@ export default function PoolView({ view = 'pool', compact = false, dense = false
               <RuleList items={current.pass} onChange={(v) => update({ ...current, pass: v })} resolveId={resolveId} assets={assetsAny} fanOut={{ onlineCount: online.length, allCount: allCharNames.length, add: (n, scope) => addRuleToChars(scope === 'online' ? online.map((c) => c.name) : allCharNames, 'pass', n) }} />
             </div>
           </div>
+        ) : view === 'alertlist' ? (
+          <div className="flex flex-col">
+            <Group title="Pool Alerts">
+              <Row label="Play A Sound While A Watched Item Is In The Pool">
+                <Toggle on={alertOn} onChange={setAlertOn} />
+              </Row>
+              <Row label="Volume">
+                <div className="flex items-center gap-2">
+                  <input type="range" min={0} max={1} step={0.05} value={alertVol} onChange={(e) => setAlertVolume(Number(e.target.value))} className="w-32 accent-accent" />
+                  <button onClick={() => testAlertTone()} className="le-tap px-2.5 py-1 text-[11px] font-semibold rounded-md border border-line bg-field text-fg-3 hover:text-fg hover:border-accent/40 transition-colors">Test</button>
+                </div>
+              </Row>
+            </Group>
+            <Group title="Watched Items" right={<span className="text-[11px] text-fg-4 tabular-nums">{alertNames.length}</span>}>
+              <div className="px-0.5 pb-1 text-[11px] text-fg-4">The tone repeats while any of these sit in the treasure pool, on any character. Add one before it drops (e.g. a Volte piece).</div>
+            </Group>
+            <div className="rounded-xl bg-surface border border-line p-3">
+              <RuleList items={alertNames} onChange={setAlertNames} resolveId={resolveId} assets={assetsAny} />
+            </div>
+          </div>
         ) : (
           <div className="flex flex-col">
             <Group title="Pool AH Price Display" right={<span className="text-[11px] text-fg-4 tabular-nums">{priceEntries.length}</span>}>
@@ -616,6 +648,13 @@ export default function PoolView({ view = 'pool', compact = false, dense = false
                 >
                   <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="shrink-0 text-fg-4"><path d="M4 7h16" /><path d="M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" /><path d="M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12" /><path d="M10 11v6M14 11v6" /></svg>
                   <span className="truncate">{drop.drop.some((n) => n.toLowerCase() === menu.item.n.toLowerCase()) ? 'Remove From Drop List' : 'Add To Drop List'}</span>
+                </button>
+                <button
+                  onMouseDown={(e) => { e.preventDefault(); toggleAlert(menu.item.n); setMenu(null); }}
+                  className="flex items-center gap-2 px-2.5 py-1.5 rounded-md text-left text-[12px] text-fg-2 hover:bg-field transition-colors"
+                >
+                  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="shrink-0 text-fg-4"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" /><path d="M13.7 21a2 2 0 0 1-3.4 0" /></svg>
+                  <span className="truncate">{hasAlert(menu.item.n) ? 'Remove Sound Alert' : 'Alert Me When In Pool'}</span>
                 </button>
                 {itemStack(menu.item.id) > 1 && (
                   <button

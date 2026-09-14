@@ -4316,7 +4316,10 @@ end
 function cbuy_release()
     if release_pkt and packets_ok then pcall(windower.packets.inject_outgoing, 0x5B, release_pkt) end
     release_pkt = nil
-    cbuy_last_bought = 0
+    -- Preserve however much this batch bought before it stalled/timed out. Zeroing it made cfarm read
+    -- got=0 and FINISH the whole job early, leaving the already-bought items unsold in inventory (the
+    -- "5544/9999 Done" multibox bug). Keeping the partial makes cfarm sell what it got and retry the rest.
+    cbuy_last_bought = (cbuy and cbuy.bought) or 0
     cbuy = nil
 end
 
@@ -4476,8 +4479,18 @@ function cfarm_tick(now)
         local got = cbuy_last_bought or 0
         f.bought = (f.bought or 0) + got
         f.remaining = math.max(0, f.remaining - got)
-        f.phase = (got > 0) and 'sell' or 'finish'
-        if got > 0 then emit_convert(true, f.shop, f.item, f.bought, f.total or 0, 'selling') end
+        if got > 0 then
+            f.retries = 0
+            f.phase = 'sell'
+            emit_convert(true, f.shop, f.item, f.bought, f.total or 0, 'selling')
+        elseif f.remaining > 0 and (f.retries or 0) < 4 then
+            -- The batch bought nothing (the NPC menu never opened -- multibox contention drops the response).
+            -- Re-poke and retry a few times instead of declaring the whole job done with currency unspent.
+            f.retries = (f.retries or 0) + 1
+            f.phase = 'startbuy'
+        else
+            f.phase = 'finish'
+        end
     elseif f.phase == 'sell' then
         cfarm_sell(f.item)
         f.phase = 'clear'

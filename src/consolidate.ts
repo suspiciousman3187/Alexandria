@@ -116,21 +116,45 @@ async function consolidateOne(name: string, collectorName: string, wants: Record
     if (stopFlag) return;
     if (movedToInv) await pollUntil(() => remain.some((r) => bagCount(fresh(name), r.id, 0) > 0), 8000);
 
-    const items = remain
-      .map((r) => ({ id: r.id, count: Math.min(r.left, bagCount(fresh(name), r.id, 0)) }))
-      .filter((x) => x.count > 0);
-    if (items.length === 0) break; // nothing staged and nothing left to stage -> done
+    // Cap this round to the collector's free slots, and offer the smallest stacks (partials) first.
+    // FFXI delivers every traded STACK into its own receiver slot BEFORE the auto-sort merges partials,
+    // so offering more stacks than the collector has free slots pushes it past 80/80 and the whole trade
+    // fails (b0rn's over-trade: a full stack + a half needs 2 slots at 79/80). Sending partials first drains
+    // the stacks that merge away, so a nearly-full collector keeps a slot open across rounds instead of
+    // wedging at 80/80. Explicit slots pin the exact stacks the addon offers.
+    const coll0 = fresh(collectorName)?.inv?.find((b) => b.id === 0);
+    const collFree = coll0 ? Math.max(0, coll0.max - coll0.used) : 0;
+    if (collFree <= 0) break; // collector inventory full; nothing more will fit this run
+
+    const senderInv0 = fresh(name)?.inv?.find((b) => b.id === 0);
+    const leftById = new Map(remain.map((r) => [r.id, r.left] as const));
+    const stacks = (senderInv0?.items ?? [])
+      .filter((it) => (leftById.get(it.id) ?? 0) > 0 && it.c > 0)
+      .map((it) => ({ id: it.id, slot: it.s, count: it.c }))
+      .sort((a, b) => a.count - b.count); // partials before full stacks
+    const items: { id: number; count: number; slot: number }[] = [];
+    const takenById = new Map<number, number>();
+    for (const s of stacks) {
+      if (items.length >= Math.min(collFree, 8)) break; // one receiver slot per stack; trade window holds 8
+      const room = (leftById.get(s.id) ?? 0) - (takenById.get(s.id) ?? 0);
+      if (room <= 0) continue;
+      const count = Math.min(s.count, room);
+      items.push({ id: s.id, count, slot: s.slot });
+      takenById.set(s.id, (takenById.get(s.id) ?? 0) + count);
+    }
+    if (items.length === 0) break; // nothing staged in inventory to send -> done
 
     patchChar(name, { status: 'trading' });
+    const ids = [...new Set(items.map((it) => it.id))];
     const before: Record<number, number> = {};
-    for (const it of items) before[it.id] = bagCount(fresh(name), it.id, 0);
+    for (const id of ids) before[id] = bagCount(fresh(name), id, 0);
     const collector = fresh(collectorName);
     if (collector?.conn != null) armTradeReceiver(collector.conn, name, fresh(name)?.id);
     await sleep(400);
     tradeTo(conn, collectorName, items, 0, collector?.id);
-    const ok = await pollUntil(() => items.some((it) => bagCount(fresh(name), it.id, 0) < before[it.id]), 15000);
+    const ok = await pollUntil(() => ids.some((id) => bagCount(fresh(name), id, 0) < before[id]), 15000);
     let movedAny = 0;
-    for (const it of items) { const moved = Math.max(0, before[it.id] - bagCount(fresh(name), it.id, 0)); sent[it.id] = (sent[it.id] ?? 0) + moved; movedAny += moved; }
+    for (const id of ids) { const moved = Math.max(0, before[id] - bagCount(fresh(name), id, 0)); sent[id] = (sent[id] ?? 0) + moved; movedAny += moved; }
     patchChar(name, { sent: Object.values(sent).reduce((a, b) => a + b, 0) });
     if (!ok) throw new Error('trade not confirmed (recipient nearby?)');
     if (movedAny === 0 && ++guard > 20) throw new Error('too many rounds');

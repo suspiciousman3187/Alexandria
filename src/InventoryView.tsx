@@ -138,7 +138,7 @@ export const ItemRow = memo(function ItemRow({ item, bag, bagId, assets, selecte
             {dense && item.bz != null && <span {...tipAttrs(`On bazaar · ${(item.bz || 0).toLocaleString()} gil`)} className="shrink-0 font-bold rounded leading-none border border-yellow-400/60 bg-yellow-400/15 text-yellow-200 cursor-help text-[8px] px-1 py-0.5">BAZAAR</span>}
           </div>
         </div>
-        {!dense && market?.median && (
+        {wantMarket && (market?.median ? (
           <div
             {...tipAttrs(stackable ? `AH ${medStack ? 'stack' : 'single'} median · ${market.stock ?? '0'} listed · click to toggle stack/single` : `AH median · ${market.stock ?? '0'} listed`)}
             onClick={stackable ? (e) => { e.stopPropagation(); e.preventDefault(); toggleMedianStack(item.id); } : undefined}
@@ -147,7 +147,14 @@ export const ItemRow = memo(function ItemRow({ item, bag, bagId, assets, selecte
             <span className="text-[9px] font-bold uppercase tracking-wide text-fg-4">Median{stackable ? (medStack ? ' · Stack' : ' · Each') : ''}</span>
             <span className="text-[12.5px] font-semibold tabular-nums text-yellow-300">{market.median}<span className="text-[9px] font-medium text-yellow-200/70 ml-0.5">g</span></span>
           </div>
-        )}
+        ) : onScreen && market === undefined ? (
+          <div {...tipAttrs('Checking AH price…')} className="shrink-0 flex flex-col items-end leading-tight cursor-help">
+            <span className="text-[9px] font-bold uppercase tracking-wide text-fg-4">Median</span>
+            <svg viewBox="0 0 24 24" className="w-3.5 h-3.5 text-fg-4 animate-spin" fill="none" stroke="currentColor" strokeWidth={2.6} strokeLinecap="round"><path d="M21 12a9 9 0 1 1-6.2-8.5" /></svg>
+          </div>
+        ) : onScreen && market !== undefined ? (
+          <span {...tipAttrs('No recent AH sales')} className="shrink-0 text-[12px] tabular-nums text-fg-4/50 cursor-help">—</span>
+        ) : null)}
         {!dense && cat && <span title={`Auction House: ${cat.path}`} className="shrink-0 text-[9px] leading-none px-1.5 py-0.5 rounded bg-field border border-line text-fg-4 max-w-[96px] truncate">{cat.leaf}</span>}
         {bag && (bagId != null ? <BagTag id={bagId} label={bag} className="max-w-[110px]" /> : <span className="shrink-0 truncate max-w-[110px] text-[10px] text-fg-4">{bag}</span>)}
       </button>

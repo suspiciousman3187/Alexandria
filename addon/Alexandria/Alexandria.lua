@@ -5997,6 +5997,11 @@ local function finish_connect(s)
     retry_delay = RETRY_INTERVAL
     queue_send(build_self('hello'))
     last_send = os.clock()
+    -- Clear the change-dedup signatures so a fresh (re)connection ALWAYS resends the current inventory +
+    -- key items, even when nothing changed since the last send. Without this a reconnect to an unchanged
+    -- character stays blank on the desktop until the next inventory change (a trade) -- Nagumo's report.
+    inv_sig_last = ''
+    ki_last = ''
     inv_dirty = true
     inv_dirty_at = os.clock() - INV_DEBOUNCE
     pool_dirty = true

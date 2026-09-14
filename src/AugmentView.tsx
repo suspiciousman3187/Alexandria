@@ -234,7 +234,7 @@ function augLocOk(key: string, zone: number | undefined, fixedNear: string[] | u
   if (!npc) return false;
   return experimental ? zone === npc.zone : !!fixedNear?.includes(npc.name);
 }
-function AmbuscadePanel({ conn, assets, inv, zone, fixedNear, experimental }: { conn: number; assets?: string; inv?: InvBag[]; zone?: number; fixedNear?: string[]; experimental: boolean }) {
+function AmbuscadePanel({ conn, assets, inv, zone, fixedNear, experimental, running }: { conn: number; assets?: string; inv?: InvBag[]; zone?: number; fixedNear?: string[]; experimental: boolean; running?: boolean }) {
   const inZone = augLocOk('Ambuscade', zone, fixedNear, experimental);
   const res = useNameResolver();
   const capeToJob = useMemo(() => {
@@ -294,7 +294,8 @@ function AmbuscadePanel({ conn, assets, inv, zone, fixedNear, experimental }: { 
               <div className="px-1">
                 <button
                   onClick={() => { if (sel) augCape(conn, { job, material: material.toLowerCase(), path, repeats, bag: sel.bagId, slot: sel.slot, confirmMode: confirmMode === 'step' ? 'step' : 'none' }); }}
-                  disabled={!inZone || !sel}
+                  disabled={!inZone || !sel || running}
+                  title={running ? 'An augment is already running' : undefined}
                   className="w-full px-3 py-2 text-[12px] font-bold rounded-md bg-accent text-on-accent hover:bg-accent-hover transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   Start Augment
@@ -305,7 +306,7 @@ function AmbuscadePanel({ conn, assets, inv, zone, fixedNear, experimental }: { 
           )}
         </>
       ) : (
-        <AmbuscadeMulti conn={conn} sel={sel} job={job} inZone={inZone} inv={inv} assets={assets} res={res} />
+        <AmbuscadeMulti conn={conn} sel={sel} job={job} inZone={inZone} inv={inv} assets={assets} res={res} running={running} />
       )}
     </>
   );
@@ -315,7 +316,7 @@ function stepNeed(steps: CapeSeqStep[], material: string): number {
   return steps.filter((s) => s.material === material).reduce((n, s) => n + s.repeats, 0);
 }
 
-function AmbuscadeMulti({ conn, sel, job, inZone, inv, assets, res }: { conn: number; sel?: Inst; job?: string; inZone: boolean; inv?: InvBag[]; assets?: string; res: Resolver }) {
+function AmbuscadeMulti({ conn, sel, job, inZone, inv, assets, res, running }: { conn: number; sel?: Inst; job?: string; inZone: boolean; inv?: InvBag[]; assets?: string; res: Resolver; running?: boolean }) {
   const [steps, setSteps] = useStickyPersisted<CapeSeqStep[]>('aug.amb.steps', []);
   const used = useMemo(() => new Set(steps.map((s) => s.material)), [steps]);
   const avail = useMemo(() => (MATERIALS as readonly string[]).filter((m) => !used.has(m)), [used]);
@@ -381,7 +382,7 @@ function AmbuscadeMulti({ conn, sel, job, inZone, inv, assets, res }: { conn: nu
         </div>
       </Group>
       <div className="px-1">
-        <button onClick={() => setConfirming(true)} disabled={!canReview} className="w-full px-3 py-2 text-[12px] font-bold rounded-md bg-accent text-on-accent hover:bg-accent-hover transition-colors disabled:opacity-40 disabled:cursor-not-allowed">
+        <button onClick={() => setConfirming(true)} disabled={!canReview || running} title={running ? 'An augment is already running' : undefined} className="w-full px-3 py-2 text-[12px] font-bold rounded-md bg-accent text-on-accent hover:bg-accent-hover transition-colors disabled:opacity-40 disabled:cursor-not-allowed">
           Review &amp; Augment
         </button>
       </div>
@@ -419,7 +420,7 @@ function AmbuscadeMulti({ conn, sel, job, inZone, inv, assets, res }: { conn: nu
               </div>
               <div className="flex items-center gap-2">
                 <button onClick={close} className="flex-1 px-3 py-2 text-[12px] font-bold rounded-md bg-field border border-line text-fg-3 hover:text-fg-2 transition-colors">Cancel</button>
-                <button onClick={startSeq} className="flex-1 px-3 py-2 text-[12px] font-bold rounded-md bg-accent text-on-accent hover:bg-accent-hover transition-colors">Augment {steps.length} Step{steps.length === 1 ? '' : 's'}</button>
+                <button onClick={startSeq} disabled={running} className="flex-1 px-3 py-2 text-[12px] font-bold rounded-md bg-accent text-on-accent hover:bg-accent-hover disabled:opacity-40 transition-colors">Augment {steps.length} Step{steps.length === 1 ? '' : 's'}</button>
               </div>
             </>
           )}
@@ -496,7 +497,7 @@ function EquipList({ items, selected, onSelect, res, assets }: {
   );
 }
 
-function GearPanel({ conn, charName, view, assets, inv, cur, zone, fixedNear, experimental }: { conn: number; charName: string; view: string; assets?: string; inv?: InvBag[]; cur?: Currency; zone?: number; fixedNear?: string[]; experimental: boolean }) {
+function GearPanel({ conn, charName, view, assets, inv, cur, zone, fixedNear, experimental, running }: { conn: number; charName: string; view: string; assets?: string; inv?: InvBag[]; cur?: Currency; zone?: number; fixedNear?: string[]; experimental: boolean; running?: boolean }) {
   const res = useNameResolver();
   const types = VIEW_TRADE_TYPES[view] ?? ['Cape'];
   const gearToType = useMemo(() => {
@@ -640,14 +641,16 @@ function GearPanel({ conn, charName, view, assets, inv, cur, zone, fixedNear, ex
       <div className="px-1 flex gap-2">
         <button
           onClick={() => start(false)}
-          disabled={!readyAuto || fragBlocked}
+          disabled={!readyAuto || fragBlocked || running}
+          title={running ? 'An augment is already running' : undefined}
           className="flex-1 px-3 py-2 text-[12px] font-bold rounded-md bg-accent text-on-accent enabled:hover:bg-accent-hover disabled:opacity-40 transition-colors"
         >
           Auto Roll
         </button>
         <button
           onClick={() => start(true)}
-          disabled={!baseReady || fragBlocked}
+          disabled={!baseReady || fragBlocked || running}
+          title={running ? 'An augment is already running' : undefined}
           className="flex-1 px-3 py-2 text-[12px] font-bold rounded-md bg-field border border-line text-fg-2 enabled:hover:bg-accent/10 enabled:hover:text-accent disabled:opacity-40 transition-colors"
         >
           Manual Roll
@@ -779,7 +782,7 @@ function GearRoll({ view, online, active, experimental, tab, setTab }: { view: s
         />
       </div>
       {tab === 'single'
-        ? <GearPanel key={active.name} conn={conn} charName={active.name} view={view} assets={active.assets} inv={active.inv} cur={active.cur} zone={active.zone} fixedNear={active.fixedNear} experimental={experimental} />
+        ? <GearPanel key={active.name} conn={conn} charName={active.name} view={view} assets={active.assets} inv={active.inv} cur={active.cur} zone={active.zone} fixedNear={active.fixedNear} experimental={experimental} running={!!active.aug?.active} />
         : <BatchRollPanel view={view} online={online} experimental={experimental} />}
     </div>
   );
@@ -830,7 +833,7 @@ export default function AugmentView({ view = 'ambuscade' }: { view?: 'ambuscade'
         )}
         {conn != null && (
           <Crossfade id={view}>{view === 'ambuscade'
-            ? <AmbuscadePanel conn={conn} assets={active?.assets} inv={active?.inv} zone={active?.zone} fixedNear={active?.fixedNear} experimental={exp} />
+            ? <AmbuscadePanel conn={conn} assets={active?.assets} inv={active?.inv} zone={active?.zone} fixedNear={active?.fixedNear} experimental={exp} running={!!aug?.active} />
             : <GearRoll view={view} online={online} active={active!} experimental={exp} tab={rollTab} setTab={setRollTab} />}</Crossfade>
         )}
       </div>

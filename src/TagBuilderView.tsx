@@ -10,6 +10,8 @@ import { Segmented, Select, Button } from './ui';
 import { setTip, clearTip, suppressTip, HoverTip } from './hoverTip';
 import { logicalRect, logicalViewport } from './uiZoom';
 import { useItemTags, createTag, renameTag, recolorTag, deleteTag, reorderTags, bulkSetTag, countForTag, TAG_COLORS, type TagDef } from './itemTags';
+import { exportTags } from './tagShare';
+import TagImportModal from './TagImportModal';
 import { TEMPORARY_BAG } from './bagConstants';
 
 type Row = { id: number; n: string };
@@ -88,6 +90,7 @@ function TagRow({ tag, total, active, editing, dragging, dropBefore, dropAfter, 
 
 export default function TagBuilderView() {
   const { tags, assign } = useItemTags();
+  const [importOpen, setImportOpen] = useState(false);
   const known = useKnownCharacters();
   const iconSet = useAvailableIcons();
   const acMap = useAcMap();
@@ -285,6 +288,7 @@ export default function TagBuilderView() {
 
   return (
     <div className="h-full flex flex-col overflow-hidden">
+      {importOpen && <TagImportModal onClose={() => setImportOpen(false)} />}
       <div className="flex-1 min-h-0 min-w-0 flex">
         {/* Left: navigate / filter */}
         <aside className="w-44 @min-[760px]:w-56 shrink-0 flex flex-col border-r border-line">
@@ -292,6 +296,10 @@ export default function TagBuilderView() {
             <input value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="New tag…" className={`flex-1 min-w-0 ${inputCls}`} />
             <Button type="submit" variant="primary" size="sm" disabled={!newName.trim()} className="shrink-0" aria-label="Add tag">+</Button>
           </form>
+          <div className="flex gap-1.5 px-2.5 py-2 border-b border-line">
+            <Button variant="secondary" size="sm" className="flex-1 whitespace-nowrap" onClick={() => void exportTags({ tags, assign })} disabled={tags.length === 0} title="Save your tags to a file to share">Export</Button>
+            <Button variant="secondary" size="sm" className="flex-1 whitespace-nowrap" onClick={() => setImportOpen(true)} title="Merge a shared tag file into yours">Import</Button>
+          </div>
           <div ref={tagListRef} className="flex-1 min-h-0 overflow-y-auto p-2 flex flex-col gap-0.5">
             <button onClick={() => setFilter((f) => (f === 'untagged' ? null : 'untagged'))} className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-[12px] font-semibold transition-colors ${filter === 'untagged' ? 'bg-accent/15 text-accent' : 'text-fg-3 hover:bg-field/50'}`}>
               <span className="w-2.5 h-2.5 rounded-full border border-fg-4/50 shrink-0" />

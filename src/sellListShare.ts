@@ -43,3 +43,12 @@ export async function exportSellList(items: string[]): Promise<string | null> {
   await invoke('write_text_file', { path, contents: sellListFileText(items) });
   return path;
 }
+
+// The drop list shares the same name-list format (parseSellList reads it back). Kept here so both share
+// features use one tolerant parser.
+export async function exportDropList(items: string[]): Promise<string | null> {
+  const path = await saveDialog({ title: 'Export Drop List', defaultPath: 'alexandria_drop_list.json', filters: [{ name: 'Drop List', extensions: ['json', 'txt'] }] });
+  if (typeof path !== 'string') return null;
+  await invoke('write_text_file', { path, contents: JSON.stringify({ alexandria_drop_list: 1, items }, null, 2) + '\n' });
+  return path;
+}

@@ -86,6 +86,44 @@ export function createTag(name: string, color?: string): string {
   return id;
 }
 
+// Merge an imported tag set into ours: match tags by NAME (case-insensitive) so a friend's "Omen" folds
+// into your "Omen", create any tag you don't have (fresh id + unused color), and UNION each item's tags
+// (never replace). Returns what was new so the import can report it.
+export function mergeTagStore(incoming: TagStore): { tagsAdded: number; itemsChanged: number } {
+  const byName = new Map(store.tags.map((t) => [t.name.toLowerCase(), t.id] as const));
+  const used = new Set(store.tags.map((t) => t.color));
+  const tags = [...store.tags];
+  const idMap = new Map<string, string>(); // imported tag id -> our tag id
+  let tagsAdded = 0;
+  for (const t of incoming.tags) {
+    const nm = t.name.trim(); if (!nm) continue;
+    const key = nm.toLowerCase();
+    let localId = byName.get(key);
+    if (!localId) {
+      const col = (typeof t.color === 'string' && t.color) || TAG_COLORS.find((c) => !used.has(c)) || TAG_COLORS[tags.length % TAG_COLORS.length];
+      used.add(col);
+      localId = newId();
+      tags.push({ id: localId, name: nm, color: col });
+      byName.set(key, localId);
+      tagsAdded++;
+    }
+    idMap.set(t.id, localId);
+  }
+  const assign: Record<number, string[]> = { ...store.assign };
+  let itemsChanged = 0;
+  for (const k in incoming.assign) {
+    const id = Number(k); if (!Number.isInteger(id)) continue;
+    const mapped = incoming.assign[id].map((tid) => idMap.get(tid)).filter((x): x is string => !!x);
+    if (!mapped.length) continue;
+    const cur = new Set(assign[id] ?? []);
+    const before = cur.size;
+    for (const tid of mapped) cur.add(tid);
+    if (cur.size !== before) { assign[id] = [...cur]; itemsChanged++; }
+  }
+  commit({ tags, assign });
+  return { tagsAdded, itemsChanged };
+}
+
 export function renameTag(id: string, name: string) {
   const nm = name.trim(); if (!nm) return;
   commit({ ...store, tags: store.tags.map((t) => (t.id === id ? { ...t, name: nm } : t)) });

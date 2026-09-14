@@ -11,6 +11,8 @@ import { useAnon } from './anonymize';
 import { Modal, Collapse } from './overlay';
 import { MOG_ONLY_BAGS } from './bagConstants';
 import TreasuryImportModal from './TreasuryImportModal';
+import DropListImportModal from './DropListImportModal';
+import { exportDropList } from './sellListShare';
 
 // Bags the cleanout pulls from (matches the addon do_retrieve list {1,9,2,4,5,6,7}). Carry
 // bags are always reachable; Safe/Storage/Locker/Safe 2 need a Mog House or Nomad Moogle.
@@ -49,6 +51,7 @@ export default function DropView() {
   const anon = useAnon();
   const [confirming, setConfirming] = useState(false);
   const [importing, setImporting] = useState(false);
+  const [importingList, setImportingList] = useState(false);
   const [cleaning, setCleaning] = useState(false);
   const [reviewOpen, setReviewOpen] = useState(false);
   const [reviewChecked, setReviewChecked] = useState<Set<string>>(() => new Set());
@@ -192,6 +195,8 @@ export default function DropView() {
 
       <Group title="Drop List" right={
         <div className="flex items-center gap-2">
+          <button onClick={() => void exportDropList(cfg.drop)} disabled={cfg.drop.length === 0} title="Save your drop list to a file to share" className="le-tap px-2.5 py-1 text-[11px] font-semibold rounded-md border border-line bg-field text-fg-3 hover:text-fg hover:border-accent/40 disabled:opacity-40 transition-colors">Export</button>
+          <button onClick={() => setImportingList(true)} title="Merge a shared drop list into yours" className="le-tap px-2.5 py-1 text-[11px] font-semibold rounded-md border border-line bg-field text-fg-3 hover:text-fg hover:border-accent/40 transition-colors">Import</button>
           <button onClick={() => setImporting(true)} className="le-tap px-2.5 py-1 text-[11px] font-semibold rounded-md border border-line bg-field text-fg-3 hover:text-fg hover:border-accent/40 transition-colors">Import From Treasury</button>
           <span className="text-[11px] text-fg-4 tabular-nums">{filter.trim() ? `${shown.length}/${cfg.drop.length}` : cfg.drop.length}</span>
         </div>
@@ -266,6 +271,7 @@ export default function DropView() {
       </Group>
 
       {importing && <TreasuryImportModal onClose={() => setImporting(false)} />}
+      {importingList && <DropListImportModal onClose={() => setImportingList(false)} />}
 
       {reviewOpen && (() => {
         const f = reviewFilter.trim().toLowerCase();

@@ -11,10 +11,11 @@ export function useCharScope(key: string, chars: KnownChar[]) {
   const scoped = useMemo(() => chars.filter((c) => !exSet.has(c.name)), [chars, exSet]);
   const toggle = (name: string) => setExcluded((p) => (p.includes(name) ? p.filter((n) => n !== name) : [...p, name]));
   const reset = () => setExcluded([]);
-  return { scoped, exSet, toggle, reset };
+  const none = () => setExcluded(chars.map((c) => c.name));
+  return { scoped, exSet, toggle, reset, none };
 }
 
-export function CharScopeBar({ chars, exSet, toggle, reset, accessory }: { chars: KnownChar[]; exSet: Set<string>; toggle: (n: string) => void; reset: () => void; accessory?: ReactNode }) {
+export function CharScopeBar({ chars, exSet, toggle, reset, none, accessory }: { chars: KnownChar[]; exSet: Set<string>; toggle: (n: string) => void; reset: () => void; none?: () => void; accessory?: ReactNode }) {
   const [open, setOpen] = useState(false);
   const anon = useAnon();
   if (chars.length <= 1) return accessory ? <div className="flex items-center min-h-[1.25rem]">{accessory}</div> : null;
@@ -27,6 +28,10 @@ export function CharScopeBar({ chars, exSet, toggle, reset, accessory }: { chars
           Characters <span className="tabular-nums text-fg-4">{active}/{chars.length}</span>
         </button>
         {accessory}
+        <div className="ml-auto flex items-center gap-1">
+          {exSet.size > 0 && <Button variant="ghost" size="xs" onClick={reset}>Select All</Button>}
+          {none && active > 0 && <Button variant="ghost" size="xs" onClick={none}>Deselect All</Button>}
+        </div>
       </div>
       <Collapse open={open}>
         <div className="grid grid-cols-[repeat(auto-fill,minmax(6.75rem,1fr))] gap-1.5">
@@ -39,7 +44,6 @@ export function CharScopeBar({ chars, exSet, toggle, reset, accessory }: { chars
               </button>
             );
           })}
-          {exSet.size > 0 && <Button variant="ghost" size="xs" onClick={reset}>Reset</Button>}
         </div>
       </Collapse>
     </div>

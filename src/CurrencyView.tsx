@@ -55,7 +55,7 @@ export default function CurrencyView() {
     () => known.filter((c) => c.online || c.cur).sort((a, b) => (a.online === b.online ? a.name.localeCompare(b.name) : a.online ? -1 : 1)),
     [known],
   );
-  const { scoped, exSet, toggle, reset } = useCharScope('cur.scope', chars);
+  const { scoped, exSet, toggle, reset, none } = useCharScope('cur.scope', chars);
 
   const valueFor = (c: KnownChar, name: string): number | null => {
     if (!c.cur) return null;
@@ -186,6 +186,7 @@ export default function CurrencyView() {
             exSet={exSet}
             toggle={toggle}
             reset={reset}
+            none={none}
             accessory={lastSync ? (
               <span className="shrink-0 inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-field border border-line text-[10px] font-semibold text-fg-3" title="Last time currency was refreshed">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400/80" />

@@ -44,7 +44,7 @@ export default function KeyItemsView() {
     () => known.filter((k) => k.keyItems !== undefined).sort((a, b) => (a.online === b.online ? a.name.localeCompare(b.name) : a.online ? -1 : 1)),
     [known],
   );
-  const { scoped, exSet, toggle, reset } = useCharScope('ki.scope', chars);
+  const { scoped, exSet, toggle, reset, none } = useCharScope('ki.scope', chars);
   const lastKey = chars.reduce((m, c) => Math.max(m, c.keyAt ?? 0), 0) || undefined;
 
   const sets = useMemo(() => scoped.map((c) => new Set((c.keyItems ?? []).map((k) => k.id))), [scoped]);
@@ -110,7 +110,7 @@ export default function KeyItemsView() {
             </span>
           )}
         </div>
-        <CharScopeBar chars={chars} exSet={exSet} toggle={toggle} reset={reset} />
+        <CharScopeBar chars={chars} exSet={exSet} toggle={toggle} reset={reset} none={none} />
       </div>
 
       <div className="flex-1 min-h-0 overflow-y-auto px-3 pb-3 pt-2">

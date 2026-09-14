@@ -272,7 +272,7 @@ function ItemCombo({ existing, onAdd, assets }: { existing: string[]; onAdd: (na
   );
 }
 
-function RuleList({ items, onChange, resolveId, assets, fanOut }: { items: string[]; onChange: (v: string[]) => void; resolveId: (n: string) => number | undefined; assets?: string; fanOut?: { onlineCount: number; allCount: number; add: (itemName: string, scope: 'online' | 'all') => void } }) {
+function RuleList({ items, onChange, resolveId, assets, fanOut, qty, onQty }: { items: string[]; onChange: (v: string[]) => void; resolveId: (n: string) => number | undefined; assets?: string; fanOut?: { onlineCount: number; allCount: number; add: (itemName: string, scope: 'online' | 'all') => void }; qty?: Record<string, number>; onQty?: (name: string, n: number | undefined) => void }) {
   const [filter, setFilter] = useState('');
   const [scope, setScope] = useState<'this' | 'online' | 'all'>('this');
   const addItem = (n: string) => {
@@ -324,6 +324,18 @@ function RuleList({ items, onChange, resolveId, assets, fanOut }: { items: strin
               >
                 <RuleIcon id={resolveId(name)} name={name} assets={assets} />
                 <span className="min-w-0 flex-1 truncate text-[11px] text-fg-2">{name}</span>
+                {onQty && (
+                  <label className="shrink-0 flex items-center gap-1 text-[10px] text-fg-4" title="Auto-lot until this character holds this many (blank = every copy)">
+                    <span>keep</span>
+                    <input
+                      type="number" min={1} inputMode="numeric"
+                      value={qty?.[name] ?? ''}
+                      onChange={(e) => { const v = e.target.value.trim(); const n = Math.floor(Number(v)); onQty(name, v === '' || !Number.isFinite(n) || n <= 0 ? undefined : n); }}
+                      placeholder="all"
+                      className="w-12 bg-field border border-line rounded px-1.5 py-0.5 text-[11px] text-fg-2 text-right tabular-nums outline-none focus:border-accent/50 placeholder-fg-4/60"
+                    />
+                  </label>
+                )}
                 <button onClick={() => removeItem(name)} aria-label="Remove" className="shrink-0 grid place-items-center w-5 h-5 rounded text-fg-4 hover:text-fg hover:bg-line transition-colors">×</button>
               </motion.div>
             ))}
@@ -528,10 +540,18 @@ export default function PoolView({ view = 'pool', compact = false, dense = false
                 <span className="text-[11px] text-fg-4 tabular-nums">{current.lot.length}</span>
               </div>
             }>
-              <div className="px-0.5 pb-1 text-[11px] text-fg-4">{editName} automatically lots these items from the treasure pool.</div>
+              <div className="px-0.5 pb-1 text-[11px] text-fg-4">{editName} automatically lots these items from the treasure pool. Set <span className="text-fg-3 font-medium">keep</span> to stop once this character already holds that many.</div>
             </Group>
             <div className="mb-5 rounded-xl bg-surface border border-line p-3">
-              <RuleList items={current.lot} onChange={(v) => update({ ...current, lot: v })} resolveId={resolveId} assets={assetsAny} fanOut={{ onlineCount: online.length, allCount: allCharNames.length, add: (n, scope) => addRuleToChars(scope === 'online' ? online.map((c) => c.name) : allCharNames, 'lot', n) }} />
+              <RuleList
+                items={current.lot}
+                onChange={(v) => { const keep = new Set(v.map((n) => n.toLowerCase())); const q: Record<string, number> = {}; for (const [k, val] of Object.entries(current.lotQty ?? {})) if (keep.has(k.toLowerCase())) q[k] = val; update({ ...current, lot: v, lotQty: q }); }}
+                qty={current.lotQty}
+                onQty={(name, n) => { const q = { ...(current.lotQty ?? {}) }; if (n == null) delete q[name]; else q[name] = n; update({ ...current, lotQty: q }); }}
+                resolveId={resolveId}
+                assets={assetsAny}
+                fanOut={{ onlineCount: online.length, allCount: allCharNames.length, add: (n, scope) => addRuleToChars(scope === 'online' ? online.map((c) => c.name) : allCharNames, 'lot', n) }}
+              />
             </div>
 
             <Group title="Lot Overview" right={<span className="text-[11px] text-fg-4 tabular-nums">{lotOverview.length}</span>}>

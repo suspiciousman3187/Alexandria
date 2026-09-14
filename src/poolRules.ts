@@ -2,7 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { useEffect, useMemo, useSyncExternalStore } from 'react';
 import { appDataPath, inTauri, setPoolRules, onAutoLotFeed, useBoxes, type PoolRules } from './bridge';
 
-export const emptyRules = (): PoolRules => ({ lot: [], pass: [], drop: [] });
+export const emptyRules = (): PoolRules => ({ lot: [], pass: [], drop: [], lotQty: {} });
 
 type Store = Record<string, PoolRules>;
 
@@ -24,7 +24,16 @@ const POOL_SYNC_KEY = 'alexandria:poolrules:sync';
 function normRules(p: unknown): PoolRules {
   const o = (p ?? {}) as Record<string, unknown>;
   const arr = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
-  return { lot: arr(o.lot), pass: arr(o.pass), drop: arr(o.drop) };
+  const lot = arr(o.lot);
+  const lotSet = new Set(lot.map((n) => n.toLowerCase()));
+  const lotQty: Record<string, number> = {};
+  if (o.lotQty && typeof o.lotQty === 'object') {
+    for (const [k, v] of Object.entries(o.lotQty as Record<string, unknown>)) {
+      const n = Number(v);
+      if (Number.isFinite(n) && n > 0 && lotSet.has(k.toLowerCase())) lotQty[k] = Math.floor(n);
+    }
+  }
+  return { lot, pass: arr(o.pass), drop: arr(o.drop), lotQty };
 }
 
 async function load() {

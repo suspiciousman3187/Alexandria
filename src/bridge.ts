@@ -1437,7 +1437,9 @@ export function requestCurrency(conn: number) { sendBoxCommand(conn, JSON.string
 export function broadcastCurrency(): Promise<number> { return broadcastBoxCommand(JSON.stringify({ cmd: 'currency' })); }
 export function broadcastSync(): Promise<number> { return broadcastBoxCommand(JSON.stringify({ cmd: 'sync' })); }
 
-export type PoolRules = { lot: string[]; pass: string[]; drop: string[]; passOnLot?: boolean; autoLot?: boolean };
+// lotQty: per lot-item target held count (keyed by item name). Auto-lot stops once the character already
+// holds that many. Absent/0 = lot every copy (the old behavior).
+export type PoolRules = { lot: string[]; pass: string[]; drop: string[]; passOnLot?: boolean; autoLot?: boolean; lotQty?: Record<string, number> };
 
 export function lotPool(conn: number, index: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'lot', index })); }
 export function passPool(conn: number, index: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'pass', index })); }
@@ -1448,7 +1450,7 @@ let autoLotFeedCb: ((name: string | undefined, on: boolean, all: boolean) => voi
 // poolRules registers here so a //ax autolot toggle typed in-game flows back to the
 // desktop (updates the UI + persists), without bridge importing poolRules (circular).
 export function onAutoLotFeed(cb: (name: string | undefined, on: boolean, all: boolean) => void) { autoLotFeedCb = cb; }
-export function setPoolRules(conn: number, r: PoolRules) { sendBoxCommand(conn, JSON.stringify({ cmd: 'poolrules', ...r })); }
+export function setPoolRules(conn: number, r: PoolRules) { sendBoxCommand(conn, JSON.stringify({ cmd: 'poolrules', lot: r.lot, pass: r.pass, drop: r.drop, passOnLot: r.passOnLot, autoLot: r.autoLot, lotqty: r.lotQty ?? {} })); }
 export function broadcastPoolRules(r: PoolRules) { return broadcastBoxCommand(JSON.stringify({ cmd: 'poolrules', ...r })); }
 
 export function setResupply(conn: number, on: boolean, items: { name: string; min: number }[], options: number[]) {

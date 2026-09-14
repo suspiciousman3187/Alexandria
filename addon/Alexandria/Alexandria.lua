@@ -1,6 +1,6 @@
 _addon.name = 'Alexandria'
 _addon.author = 'Noirblanc'
-_addon.version = '0.0.26'
+_addon.version = '0.0.27'
 _addon.commands = {'alexandria', 'alex', 'ax'}
 
 local socket = require('socket')
@@ -308,6 +308,7 @@ local pool = {}
 local pool_dirty = false
 local pool_dirty_at = 0
 local pool_rules = { lot = {}, pass = {}, drop = {} }
+pool_lotqty = {}   -- item id -> target held count; auto-lot stops once resupply_count(id) reaches it
 pool_pass_on_lot = false
 pool_autolot_on = true -- master switch for acting on the lot list; toggled by desktop or //ax autolot
 my_lotted = {}
@@ -1064,6 +1065,7 @@ local function pool_check(index, id)
     elseif r.lot[id] then
         if not pool_autolot_on then return end
         if resupply_is_rare(id) and resupply_count(id) >= 1 then return end
+        if pool_lotqty[id] and resupply_count(id) >= pool_lotqty[id] then return end -- quantity target reached; stop lotting
         local inv = windower.ffxi.get_bag_info(0)
         if inv and (inv.max - inv.count) > 1 then
             enqueue_pool(index, 'lot')
@@ -1235,6 +1237,17 @@ local function ids_for_names(names)
         for _, id in ipairs(ids_for_name_entry(nm)) do set[id] = true end
     end
     return set
+end
+
+-- Resolve a { name -> target count } map into { item id -> target count } for quantity-capped auto-lot.
+function idqty_for_names(map)
+    local out = {}
+    if type(map) ~= 'table' then return out end
+    for nm, qty in pairs(map) do
+        local q = tonumber(qty)
+        if q and q > 0 then for _, id in ipairs(ids_for_name_entry(nm)) do out[id] = q end end
+    end
+    return out
 end
 
 function enqueue_drop(slot, id)
@@ -5671,6 +5684,7 @@ local function dispatch(line)
         pool_rules.lot = ids_for_names(msg.lot)
         pool_rules.pass = ids_for_names(msg.pass)
         pool_rules.drop = ids_for_names(msg.drop)
+        pool_lotqty = idqty_for_names(msg.lotqty)
         pool_pass_on_lot = msg.passOnLot and true or false
         pool_autolot_on = msg.autoLot ~= false
         for idx, it in pairs(pool) do if it and it.id then pool_check(idx, it.id) end end

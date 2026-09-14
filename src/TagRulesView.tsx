@@ -6,10 +6,15 @@ import { STORABLE_BAGS, ALL_PLAYERS_KEY, ALL_PLAYERS_LABEL } from './storagePref
 import { useTagRules, setTagRules, type TagRule } from './tagRules';
 import { useItemTags, countForTag, type TagDef } from './itemTags';
 
-// The main Inventory (bag 0) can be a routing target too -- "keep these on the character".
-// Added here only for tag routing; STORABLE_BAGS (shared with the Organize Rules'
-// storable-bags) stays storage-only so overflow never tries to target Inventory.
-const ROUTE_BAGS: { id: number; name: string }[] = [{ id: 0, name: 'Inventory' }, ...STORABLE_BAGS];
+// The main Inventory (bag 0) and the wardrobes can be routing targets too -- Inventory to "keep these on
+// the character", wardrobes for gear tags. Added here only for tag routing; STORABLE_BAGS (shared with the
+// Organize Rules' storable-bags) stays storage-only so overflow never targets these. Wardrobes hold gear
+// only, so routing a non-equippable tag there just won't place -- harmless.
+const WARDROBE_BAGS: { id: number; name: string }[] = [
+  { id: 8, name: 'Wardrobe 1' }, { id: 10, name: 'Wardrobe 2' }, { id: 11, name: 'Wardrobe 3' }, { id: 12, name: 'Wardrobe 4' },
+  { id: 13, name: 'Wardrobe 5' }, { id: 14, name: 'Wardrobe 6' }, { id: 15, name: 'Wardrobe 7' }, { id: 16, name: 'Wardrobe 8' },
+];
+const ROUTE_BAGS: { id: number; name: string }[] = [{ id: 0, name: 'Inventory' }, ...STORABLE_BAGS, ...WARDROBE_BAGS];
 const bagName = (id: number) => ROUTE_BAGS.find((x) => x.id === id)?.name ?? String(id);
 
 function ruleSummary(rule: TagRule): string {

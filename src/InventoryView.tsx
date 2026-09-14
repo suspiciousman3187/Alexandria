@@ -493,7 +493,7 @@ export function RowActions({ char, bag, item, canAct, bags }: { char: KnownChar;
   const known = useKnownCharacters();
   const iconSet = useAvailableIcons();
   const exp = useSettings().experimentalFeatures;
-  const server = useSettings().ahServer;
+  const server = useSettings().ahServer || known.find((c) => c.online)?.server;
   const poolStore = usePoolStore();
   const consoPrefs = useConsolidatePrefs();
   const storagePrefs = useStoragePrefs();
@@ -1515,7 +1515,9 @@ export default function InventoryView() {
   const catOf = useMemo(() => (id: number) => catObjs.get(id), [catObjs]);
   const sell = useShopSell();
   const experimental = useSettings().experimentalFeatures;
-  const server = useSettings().ahServer;
+  // AH prices need a "world" to query. Fall back to a connected character's server when no AH server is set
+  // in Settings, matching the drop list -- otherwise players who never set one get NO inventory prices.
+  const server = useSettings().ahServer || known.find((c) => c.online)?.server;
   const [name, setName] = useStickyChar();
   const [bagId, setBagId] = useSticky<number | null>('inv.bag', null);
   const [q, setQ] = useSticky('inv.q', '');

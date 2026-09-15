@@ -66,7 +66,7 @@ export default function TagImportModal({ onClose }: { onClose: () => void }) {
         <div className="flex flex-col min-h-0">
           <div className="shrink-0 px-4 pt-4 pb-3 border-b border-line">
             <h2 className="text-[14px] font-bold text-fg">Import Item Tags</h2>
-            <p className="text-[11px] text-fg-4 mt-1 leading-snug">Merge a friend's tags into yours. Pick which tags to bring in; matching names fold into your own and every item stays tagged, nothing is replaced.</p>
+            <p className="text-[11px] text-fg-4 mt-1 leading-snug">Merge an outside tag set into your own tag list.</p>
           </div>
 
           <div className="flex-1 min-h-0 overflow-y-auto px-4 py-3 flex flex-col gap-3">

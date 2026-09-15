@@ -231,8 +231,8 @@ export function GilInput({
 // spinner (un-themeable OS widget). The value stays typeable; buttons clamp to min/max
 // and hold-to-repeat. Pass className to control width/height of the outer control.
 export function Stepper({
-  value, onChange, min, max, step = 1, className, title, numW = 'w-9',
-}: { value: number; onChange: (v: number) => void; min?: number; max?: number; step?: number; className?: string; title?: string; numW?: string }) {
+  value, onChange, min, max, step = 1, className, title, numW = 'w-9', h = 'h-8',
+}: { value: number; onChange: (v: number) => void; min?: number; max?: number; step?: number; className?: string; title?: string; numW?: string; h?: string }) {
   const [text, setText] = useState(String(value));
   const valueRef = useRef(value);
   valueRef.current = value;
@@ -264,7 +264,7 @@ export function Stepper({
   const btn = 'shrink-0 w-7 grid place-items-center text-fg-3 enabled:hover:bg-line enabled:hover:text-fg disabled:opacity-30 transition-colors select-none touch-none';
 
   return (
-    <div title={title} className={`inline-flex items-stretch h-8 rounded-md border border-line bg-field overflow-hidden ${className ?? ''}`}>
+    <div title={title} className={`inline-flex items-stretch ${h} rounded-md border border-line bg-field overflow-hidden ${className ?? ''}`}>
       <button
         type="button" aria-label="Decrease" disabled={atMin}
         onPointerDown={(e) => { e.preventDefault(); startHold(-1); }} onPointerUp={stopHold} onPointerLeave={stopHold} onPointerCancel={stopHold}

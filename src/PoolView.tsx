@@ -16,7 +16,7 @@ import { usePoolPriceMode, setPoolPriceMode, usePoolPriceDefault, setPoolPriceDe
 import { useAlertNames, setAlertNames, useAlertOn, setAlertOn, useAlertVolume, setAlertVolume, testAlertTone, toggleAlert, hasAlert, useAlertActiveNames, dismissAlerts } from './poolAlerts';
 import { useSticky, useStickyChar } from './sticky';
 import { logicalRect, logicalViewport } from './uiZoom';
-import { Group, CharacterSelect, Select, Row, Toggle, SearchInput, Segmented } from './ui';
+import { Group, CharacterSelect, Select, Row, Toggle, SearchInput, Segmented, Stepper } from './ui';
 import { Popover } from './overlay';
 import { Crossfade } from './overlay';
 import { AnimatePresence, motion } from 'motion/react';
@@ -325,16 +325,17 @@ function RuleList({ items, onChange, resolveId, assets, fanOut, qty, onQty }: { 
                 <RuleIcon id={resolveId(name)} name={name} assets={assets} />
                 <span className="min-w-0 flex-1 truncate text-[11px] text-fg-2">{name}</span>
                 {onQty && (
-                  <label className="shrink-0 flex items-center gap-1 text-[10px] text-fg-4" title="Auto-lot until this character holds this many (blank = every copy)">
+                  <div className="shrink-0 flex items-center gap-1.5 text-[10px] text-fg-4">
                     <span>keep</span>
-                    <input
-                      type="number" min={1} inputMode="numeric"
-                      value={qty?.[name] ?? ''}
-                      onChange={(e) => { const v = e.target.value.trim(); const n = Math.floor(Number(v)); onQty(name, v === '' || !Number.isFinite(n) || n <= 0 ? undefined : n); }}
-                      placeholder="all"
-                      className="w-12 bg-field border border-line rounded px-1.5 py-0.5 text-[11px] text-fg-2 text-right tabular-nums outline-none focus:border-accent/50 placeholder-fg-4/60"
-                    />
-                  </label>
+                    {qty?.[name] != null ? (
+                      <>
+                        <Stepper value={qty[name]} min={1} onChange={(v) => onQty(name, v)} h="h-6" numW="w-7" title="Auto-lot until this character holds this many" />
+                        <button onClick={() => onQty(name, undefined)} title="Keep every copy instead" className="le-tap px-1 text-fg-4 hover:text-fg-2 transition-colors">all</button>
+                      </>
+                    ) : (
+                      <button onClick={() => onQty(name, 1)} title="Cap how many to keep" className="le-tap h-6 px-2 grid place-items-center rounded-md border border-line bg-field text-[11px] text-fg-3 hover:text-fg-2 hover:border-accent/50 transition-colors">All</button>
+                    )}
+                  </div>
                 )}
                 <button onClick={() => removeItem(name)} aria-label="Remove" className="shrink-0 grid place-items-center w-5 h-5 rounded text-fg-4 hover:text-fg hover:bg-line transition-colors">×</button>
               </motion.div>
@@ -413,6 +414,13 @@ export default function PoolView({ view = 'pool', compact = false, dense = false
     const r = poolStore[charName] ?? emptyRules();
     if (r[kind].some((x) => x.toLowerCase() === itemName.toLowerCase())) return;
     setCharRules(charName, { ...r, [kind]: [...r[kind], itemName] });
+  };
+  const removeRuleFor = (charName: string, kind: 'lot' | 'pass', itemName: string) => {
+    const r = poolStore[charName];
+    if (!r) return;
+    const q = { ...(r.lotQty ?? {}) };
+    delete q[itemName];
+    setCharRules(charName, { ...r, [kind]: r[kind].filter((x) => x !== itemName), lotQty: q });
   };
 
   const nameToId = useMemo(() => {
@@ -568,9 +576,11 @@ export default function PoolView({ view = 'pool', compact = false, dense = false
                     </button>
                     <div className="flex flex-wrap gap-1.5 min-w-0 flex-1">
                       {r.lot.map((n) => (
-                        <span key={n} className="inline-flex items-center gap-1 rounded bg-field border border-line px-1.5 py-0.5 text-[11px] text-fg-2">
+                        <span key={n} className="inline-flex items-center gap-1 rounded bg-field border border-line pl-1.5 pr-0.5 py-0.5 text-[11px] text-fg-2">
                           <RuleIcon id={resolveId(n)} name={n} assets={assetsAny} />
                           <span className="truncate max-w-[140px]">{n}</span>
+                          {r.lotQty?.[n] != null && <span className="shrink-0 tabular-nums text-[10px] text-fg-4" title={`Keep ${r.lotQty[n]}`}>·{r.lotQty[n]}</span>}
+                          <button onClick={() => removeRuleFor(char, 'lot', n)} aria-label={`Remove ${n}`} title="Remove from this character's lot list" className="shrink-0 grid place-items-center w-4 h-4 rounded text-fg-4 hover:text-fg hover:bg-line transition-colors">×</button>
                         </span>
                       ))}
                     </div>

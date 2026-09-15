@@ -8407,6 +8407,15 @@ end
 
 function rf_tick(now)
     if not rf or not rf.active or rf.await_step then return end
+    -- Trace every status transition (prep never logged its sub-states, so a stall showed only START). This
+    -- makes the next "stuck on Gathering" report pinpoint whether it is go-to-NPC, a missing material, a
+    -- Rem's Tale retrieve, or the collect wait -- without per-tick spam.
+    if rf.phase == 'prep' and rf.status ~= rf.last_status_log then
+        rf.last_status_log = rf.status
+        rf_log(('PREP step %d/%d: %s | npc=%s near=%s zone=%s'):format(rf.step_index or 0, (rf.steps and #rf.steps) or 0,
+            tostring(rf.status), tostring(rf.steps and rf.steps[rf.step_index] and rf.steps[rf.step_index].npc),
+            tostring(rf_npc_near()), tostring((windower.ffxi.get_info() or {}).zone)))
+    end
     local st = rf.steps[rf.step_index]
     if rf.phase == 'prep' then
         if not rf_npc_near() then rf.status = 'go to ' .. st.npc; return end

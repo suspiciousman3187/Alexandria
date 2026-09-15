@@ -8269,6 +8269,7 @@ function rf_advance()
         alex_chat(207, '[Alexandria] reforge queue complete', 'progress'); rf_dirty = true; return
     end
     if rf.confirm_steps then
+        rf_log(('PAUSE step %d/%d: awaiting user Continue (confirm-each-step)'):format(rf.step_index or 0, #rf.steps))
         rf.await_step = true; rf.phase = 'confirm'; rf.status = 'confirm to continue'; rf_dirty = true; return
     end
     rf.step_index = rf.step_index + 1; rf_setup_step(); rf_dirty = true
@@ -8407,14 +8408,19 @@ end
 
 function rf_tick(now)
     if not rf or not rf.active or rf.await_step then return end
-    -- Trace every status transition (prep never logged its sub-states, so a stall showed only START). This
-    -- makes the next "stuck on Gathering" report pinpoint whether it is go-to-NPC, a missing material, a
-    -- Rem's Tale retrieve, or the collect wait -- without per-tick spam.
-    if rf.phase == 'prep' and rf.status ~= rf.last_status_log then
-        rf.last_status_log = rf.status
-        rf_log(('PREP step %d/%d: %s | npc=%s near=%s zone=%s'):format(rf.step_index or 0, (rf.steps and #rf.steps) or 0,
-            tostring(rf.status), tostring(rf.steps and rf.steps[rf.step_index] and rf.steps[rf.step_index].npc),
-            tostring(rf_npc_near()), tostring((windower.ffxi.get_info() or {}).zone)))
+    -- Forensic trail: log EVERY phase/status transition across the whole state machine, not just the money
+    -- events (START/TRADE/consumed/FAIL). A stall between those events used to write nothing -- prep, wait
+    -- and collect sub-states were all silent -- so a hang was indistinguishable from doing nothing. One line
+    -- per change (never per-tick), carrying what actually explains a stall: which NPC, whether it is detected
+    -- near, the zone, and while waiting how many seconds until the collect window.
+    if rf.phase ~= rf.last_phase_log or rf.status ~= rf.last_status_log then
+        rf.last_phase_log, rf.last_status_log = rf.phase, rf.status
+        local st0 = rf.steps and rf.steps[rf.step_index]
+        local ready_in = (rf.phase == 'wait' and rf.ready_at and rf.ready_at > 0) and (rf.ready_at - os.time()) or nil
+        rf_log(('TICK step %d/%d phase=%s status=%s | npc=%s near=%s zone=%s%s'):format(
+            rf.step_index or 0, (rf.steps and #rf.steps) or 0, tostring(rf.phase), tostring(rf.status),
+            tostring(st0 and st0.npc), tostring(rf_npc_near()), tostring((windower.ffxi.get_info() or {}).zone),
+            ready_in and (' ready_in=' .. ready_in .. 's') or ''))
     end
     local st = rf.steps[rf.step_index]
     if rf.phase == 'prep' then

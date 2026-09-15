@@ -7936,6 +7936,13 @@ end
 -- the caller can say so instead of spinning until a 20s "missing item id" timeout.
 function rf_pull(item_id, need)
     if rf_inv_count(item_id) >= need then return 'moving' end
+    -- PACE the pull. FFXI applies an inventory move via a request/ack round-trip and silently DROPS a move
+    -- fired before the prior one acks (same reason Organize paces its moves). rf_pull is called every frame
+    -- while gathering, so firing a wardrobe move each frame floods the request and the gear sometimes never
+    -- lands -- the "doesn't pull from the wardrobe before trading" report. Fire once, then wait for it to
+    -- register (or the move to have been dropped) before re-firing.
+    rf.pull_at = rf.pull_at or {}
+    if rf.pull_at[item_id] and (os.clock() - rf.pull_at[item_id]) < 1.5 then return 'moving' end
     local locked = false
     for _, bag in ipairs({ 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16 }) do
         local items = windower.ffxi.get_items(bag)
@@ -7946,7 +7953,9 @@ function rf_pull(item_id, need)
                     if it.status == nil or it.status == 0 then
                         local di = windower.ffxi.get_bag_info(0)
                         if di and (di.max - di.count) <= 0 then return 'nospace' end   -- movable, but inventory full
-                        enqueue_move(item_id, bag, 0, math.min(it.count or 1, need)); return 'moving'
+                        enqueue_move(item_id, bag, 0, math.min(it.count or 1, need))
+                        rf.pull_at[item_id] = os.clock()
+                        return 'moving'
                     else
                         locked = true   -- equipped (5) / bazaared (25): keep looking for a free copy first
                     end
@@ -8117,6 +8126,7 @@ function rf_setup_step()
     rf.ready_menu = st.advance and RF_ADVANCE_MENU[st.npc] or RF_READY_MENU[st.npc]
     rf.collect_option = st.advance and (RF_ADVANCE_OPTION[st.npc] or 0) or 0
     rf.rem_done = {}   -- chapters we already fired a Monisette retrieve for this step (avoid re-looping)
+    rf.pull_at = {}    -- last bag->inventory pull time per item id, to pace moves (FFXI drops flooded moves)
     if st.pending then
         -- Already-traded / in-flight piece: skip the trade and go straight to collecting. Use the saved
         -- ready time when resuming a pause (so the countdown is exact); otherwise 0 = try now, and if it

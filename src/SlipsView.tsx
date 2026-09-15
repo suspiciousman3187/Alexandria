@@ -121,7 +121,7 @@ function SlipCard({ slip, assets, near, q, jobMatch, onStoreIds, onRetrieveIds, 
         {slip.storable.length > 0 && (
           <>
             <div className="flex items-center mb-1.5">
-              <span className="text-[10px] font-semibold text-fg-3">{owned ? 'Storable now' : 'Items for this slip'}{canAct ? (pickStore.length ? ` — ${pickStore.length} picked` : ' — tap to pick, or Store all') : ''}</span>
+              <span className="text-[10px] font-semibold text-fg-3">{owned ? 'Storable now' : 'Items for this slip'}{canAct ? (pickStore.length ? ` · ${pickStore.length} picked` : ' · tap to pick, or Store all') : ''}</span>
               {canAct && slip.storable.length > 1 && (
                 <div className="ml-auto flex items-center gap-2 text-[10px] font-semibold">
                   <Button variant="ghost" size="xs" onClick={() => setSelStore(allIds(slip.storable))}>{jobMatch ? 'Job' : 'All'}</Button>
@@ -137,7 +137,7 @@ function SlipCard({ slip, assets, near, q, jobMatch, onStoreIds, onRetrieveIds, 
         {owned && (
           <>
             <div className="flex items-center mb-1.5">
-              <span className="text-[10px] font-semibold text-fg-4">Stored ({slip.stored.length}){slip.stored.length > 0 && canAct ? (pickRet.length ? ` — ${pickRet.length} picked` : ' — tap to pick, or Retrieve all') : ''}</span>
+              <span className="text-[10px] font-semibold text-fg-4">Stored ({slip.stored.length}){slip.stored.length > 0 && canAct ? (pickRet.length ? ` · ${pickRet.length} picked` : ' · tap to pick, or Retrieve all') : ''}</span>
               {canAct && slip.stored.length > 1 && (
                 <div className="ml-auto flex items-center gap-2 text-[10px] font-semibold">
                   <Button variant="ghost" size="xs" onClick={() => setSelRet(allIds(slip.stored))}>{jobMatch ? 'Job' : 'All'}</Button>
@@ -243,7 +243,7 @@ export default function SlipsView() {
               <Button variant="secondary" className="flex-1" onClick={openRetrieve} disabled={!near || running || retrieveIds.length === 0} title={!near ? 'Stand next to the Porter Moogle' : undefined}>Retrieve{retrieveIds.length ? ` ${retrieveIds.length}` : ''}</Button>
             </div>
             {!near ? <div className="text-[10.5px] text-amber-300 mt-2">Stand next to the Porter Moogle to store or retrieve.</div>
-              : blockedCount > 0 ? <div className="text-[10.5px] text-amber-300/90 mt-2">{blockedCount} more in Mog House storage — open your Mog House to include them.</div> : null}
+              : blockedCount > 0 ? <div className="text-[10.5px] text-amber-300/90 mt-2">{blockedCount} more in Mog House storage. Open your Mog House to include them.</div> : null}
           </div>
         )}
         {slips.length > 0 && (

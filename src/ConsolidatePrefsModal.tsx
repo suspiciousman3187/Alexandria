@@ -86,7 +86,7 @@ export default function ConsolidatePrefsModal({ onClose }: { onClose: () => void
                       ? <span className="ml-auto text-[11px] tabular-nums shrink-0"><span className="text-fg-3">{p.fit} fit</span> <span className="text-amber-400">· {p.leftover} won't fit</span></span>
                       : <span className="ml-auto text-[11px] text-fg-4 tabular-nums shrink-0">{p.total} incoming</span>}
                   </div>
-                  {p.leftover > 0 && <div className="px-3 py-1 text-[10px] text-amber-400/90 bg-amber-400/5">{anon(p.holder)} has {p.slotsFree} free slot{p.slotsFree === 1 ? '' : 's'} — only what fits will be sent.</div>}
+                  {p.leftover > 0 && <div className="px-3 py-1 text-[10px] text-amber-400/90 bg-amber-400/5">{anon(p.holder)} has {p.slotsFree} free slot{p.slotsFree === 1 ? '' : 's'}. Only what fits will be sent.</div>}
                   <div className="divide-y divide-line">
                     {p.items.map((r) => (
                       <div key={r.n} className="flex items-center gap-2 px-3 py-1.5">

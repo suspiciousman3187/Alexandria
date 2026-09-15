@@ -657,7 +657,7 @@ function GearPanel({ conn, charName, view, assets, inv, cur, zone, fixedNear, ex
         </button>
       </div>
       {fragBlocked && (
-        <div className="px-1 mt-1.5 text-[11px] text-amber-300">Out of Obsidian Fragments (50 needed per roll) — you have {obsidian.toLocaleString()}.</div>
+        <div className="px-1 mt-1.5 text-[11px] text-amber-300">Out of Obsidian Fragments (50 needed per roll). You have {obsidian.toLocaleString()}.</div>
       )}
       {selType && item !== '' && !locOk && npcName && (
         <div className="px-1 mt-1.5 text-[11px] text-amber-300">{experimental ? `Travel to ${npcName}'s zone to augment.` : `Stand next to ${npcName} to augment.`}</div>

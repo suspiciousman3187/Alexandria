@@ -75,7 +75,7 @@ function TagRuleCard({ tag, items, own, inherited, isAll, onChange, onClear, onO
               <Button variant="ghost" size="sm" className="shrink-0" onClick={onClear}>Clear</Button>
             </div>
           ) : (
-            <div className="text-[11px] text-fg-4">Not routed yet — pick a bag above to send these items there.{!isAll && inherited ? ' (Overriding the All Players rule.)' : ''}</div>
+            <div className="text-[11px] text-fg-4">Not routed yet. Pick a bag above to send these items there.{!isAll && inherited ? ' (Overriding the All Players rule.)' : ''}</div>
           )}
         </div>
       )}

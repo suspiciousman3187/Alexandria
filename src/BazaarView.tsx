@@ -307,7 +307,7 @@ function BuyModal({ conn, row, gil, assets, iconSet, onClose }: { conn: number; 
           <div className="text-[13px] text-fg-2">
             Buy <span className="font-extrabold text-accent">{qty}{row.qty > 1 ? ` of ${row.qty}` : ''}</span> for <span className={`font-extrabold tabular-nums ${afford ? 'text-amber-300' : 'text-red-300'}`}>{fmtGil(total)} gil</span>?
           </div>
-          {!afford && <div className="text-[11px] text-red-300">Not enough gil — you have {fmtGil(gil)}.</div>}
+          {!afford && <div className="text-[11px] text-red-300">Not enough gil. You have {fmtGil(gil)}.</div>}
           {note && <div className="text-[11px] text-amber-300">{note}</div>}
 
           <div className="flex items-center gap-2 pt-1">

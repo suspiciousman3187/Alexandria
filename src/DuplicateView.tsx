@@ -83,7 +83,7 @@ function LocalConsolidateAllModal({ onClose, targets, setTargets }: { onClose: (
             {(running || done) && (
               <div className="flex flex-col gap-1">
                 <div className="flex items-center justify-between text-[10px]">
-                  <span className={`font-semibold ${done ? 'text-emerald-300' : 'text-fg-2'}`}>{done ? (liveItems === 0 ? 'Done — all stacks merged' : `Done — ${liveItems} left unmerged`) : 'Consolidating…'}</span>
+                  <span className={`font-semibold ${done ? 'text-emerald-300' : 'text-fg-2'}`}>{done ? (liveItems === 0 ? 'Done, all stacks merged' : `Done, ${liveItems} left unmerged`) : 'Consolidating…'}</span>
                   <span className="text-fg-4 tabular-nums">{pct}%</span>
                 </div>
                 <div className="h-1.5 rounded-full bg-line overflow-hidden"><div className={`h-full rounded-full transition-all duration-300 ${done ? 'bg-emerald-400' : 'bg-accent'}`} style={{ width: `${Math.max(3, pct)}%` }} /></div>

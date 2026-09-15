@@ -8245,9 +8245,12 @@ function rf_send_option(menu, opt)
 end
 
 -- Count how many of an item the player holds across inventory + wardrobes (where a reforged piece lands or
--- gets organized to). Used to detect that a step's output already arrived, so an already-collected reforge
--- doesn't loop forever waiting for a collect menu that will never appear.
-function rf_inv_count(id)
+-- gets organized to). Used to detect that a step's OUTPUT already arrived, so an already-collected reforge
+-- doesn't loop forever waiting for a collect menu that will never appear. NOT for input gathering: a piece
+-- must be in inventory (bag 0) to trade, so the gather path uses rf_inv_count (inventory-only) instead. This
+-- was one function named rf_inv_count, silently clobbering the inventory-only one, so gathering counted the
+-- wardrobe copy as "already here", skipped the pull, and spun on 'moving items to inventory' forever.
+function rf_have_count(id)
     if not id then return 0 end
     local n = 0
     for _, b in ipairs({ 0, 8, 10, 11, 12, 13, 14, 15, 16 }) do
@@ -8455,7 +8458,7 @@ function rf_tick(now)
         -- Verify against the pre-trade snapshot instead of blindly advancing: a piece that never came back
         -- (materials consumed, no upgrade) now HALTS the queue with a logged LOSS line instead of silently
         -- moving on and eating the next step's materials too.
-        if st.advance or rf_inv_count(st.output_id) >= 1 then
+        if st.advance or rf_have_count(st.output_id) >= 1 then
             rf_verify_advance(st, 'ok')
         elseif (os.clock() - (rf.collect_at or now)) > RF_VERIFY_SECS then
             rf_verify_advance(st, 'timeout')
@@ -8475,7 +8478,7 @@ function rf_incoming(id, data)
         rf_log(('CONFIRM step %d: menu=0x%03X opt=%d'):format(rf.step_index, menu or 0x184, (tst and RF_TRADE_OPTION[tst.npc]) or 0))
         rf_send_option(menu or 0x184, tst and RF_TRADE_OPTION[tst.npc] or 0)
         rf.trade_at = os.time(); rf.ready_at = rf_ready_at(rf.trade_at, rf.timing)
-        if tst then tst.out_baseline = rf_inv_count(tst.output_id) end   -- how many of the +1 we hold BEFORE it comes back
+        if tst then tst.out_baseline = rf_have_count(tst.output_id) end   -- how many of the +1 we hold BEFORE it comes back
         rf.phase = 'wait'; rf.awaiting = false; rf.last_progress = os.clock(); rf_dirty = true
         return true
     elseif rf.phase == 'await_collect' then
@@ -8490,7 +8493,7 @@ function rf_incoming(id, data)
             -- Already collected? If the +1 output is now in inventory (beyond the pre-trade baseline), the
             -- reforge finished and the piece was picked up (auto or manual). The ready menu (0x182) will never
             -- appear again, so stop waiting on it and advance the queue instead of looping forever.
-            if st and not st.advance and st.output_id and rf_inv_count(st.output_id) > (st.out_baseline or 0) then
+            if st and not st.advance and st.output_id and rf_have_count(st.output_id) > (st.out_baseline or 0) then
                 rf_log(('COLLECT step %d: output #%d already in inventory -> already collected, advancing'):format(rf.step_index, st.output_id))
                 rf.awaiting = false; rf_advance(); rf_dirty = true
                 return true
@@ -8566,7 +8569,7 @@ end
 
 function rem_poke()
     packets.inject(packets.new('outgoing', 0x01A, { ['Target'] = rem.npc_id, ['Target Index'] = rem.npc_index, ['Category'] = 0, ['Param'] = 0 }))
-    rem.before = rf_inv_count(rem.item_id)
+    rem.before = rf_have_count(rem.item_id)
     rem.phase = 'await_menu'; rem.t = os.clock()
 end
 
@@ -8599,7 +8602,7 @@ function rem_tick(now)
     elseif rem.phase == 'await_item' then
         -- One talk/select pulls the whole requested quantity at once (count is packed into the option),
         -- so wait for all `want` to land in inventory, then finish.
-        local got = rf_inv_count(rem.item_id) - (rem.before or 0)
+        local got = rf_have_count(rem.item_id) - (rem.before or 0)
         if got >= rem.want then
             alex_chat(207, ('[Alexandria] retrieved %dx Rems Tale Ch.%d'):format(rem.want, rem.ch), 'progress')
             rem = nil

@@ -2487,11 +2487,15 @@ local function shop_buy_packet(idx, qty)
     return string.char(0x83, 0x08, 0, 0) .. le4(qty) .. le2(0) .. le2(idx) .. string.char(0, 0, 0, 0)
 end
 
-local function shop_do_sell(id, slot, qty)
+local function shop_do_sell(id, slot, qty, force)
     if not packets_ok then return end
     -- Only sell when a shop is actually open, or in the explicit sell-anywhere-in-town mode. Stops a pending
     -- sell that resolves after the shop closed (or a stale command) from firing shop packets off-menu.
-    if not (shop_session or (sell_anywhere and in_town())) then return end
+    -- `force` is the sparks/unity conversion: it buys from an NPC event menu (never a 0x03C shop), so it
+    -- never sets shop_session, yet the direct-sell must still fire. It is a controlled, user-started run that
+    -- only sells the item it is converting, so it is exempt from the open-shop gate (restores pre-gate behavior
+    -- -- the gate silently blocked every convert-sell unless the user had separately opened a vendor shop).
+    if not (force or shop_session or (sell_anywhere and in_town())) then return end
     pcall(windower.packets.inject_outgoing, 0x84, string.char(0x84, 0x06, 0, 0) .. le4(qty) .. le2(id) .. string.char(slot, 0))
     pcall(windower.packets.inject_outgoing, 0x85, string.char(0x85, 0x04, 0, 0, 1, 0, 0, 0))
 end
@@ -4437,7 +4441,7 @@ function cfarm_sell(id)
         local it = inv[s]
         if type(it) == 'table' and it.id == id and it.status == 0 and not shop_no_sale(id) then
             if not cfarm.sold[s] or now - cfarm.sold[s] > 3 then
-                shop_do_sell(id, s, it.count or 1)
+                shop_do_sell(id, s, it.count or 1, true)
                 cfarm.sold[s] = now
             end
         end

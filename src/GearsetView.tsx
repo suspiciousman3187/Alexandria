@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useKnownCharacters, useAvailableIcons, useAddonInfo } from './bridge';
-import { useItemNames, type ItemName } from './itemNames';
+import { useItemNames, nameMatches, type ItemName } from './itemNames';
 import { useSettings } from './settings';
 import { IconInner } from './atlasIcon';
 import { useItemCard, RichDescription } from './ItemTooltip';
@@ -162,7 +162,7 @@ export default function GearsetView() {
     const q = filter.trim().toLowerCase();
     const byGroup = new Map<string, ParsedSet[]>();
     for (const s of parsed.sets) {
-      if (q && !s.key.toLowerCase().includes(q)) continue;
+      if (q && !nameMatches(s.key, q)) continue;
       const g = s.path[0] ?? '?';
       const arr = byGroup.get(g) ?? [];
       arr.push(s); byGroup.set(g, arr);
@@ -213,7 +213,7 @@ export default function GearsetView() {
       const it = idToItem.get(id);
       if (!it || !it.sl || !(it.sl & bit)) continue;
       if (jbit && it.jb && !(it.jb & jbit)) continue; // hide gear this job can't equip
-      if (q && !it.n.toLowerCase().includes(q)) continue;
+      if (q && !nameMatches(it.n, q)) continue;
       out.push({ id, name: it.n, count: copies.length });
       if (out.length >= 60) break;
     }

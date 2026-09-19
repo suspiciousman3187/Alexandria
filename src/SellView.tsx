@@ -2,7 +2,7 @@ import { useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { useKnownCharacters, useAvailableIcons } from './bridge';
 import { useShopSell, setShopSell } from './shop';
-import { useItemNames, itemNameMatches, type ItemName } from './itemNames';
+import { useItemNames, itemNameMatches, nameMatches, type ItemName } from './itemNames';
 import { IconInner } from './atlasIcon';
 import { Popover } from './overlay';
 import { useSticky } from './sticky';
@@ -61,7 +61,7 @@ export default function SellView() {
 
   const shown = useMemo(() => {
     const q = filter.trim().toLowerCase();
-    return q ? sell.items.filter((n) => n.toLowerCase().includes(q)) : sell.items;
+    return q ? sell.items.filter((n) => nameMatches(n, q)) : sell.items;
   }, [sell.items, filter]);
 
   return (

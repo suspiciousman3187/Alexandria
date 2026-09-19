@@ -8,6 +8,7 @@ import { useStickyChar, useStickyPersisted } from './sticky';
 import { CharacterSelect, Select, SearchInput, Button } from './ui';
 import { openAhDetail } from './ahNav';
 import { useItemValues, useRowMarket } from './priceStore';
+import { nameMatches } from './itemNames';
 import { useSettings } from './settings';
 import { runQuantityBuy } from './quantityBuy';
 import {
@@ -761,8 +762,8 @@ export default function ReforgeView() {
     const q = search.trim().toLowerCase();
     return shown.filter((o) => (jobFilter === '' || o.job === jobFilter)
       && (slotFilter === '' || o.slot === slotFilter)
-      && (q === '' || o.job.toLowerCase().includes(q) || o.step.output.name.toLowerCase().includes(q)
-        || (db[tab]?.[o.job] ? setNameFor(db[tab][o.job]).toLowerCase().includes(q) : false)));
+      && (q === '' || nameMatches(o.job, q) || nameMatches(o.step.output.name, q)
+        || (db[tab]?.[o.job] ? nameMatches(setNameFor(db[tab][o.job]), q) : false)));
   }, [shown, jobFilter, slotFilter, search, tab, db]);
   const byJob = useMemo(() => { const m = new Map<string, Opportunity[]>(); for (const o of filtered) { const a = m.get(o.job) ?? []; a.push(o); m.set(o.job, a); } return [...m.entries()]; }, [filtered]);
 

@@ -8,6 +8,7 @@ import { useSticky } from './sticky';
 import { useSettings } from './settings';
 import { useItemValues, getCachedValue } from './priceStore';
 import { useAnon } from './anonymize';
+import { nameMatches } from './itemNames';
 import { Modal, Collapse } from './overlay';
 import { MOG_ONLY_BAGS } from './bagConstants';
 import TreasuryImportModal from './TreasuryImportModal';
@@ -143,7 +144,7 @@ export default function DropView() {
   const [filter, setFilter] = useSticky('drop.filter', '');
   const shown = useMemo(() => {
     const q = filter.trim().toLowerCase();
-    return q ? cfg.drop.filter((n) => n.toLowerCase().includes(q)) : cfg.drop;
+    return q ? cfg.drop.filter((n) => nameMatches(n, q)) : cfg.drop;
   }, [cfg.drop, filter]);
   const world = useSettings().ahServer || known.find((c) => c.online)?.server;
   const shownIds = useMemo(() => shown.map((name) => iconMap[name] ?? nameToId.get(name.toLowerCase())).filter((id): id is number => typeof id === 'number' && id > 0), [shown, iconMap, nameToId]);
@@ -275,7 +276,7 @@ export default function DropView() {
 
       {reviewOpen && (() => {
         const f = reviewFilter.trim().toLowerCase();
-        const list = f ? cfg.drop.filter((n) => n.toLowerCase().includes(f)) : cfg.drop;
+        const list = f ? cfg.drop.filter((n) => nameMatches(n, f)) : cfg.drop;
         const keep = reviewChecked.size;
         return (
           <Modal onClose={() => setReviewOpen(false)} panelClass="w-[min(94vw,520px)] max-h-[90vh]">

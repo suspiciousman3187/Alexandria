@@ -98,10 +98,37 @@ export function itemCategoryRank(id: number): number {
   return CAT_RANK.get(itemCategory(id)) ?? 999;
 }
 
+// Split a search-box query into OR-terms on the common delimiters `|` and `,`, so one box can hunt several
+// items at once ("orcfeltrap | shinj" matches either). Each term is trimmed + lowercased; blanks dropped.
+// A query with no delimiter yields a single term = the old single-substring behavior.
+export function searchTerms(query: string): string[] {
+  const terms: string[] = [];
+  for (const raw of query.split(/[|,]/)) {
+    const t = raw.trim().toLowerCase();
+    if (t) terms.push(t);
+  }
+  return terms;
+}
+
+// True if `text` contains ANY of the query's OR-terms (see searchTerms). For the plain name-only filters
+// that used `text.toLowerCase().includes(q)` -- gives them the same multi-item search. Blank query -> false
+// (callers already skip filtering when the box is empty).
+export function nameMatches(text: string, query: string): boolean {
+  const lc = text.toLowerCase();
+  for (const t of searchTerms(query)) if (lc.includes(t)) return true;
+  return false;
+}
+
 export function itemNameMatches(id: number, shownName: string, lcQuery: string): boolean {
-  if (shownName.toLowerCase().includes(lcQuery)) return true;
+  const terms = searchTerms(lcQuery);
+  if (terms.length === 0) return false;
+  const shown = shownName.toLowerCase();
   const full = fullById.get(id);
-  return full != null && full.includes(lcQuery);
+  for (const t of terms) {
+    if (shown.includes(t)) return true;
+    if (full != null && full.includes(t)) return true;
+  }
+  return false;
 }
 void load();
 

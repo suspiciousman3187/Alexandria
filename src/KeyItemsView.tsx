@@ -7,6 +7,7 @@ import { SearchInput } from './ui';
 import { Collapse } from './overlay';
 import { relTime, useNowTick } from './reltime';
 import { useAnon } from './anonymize';
+import { nameMatches } from './itemNames';
 
 type Row = { id: number; n: string; have: boolean[]; count: number };
 
@@ -57,7 +58,7 @@ export default function KeyItemsView() {
       const have = sets.map((s) => s.has(id));
       return { id, n, have, count: have.filter(Boolean).length };
     });
-    if (search) out = out.filter((r) => r.n.toLowerCase().includes(search));
+    if (search) out = out.filter((r) => nameMatches(r.n, search));
     if (diffOnly && scoped.length > 1) out = out.filter((r) => r.count > 0 && r.count < scoped.length);
     if (starOnly) out = out.filter((r) => starSet.has(r.id));
     out.sort((a, b) => a.n.localeCompare(b.n));

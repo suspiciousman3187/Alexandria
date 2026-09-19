@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { Modal } from './overlay';
 import { useSticky } from './sticky';
 import { useKnownCharacters, useAvailableIcons, useAcMap } from './bridge';
-import { useItemNames, itemNameMatches } from './itemNames';
+import { useItemNames, itemNameMatches, nameMatches } from './itemNames';
 import { IconInner } from './atlasIcon';
 import { AH_CATEGORY_TREE, AH_CATEGORY_TOP } from './ahCategories';
 import { Segmented, Select, Button } from './ui';
@@ -176,13 +176,13 @@ export default function TagBuilderView() {
       base = [];
       for (const k in assign) if (assign[k].includes(filter)) { const id = Number(k); base.push({ id, n: nameById.get(id) ?? `#${id}` }); }
       base.sort((a, b) => a.n.localeCompare(b.n));
-      if (s) base = base.filter((it) => it.n.toLowerCase().includes(s));
+      if (s) base = base.filter((it) => nameMatches(it.n, s));
     } else if (source === 'all') {
       if (s.length < 2) return [];
       base = []; const seen = new Set<number>();
       for (const it of db) { if (seen.has(it.id) || !itemNameMatches(it.id, it.n, s)) continue; seen.add(it.id); base.push({ id: it.id, n: it.n }); if (base.length >= CAP) break; }
     } else {
-      base = s ? myItems.filter((it) => it.n.toLowerCase().includes(s)) : myItems;
+      base = s ? myItems.filter((it) => nameMatches(it.n, s)) : myItems;
     }
     if (catTop !== 'All') base = base.filter((it) => AH_CATEGORY_TOP[acMap.get(it.id) ?? 0] === catTop);
     if (filter === 'untagged') base = base.filter((it) => !(assign[it.id]?.length));

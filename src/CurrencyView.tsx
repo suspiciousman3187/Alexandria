@@ -8,6 +8,7 @@ import { useCharScope, CharScopeBar } from './CharScope';
 import { Collapse } from './overlay';
 import { relTime, useNowTick } from './reltime';
 import { useAnon } from './anonymize';
+import { nameMatches } from './itemNames';
 
 const fmt = (v: number | null) => (v == null ? '·' : v.toLocaleString());
 const fmtRemain = (ms: number) => {
@@ -72,7 +73,7 @@ export default function CurrencyView() {
       .map((name) => ({ name, total: scoped.reduce((s, c) => s + (valueFor(c, name) ?? 0), 0) }))
       .filter((r) => r.total > 0);
     const q = query.trim().toLowerCase();
-    let filtered = q ? built.filter((r) => r.name.toLowerCase().includes(q)) : built;
+    let filtered = q ? built.filter((r) => nameMatches(r.name, q)) : built;
     if (starredOnly) filtered = filtered.filter((r) => starSet.has(r.name));
     filtered.sort((a, b) => {
       if (a.name === 'Gil') return -1;

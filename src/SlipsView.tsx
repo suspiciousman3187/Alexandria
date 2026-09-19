@@ -3,7 +3,7 @@ import { AnimatePresence, motion } from 'motion/react';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { useKnownCharacters, useAvailableIcons, slipStore, slipRetrieve, moveItem, inTauri, type Slip, type PorterProgress } from './bridge';
 import { useItemHover } from './ItemTooltip';
-import { itemNameMatches } from './itemNames';
+import { itemNameMatches, nameMatches } from './itemNames';
 import { useJobFilter, JobFilterSelect } from './jobFilter';
 import { slipLabel } from './slipLabels';
 import { CharacterSelect, SearchInput, Button } from './ui';
@@ -186,7 +186,7 @@ export default function SlipsView() {
   const jm = jf.matches;
   const q = filter.trim().toLowerCase();
   const visible = slips.filter((s) => {
-    if (q && !(s.name.toLowerCase().includes(q) || s.storable.some((it) => itemNameMatches(it.id, it.n, q)) || s.stored.some((it) => itemNameMatches(it.id, it.n, q)))) return false;
+    if (q && !(nameMatches(s.name, q) || s.storable.some((it) => itemNameMatches(it.id, it.n, q)) || s.stored.some((it) => itemNameMatches(it.id, it.n, q)))) return false;
     if (jm && !(s.storable.some((it) => jm(it.id)) || s.stored.some((it) => jm(it.id)))) return false; // only slips holding gear for this job
     return true;
   });

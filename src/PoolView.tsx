@@ -5,7 +5,7 @@ import {
   useKnownCharacters, useAvailableIcons, useDropIconMap, inTauri, lotPool, passPool, lotAll, passAll, useAhCatalog,
   type PoolItem, type KnownChar, type PoolRules,
 } from './bridge';
-import { useItemNames, itemStack, itemNameMatches, type ItemName } from './itemNames';
+import { useItemNames, itemStack, itemNameMatches, nameMatches, type ItemName } from './itemNames';
 import { useItemValue } from './priceStore';
 import { useSettings } from './settings';
 import { openPoolWindow, isPoolOverlay } from './overlayWindow';
@@ -283,7 +283,7 @@ function RuleList({ items, onChange, resolveId, assets, fanOut, qty, onQty }: { 
   const removeItem = (name: string) => onChange(items.filter((x) => x !== name));
   const shown = useMemo(() => {
     const q = filter.trim().toLowerCase();
-    return q ? items.filter((n) => n.toLowerCase().includes(q)) : items;
+    return q ? items.filter((n) => nameMatches(n, q)) : items;
   }, [items, filter]);
 
   return (

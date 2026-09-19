@@ -4,7 +4,7 @@ import { useKnownCharacters, useAvailableIcons, useItemDescription, augCape, aug
 
 // "Each Step" = confirm after each single roll; "Each Path" = confirm after each full path (sequence row).
 const CONFIRM_OPTS: { v: ConfirmMode; label: string }[] = [{ v: 'none', label: 'Off' }, { v: 'step', label: 'Each Step' }, { v: 'path', label: 'Each Path' }];
-import { useItemNames, itemNameMatches } from './itemNames';
+import { useItemNames, itemNameMatches, nameMatches } from './itemNames';
 import { IconInner } from './atlasIcon';
 import { Group, Row, RowStacked, Segmented, Select, Slider, Toggle, CharacterSelect, Stepper, SectionTabs, SearchInput, Button } from './ui';
 import { OpGlyph } from './OpCard';
@@ -466,7 +466,7 @@ function EquipList({ items, selected, onSelect, res, assets }: {
   const [filter, setFilter] = useState('');
   const shown = useMemo(() => {
     const q = filter.trim().toLowerCase();
-    return q ? items.filter((i) => { const id = res.idOf(i.name); return id != null ? itemNameMatches(id, i.name, q) : i.name.toLowerCase().includes(q); }) : items;
+    return q ? items.filter((i) => { const id = res.idOf(i.name); return id != null ? itemNameMatches(id, i.name, q) : nameMatches(i.name, q); }) : items;
   }, [items, filter, res]);
   if (items.length === 0) return <div className="text-[12px] text-fg-4 text-center py-6">None of these are in your bags.</div>;
   return (

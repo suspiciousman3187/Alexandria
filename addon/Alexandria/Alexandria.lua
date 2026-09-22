@@ -7596,6 +7596,15 @@ do
         pcall(windower.packets.inject_outgoing, 0x105, string.char(0x05, 0x07, 0, 0) .. le4(id) .. le2(index) .. le2(0))
     end
 
+    -- /check (examine) a player: outgoing 0x0DD GP_CLI_COMMAND_EQUIP_INSPECT, 16 bytes, Kind byte 0 (= /check;
+    -- 1=/checkname, 2=/checkparam). Header id|size, then UniqueNo (server id, u32), ActIndex (target index, u32),
+    -- Kind (u8) + 3 pad. Sent right before we peek a bazaar so the sequence mirrors a real player: examine, then
+    -- open the bazaar -- instead of opening every bazaar cold in a burst.
+    function bz_check(id, index)
+        if not packets_ok or not id or not index then return end
+        pcall(windower.packets.inject_outgoing, 0x0DD, string.char(0xDD, 0x08, 0, 0) .. le4(id) .. le4(index) .. string.char(0, 0, 0, 0))
+    end
+
     function bz_buy_result(ok, name, reason)
         local b = bz_buy
         bz_buy = nil
@@ -7633,10 +7642,16 @@ do
         local m = windower.ffxi.get_mob_by_index(nx.index)
         s.current = (m and m.name) or ''
         bz_sweep_dirty = true
-        bz_open(nx.id, nx.index)
+        -- Natural pacing: /check the player first, then peek the bazaar 3-5s later (a human examines,
+        -- pauses, then opens the bazaar). bz_open is deferred to bz_tick once s.open_at passes; s.pending
+        -- both carries the target and blocks the next step until this open has fired + collected.
+        bz_check(nx.id, nx.index)
+        s.pending = { id = nx.id, index = nx.index }
+        s.open_at = now + 3 + math.random() * 2
     end
 
     local function bz_start_sweep(list, emptymsg)
+        math.randomseed(os.time() + math.floor(os.clock() * 1000))   -- vary the 3-5s /check->open jitter per sweep
         if #list == 0 then
             bz_sweep = { active = false, total = 0, done = 0, current = '' }
             bz_sweep_dirty = true
@@ -7726,7 +7741,14 @@ do
                 end
             end
         end
-        if bz_sweep and bz_sweep.active and not bz_collecting and now >= (bz_sweep.next_at or 0) then
+        -- Fire the deferred bazaar open once the natural /check -> wait delay has elapsed.
+        if bz_sweep and bz_sweep.active and bz_sweep.pending and not bz_collecting and now >= (bz_sweep.open_at or 0) then
+            local pd = bz_sweep.pending
+            bz_sweep.pending = nil
+            bz_open(pd.id, pd.index)
+        end
+        -- Advance to the next player only once nothing is pending/collecting (so /check -> delay -> open completes).
+        if bz_sweep and bz_sweep.active and not bz_collecting and not bz_sweep.pending and now >= (bz_sweep.next_at or 0) then
             bz_sweep_step(now)
         end
         if bz_buy and (now - bz_buy.t) > 6 then

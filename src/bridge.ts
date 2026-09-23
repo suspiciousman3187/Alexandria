@@ -1232,8 +1232,21 @@ export function useAvailableIcons(): Set<number> {
   );
 }
 
+// Per-conn FIFO send chain. Each box command awaits the previous one's invoke before firing, so a burst of
+// lines (e.g. findall printing every match then its "N total" summary) reaches the addon in call order. Without
+// this each call fired an independent, un-awaited invoke('send_box_command') and concurrent invokes settled in
+// arbitrary order, so the summary line could overtake earlier match lines and print mid-list (the "random
+// position of the total line" bug). Chain entries self-clean once they are the settled tail so the map cannot grow.
+const sendChains = new Map<number, Promise<void>>();
 export function sendBoxCommand(conn: number, line: string) {
-  if (inTauri) void invoke('send_box_command', { conn, line }).catch(() => {});
+  if (!inTauri) return;
+  const prev = sendChains.get(conn) ?? Promise.resolve();
+  const next: Promise<void> = prev
+    .catch(() => {})                                              // a failed prior send must not break the chain
+    .then(() => invoke('send_box_command', { conn, line }))
+    .then(() => {}, () => {});                                    // coerce to void + swallow this send's own failure
+  sendChains.set(conn, next);
+  void next.finally(() => { if (sendChains.get(conn) === next) sendChains.delete(conn); });
 }
 
 type AxHandler = (conn: number, char: string, target: string | undefined, args: string[]) => void;

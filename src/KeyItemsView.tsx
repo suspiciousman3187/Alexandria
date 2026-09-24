@@ -38,7 +38,7 @@ export default function KeyItemsView() {
   const [starred, setStarred] = useStickyPersisted<number[]>('ki.starred', []);
   const starSet = useMemo(() => new Set(starred), [starred]);
   const toggleStar = (id: number) => setStarred((p) => (p.includes(id) ? p.filter((x) => x !== id) : [...p, id]));
-  const [expand, setExpand] = useState<number | null>(null);
+  const [expand, setExpand] = useState<Set<number>>(() => new Set());
 
   const chars = useMemo<KnownChar[]>(
     () => known.filter((k) => k.keyItems !== undefined).sort((a, b) => (a.online === b.online ? a.name.localeCompare(b.name) : a.online ? -1 : 1)),
@@ -120,7 +120,7 @@ export default function KeyItemsView() {
           <div className="rounded-lg border border-line bg-surface overflow-hidden divide-y divide-line">
             <AnimatePresence mode="popLayout" initial={false}>
             {rows.map((r) => {
-              const open = expand === r.id;
+              const open = expand.has(r.id);
               return (
                 <motion.div
                   key={r.id}
@@ -134,7 +134,7 @@ export default function KeyItemsView() {
                     <button onClick={() => toggleStar(r.id)} aria-pressed={starSet.has(r.id)} aria-label={starSet.has(r.id) ? 'Unstar' : 'Star'} className={`le-tap shrink-0 grid place-items-center w-7 h-7 ml-1.5 rounded-md transition-colors ${starSet.has(r.id) ? 'text-amber-300' : 'text-fg-4/50 hover:text-amber-300 hover:bg-field/40'}`}>
                       <Star filled={starSet.has(r.id)} />
                     </button>
-                    <button onClick={() => setExpand(open ? null : r.id)} className="le-tap flex-1 min-w-0 flex items-center gap-2 pl-1 pr-3 py-1.5 text-left hover:bg-field/40 transition-colors">
+                    <button onClick={() => setExpand((prev) => { const next = new Set(prev); if (next.has(r.id)) next.delete(r.id); else next.add(r.id); return next; })} className="le-tap flex-1 min-w-0 flex items-center gap-2 pl-1 pr-3 py-1.5 text-left hover:bg-field/40 transition-colors">
                       <span className="flex-1 min-w-0 truncate text-fg-2 text-[12px]">{r.n}</span>
                       <span className={`tabular-nums text-[11px] font-semibold ${r.count === scoped.length ? 'text-emerald-300' : r.count === 0 ? 'text-fg-4' : 'text-amber-300'}`}>{r.count}/{scoped.length}</span>
                       <svg viewBox="0 0 24 24" className={`w-3 h-3 shrink-0 text-fg-4 transition-transform ${open ? 'rotate-90' : ''}`} fill="none" stroke="currentColor" strokeWidth={2.4} strokeLinecap="round" strokeLinejoin="round"><path d="m9 6 6 6-6 6" /></svg>

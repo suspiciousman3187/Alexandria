@@ -9,7 +9,7 @@ import { useAnon } from './anonymize';
 const INCS = [10000, 50000, 100000, 1000000];
 const fmtInc = (n: number) => (n >= 1000000 ? `+${n / 1000000}M` : `+${n / 1000}K`);
 
-export default function IncBidModal({ id, n, single, qty, startPrice, rare, assets, onClose }: { id: number; n: string; single: number; qty: number; startPrice: number; rare?: boolean; assets?: string; onClose: () => void }) {
+export default function IncBidModal({ id, n, single, qty, startPrice, rare, assets, defaultChar, onClose }: { id: number; n: string; single: number; qty: number; startPrice: number; rare?: boolean; assets?: string; defaultChar?: string; onClose: () => void }) {
   const anon = useAnon();
   const known = useKnownCharacters();
   const iconSet = useAvailableIcons();
@@ -30,7 +30,7 @@ export default function IncBidModal({ id, n, single, qty, startPrice, rare, asse
   const [inc, setInc] = useState(50000);
   const [tries, setTries] = useState(5);
   const [delaySec, setDelaySec] = useState(20);
-  const [char, setChar] = useState(() => atAh[0]?.name ?? '');
+  const [char, setChar] = useState(() => (defaultChar && atAh.some((k) => k.name === defaultChar) ? defaultChar : atAh[0]?.name ?? ''));
 
   const startNum = Number(start) || 0;
   const charObj = atAh.find((k) => k.name === char) ?? atAh[0];

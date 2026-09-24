@@ -34,15 +34,14 @@ export async function runQuantityBuy(opts: {
   stop = false;
   set({ running: true, charName: opts.charName, item: opts.itemName, itemId: opts.id, bought: 0, target: opts.target, failed: 0, price: opts.price, status: 'buying', note: undefined });
   const pace = opts.paceMs ?? 1200;
-  let misses = 0;
   for (let i = 0; i < opts.target; i++) {
     if (stop) break;
     const gil = getKnownCharacters().find((k) => k.name === opts.charName)?.gil ?? 0;
     if (gil < opts.price) { set({ running: false, status: 'broke', note: `${opts.charName} has ${gil.toLocaleString()} gil, needs ${opts.price.toLocaleString()}` }); return; }
     ahBuy(opts.conn, opts.id, opts.single, opts.price, 1);
     const res = await nextAhMsg(opts.conn, 10000);
-    if (res?.ok) { misses = 0; set({ bought: s.bought + 1, note: res.text }); }
-    else { misses += 1; set({ failed: s.failed + 1, note: res?.text || 'bid failed' }); if (misses >= 5) { set({ note: 'stopped: 5 bids in a row failed (out of stock?)' }); break; } }
+    if (res?.ok) { set({ bought: s.bought + 1, note: res.text }); }
+    else { set({ failed: s.failed + 1, note: `${res?.text || 'Bid failed'} — stopped, remaining bids at this price cancelled` }); break; }
     if (i < opts.target - 1 && !stop && s.running) await waitOrStop(pace);
   }
   set({ running: false, status: stop ? 'stopped' : (s.bought >= opts.target ? 'done' : 'stopped') });

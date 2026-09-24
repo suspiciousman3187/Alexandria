@@ -985,6 +985,7 @@ function ItemDetail({ item, onBack, backLabel, sell, initialStack, atah, assets,
   const bidCost = priceNum * buyQty;
   const bidders = useMemo(() => atAh.filter((k) => (k.gil ?? 0) >= bidCost && !(isRare && (heldCount.get(k.name) ?? 0) >= 1)), [atAh, bidCost, isRare, heldCount]);
   const onlineChars = useMemo(() => known.filter((k) => k.online && k.conn != null), [known]);
+  const activeCharName = known.find((k) => k.conn === conn)?.name;
   const bidderChar = bidders.find((k) => k.name === bidder) ?? bidders[0];
   const canBid = priceNum > 0 && bidders.length > 0;
   const jobsList = item.j ?? [];
@@ -1198,7 +1199,7 @@ function ItemDetail({ item, onBack, backLabel, sell, initialStack, atah, assets,
 
       {sellOpen && <SellModal item={item} sellers={sellers} initial={sell ?? null} server={server} assets={assets} iconSet={iconSet} onClose={() => setSellOpen(false)} afterList={sell ? onBack : undefined} />}
 
-      {incOpen && <IncBidModal id={item.id} n={item.n} single={stack ? 0 : 1} qty={buyQty} startPrice={priceNum} rare={isRare} assets={assets} onClose={() => setIncOpen(false)} />}
+      {incOpen && <IncBidModal id={item.id} n={item.n} single={stack ? 0 : 1} qty={buyQty} startPrice={priceNum} rare={isRare} assets={assets} defaultChar={activeCharName} onClose={() => setIncOpen(false)} />}
 
       {market && market.sales.length > 0 && (
         <Group title={`Price History · ${market.sales.length}`}>

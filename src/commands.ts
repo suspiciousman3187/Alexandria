@@ -289,6 +289,7 @@ function doFind(ctx: Ctx, a: string[], selfDefault: boolean): string {
   for (const [name, entries] of Object.entries(getFindCache())) {
     if (!onlineNames.has(name.toLowerCase())) searched.push({ name, entries });
   }
+  searched.sort((a, b) => a.name.localeCompare(b.name));
   for (const { name, entries } of searched) {
     const ln = name.toLowerCase();
     if (include.size && !include.has(ln)) continue;
@@ -303,7 +304,7 @@ function doFind(ctx: Ctx, a: string[], selfDefault: boolean): string {
       const m = merged.get(k);
       if (m) m.c += it.c; else merged.set(k, { loc: it.loc, id: it.id, n: it.n, c: it.c });
     }
-    for (const m of merged.values()) {
+    for (const m of [...merged.values()].sort((a, b) => a.n.localeCompare(b.n) || a.loc.localeCompare(b.loc))) {
       if (m.id > 0) total += m.c;
       lines.push(`${name}/${m.loc}: ${m.n}${m.c > 1 ? ` (${m.c})` : ''}`);
     }

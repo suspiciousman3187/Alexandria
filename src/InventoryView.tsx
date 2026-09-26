@@ -1803,7 +1803,7 @@ export default function InventoryView() {
               value={q}
               onChange={setQ}
               wrap="flex-1 min-w-0"
-              placeholder={globalFind ? `Find an item across all ${known.length} character${known.length === 1 ? '' : 's'}…` : 'Search...'}
+              placeholder={globalFind ? `Find by name or stat across all ${known.length} character${known.length === 1 ? '' : 's'}…` : 'Name or stat…'}
               className="w-full bg-field border border-line rounded-md px-3 py-1.5 text-xs text-fg-2 placeholder-fg-4 outline-none focus:border-accent/50 transition-colors"
             />
             {viewBusy && <svg viewBox="0 0 24 24" className="shrink-0 w-4 h-4 text-accent animate-spin" fill="none" stroke="currentColor" strokeWidth={2.4} strokeLinecap="round"><path d="M21 12a9 9 0 1 1-6.2-8.5" /></svg>}

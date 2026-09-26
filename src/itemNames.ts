@@ -11,6 +11,25 @@ let levelById = new Map<number, number>();
 let started = false;
 const subs = new Set<() => void>();
 
+// Gear stat index (id -> lowercased description text). Loaded lazily on the first item search so it costs
+// nothing until someone actually searches. Lets the search match by stat ("fast cast", "dex+10") not just name.
+let descById = new Map<number, string>();
+let descStarted = false;
+async function loadDescs() {
+  if (descStarted) return;
+  descStarted = true;
+  try {
+    const resp = await fetch('/item_stats.json');
+    if (resp.ok) {
+      const p = await resp.json();
+      const m = new Map<number, string>();
+      for (const k in p) m.set(Number(k), p[k]);
+      descById = m;
+    }
+  } catch { /* not bundled (dev without build:itemnames) */ }
+  subs.forEach((s) => s());
+}
+
 async function load() {
   if (started) return;
   started = true;
@@ -122,11 +141,14 @@ export function nameMatches(text: string, query: string): boolean {
 export function itemNameMatches(id: number, shownName: string, lcQuery: string): boolean {
   const terms = searchTerms(lcQuery);
   if (terms.length === 0) return false;
+  if (!descStarted) void loadDescs();          // pull the gear-stat index on the first search
   const shown = shownName.toLowerCase();
   const full = fullById.get(id);
+  const desc = descById.get(id);               // lowercased gear stats/description (equippable gear only)
   for (const t of terms) {
     if (shown.includes(t)) return true;
     if (full != null && full.includes(t)) return true;
+    if (desc != null && desc.includes(t)) return true;
   }
   return false;
 }

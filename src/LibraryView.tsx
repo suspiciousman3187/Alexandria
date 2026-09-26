@@ -26,6 +26,7 @@ import { resolveLayout, useTagRules } from './tagRules';
 import { useItemTags, bulkSetTag } from './itemTags';
 import { useTagFilter, TagFilterSelect } from './tagFilter';
 import { useJobFilter, JobFilterSelect } from './jobFilter';
+import { useStatFilter, StatFilterSelect } from './statFilter';
 import PullButton from './PullMenu';
 import { usePorterGear } from './porterGear';
 import { BAG_ORDER, bagName, bagIdByName } from './bagNames';
@@ -96,7 +97,7 @@ const parseKey = (k: string) => { const i = k.indexOf('|'); const [b, s] = k.sli
 const WARDROBES = new Set([8, 10, 11, 12, 13, 14, 15, 16]);
 const isEquippable = (id: number) => itemCategory(id) !== 'other';
 // Shared item filter predicate so the grid and Select All narrow identically.
-const passesFilt = (it: InvItem, filt: Filt, catMatch?: Set<number> | null, medianOf?: Map<number, number>, tagMatches?: ((id: number) => boolean) | null, jobMatches?: ((id: number) => boolean) | null) => {
+const passesFilt = (it: InvItem, filt: Filt, catMatch?: Set<number> | null, medianOf?: Map<number, number>, tagMatches?: ((id: number) => boolean) | null, jobMatches?: ((id: number) => boolean) | null, statMatches?: ((id: number) => boolean) | null) => {
   const f = it.f ?? 0;
   if (filt.rare && !(f & 0x01)) return false;
   if (filt.ex && !(f & 0x02)) return false;
@@ -107,6 +108,7 @@ const passesFilt = (it: InvItem, filt: Filt, catMatch?: Set<number> | null, medi
   if (catMatch && !catMatch.has(it.id)) return false;
   if (tagMatches && !tagMatches(it.id)) return false;
   if (jobMatches && !jobMatches(it.id)) return false;
+  if (statMatches && !statMatches(it.id)) return false;
   return true;
 };
 const bagOf = (ch: KnownChar | undefined, bagId: number) => ch?.inv?.find((b) => b.id === bagId);
@@ -239,9 +241,9 @@ function Tile({ item, dataKey, tile, assets, iconSet, selected, dim, hit, homeCl
 
 const EMPTY_HOME: Map<string, number[]> = new Map();
 
-const BagCard = memo(function BagCard({ charName, bag, name, items, max, used, reach, isDrop, receiving, sel, query, homeBags, misplacedOnly, filt, catMatch, tagMatches, jobMatches, medianOf, pending, tile, tileCols, assets, iconSet, fleetTotals, onDown, onContext, onDouble }: {
+const BagCard = memo(function BagCard({ charName, bag, name, items, max, used, reach, isDrop, receiving, sel, query, homeBags, misplacedOnly, filt, catMatch, tagMatches, jobMatches, statMatches, medianOf, pending, tile, tileCols, assets, iconSet, fleetTotals, onDown, onContext, onDouble }: {
   charName: string; bag: number; name: string; items: InvItem[]; max: number; used: number; reach: boolean; isDrop: boolean; receiving?: boolean; sel: Set<string>; query: string; homeBags: Map<string, number[]>; misplacedOnly: boolean;
-  filt: Filt; catMatch?: Set<number> | null; tagMatches?: ((id: number) => boolean) | null; jobMatches?: ((id: number) => boolean) | null; medianOf?: Map<number, number>; pending?: Set<string>; tile: number; tileCols?: number;
+  filt: Filt; catMatch?: Set<number> | null; tagMatches?: ((id: number) => boolean) | null; jobMatches?: ((id: number) => boolean) | null; statMatches?: ((id: number) => boolean) | null; medianOf?: Map<number, number>; pending?: Set<string>; tile: number; tileCols?: number;
   assets?: string; iconSet: Set<number>; fleetTotals?: Map<number, number>;
   onDown: (e: React.PointerEvent, item: InvItem, from: number, charName: string) => void;
   onContext: (e: React.MouseEvent, item: InvItem, from: number, charName: string) => void;
@@ -250,10 +252,10 @@ const BagCard = memo(function BagCard({ charName, bag, name, items, max, used, r
   const c = bagColor(bag);
   const now = Date.now();
   const homeOf = (n: string) => homeBags.get(n.toLowerCase());
-  const anyFilter = filt.rare || filt.ex || filt.aug || filt.equip || filt.sellable || filt.worth || filt.cat || !!tagMatches || !!jobMatches;
+  const anyFilter = filt.rare || filt.ex || filt.aug || filt.equip || filt.sellable || filt.worth || filt.cat || !!tagMatches || !!jobMatches || !!statMatches;
   // When searching, render ONLY the matching tiles (do not render every tile and
   // dim non-matches) so a 5000-item fleet stays responsive per keystroke.
-  const passed = (misplacedOnly ? items.filter((it) => { const h = homeOf(it.n); return h && h.length && !h.includes(bag); }) : items).filter((it) => passesFilt(it, filt, catMatch, medianOf, tagMatches, jobMatches));
+  const passed = (misplacedOnly ? items.filter((it) => { const h = homeOf(it.n); return h && h.length && !h.includes(bag); }) : items).filter((it) => passesFilt(it, filt, catMatch, medianOf, tagMatches, jobMatches, statMatches));
   const shown = query ? passed.filter((it) => itemNameMatches(it.id, it.n, query)) : passed;
   const pct = max ? Math.min(100, (used / max) * 100) : 0;
   const full = !!max && used / max >= 0.95;
@@ -305,6 +307,8 @@ export default function LibraryView() {
   const tagMatches = tf.matches;
   const jf = useJobFilter('library.jobfilter');
   const jobMatches = jf.matches;
+  const sf = useStatFilter('library.statfilter');
+  const statMatches = sf.matches;
   const drop = useDrop();
   const wishlist = useWishlist();
   const watch = useWatchStore();
@@ -437,7 +441,7 @@ export default function LibraryView() {
   }, [isAll, viewChars]);
 
   const filt: Filt = useMemo(() => ({ rare: hasF('rare'), ex: hasF('ex'), aug: hasF('aug'), equip: hasF('equip'), sellable: hasF('sellable'), worth: minWorth > 0 && !!settings.ahServer, cat: catTop !== 'all', minWorth }), [filters, minWorth, settings.ahServer, catTop]);
-  const anyFilter = filters.length > 0 || minWorth > 0 || catTop !== 'all' || tf.active || jf.active;
+  const anyFilter = filters.length > 0 || minWorth > 0 || catTop !== 'all' || tf.active || jf.active || sf.active;
 
   // AH-category filter: match items whose bundled auction-house category (via
   // useAcMap) falls under the chosen top group, optionally narrowed to one sub.
@@ -492,7 +496,7 @@ export default function LibraryView() {
       for (const b of ch.inv ?? []) {
         for (const it of b.items) {
           if (dQuery && !itemNameMatches(it.id, it.n, dQuery)) continue;
-          if (!passesFilt(it, filt, catMatch, medianOf, tagMatches, jobMatches)) continue;
+          if (!passesFilt(it, filt, catMatch, medianOf, tagMatches, jobMatches, statMatches)) continue;
           if (homes) { const h = homes.get(it.n.toLowerCase()); if (!(h && h.length && !h.includes(b.id))) continue; }
           bagSet.add(b.id); count++;
         }
@@ -500,7 +504,7 @@ export default function LibraryView() {
       if (count) m.set(ch.name, { bags: bagSet, count });
     }
     return m;
-  }, [dQuery, anyFilter, misplacedOnly, viewChars, filt, catMatch, medianOf, homeBagMaps, tagMatches, jobMatches]);
+  }, [dQuery, anyFilter, misplacedOnly, viewChars, filt, catMatch, medianOf, homeBagMaps, tagMatches, jobMatches, statMatches]);
   // The characters left to show once the visibility map has dropped the empty ones.
   const shownChars = useMemo(() => (searchMap ? viewChars.filter((ch) => searchMap.has(ch.name)) : viewChars), [searchMap, viewChars]);
 
@@ -911,7 +915,7 @@ export default function LibraryView() {
       for (const b of ch.inv ?? []) {
         if (!reachable(b.id, ch, experimental)) continue;
         for (const it of b.items) {
-          if (!passesFilt(it, filt, catMatch, medianOf, tagMatches, jobMatches)) continue;
+          if (!passesFilt(it, filt, catMatch, medianOf, tagMatches, jobMatches, statMatches)) continue;
           if (homes) { const h = homes.get(it.n.toLowerCase()); if (!(h && h.length && !h.includes(b.id))) continue; }
           if (query && !itemNameMatches(it.id, it.n, query)) continue;
           all.add(keyOf(ch.name, b.id, it.s));
@@ -1131,6 +1135,7 @@ export default function LibraryView() {
         <div className="w-32 shrink-0" title="Filter by auction-house category"><Select full value={catTop} onChange={(v) => { setCatTop(v); setCatSub(0); }} options={['all', ...AH_CATEGORY_TREE.map((g) => g.top)]} renderValue={(v) => (v === 'all' ? 'AH Category' : v)} renderOption={(v) => (v === 'all' ? 'All AH Categories' : v)} /></div>
         {tf.tags.length > 0 && <div className="w-28 shrink-0" title="Filter by tag"><TagFilterSelect value={tf.value} onChange={tf.setValue} tags={tf.tags} /></div>}
         <div className="w-24 shrink-0" title="Filter by job"><JobFilterSelect value={jf.value} onChange={jf.setValue} /></div>
+        <div className="w-28 shrink-0" title="Filter by gear stat (e.g. Fast Cast)"><StatFilterSelect value={sf.value} onChange={sf.setValue} /></div>
         {catGroup && catGroup.subs.length > 1 && <div className="w-36 shrink-0"><Select full value={String(catSub)} onChange={(v) => setCatSub(Number(v))} options={['0', ...catGroup.subs.map((s) => String(s.id))]} renderValue={(v) => (v === '0' ? 'All' : (catGroup.subs.find((s) => String(s.id) === v)?.label ?? v))} renderOption={(v) => (v === '0' ? `All ${catTop}` : (catGroup.subs.find((s) => String(s.id) === v)?.label ?? v))} /></div>}
         <div className={`shrink-0 inline-flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-semibold rounded-md border transition-colors ${minWorth > 0 ? 'border-accent bg-accent/15' : 'border-line bg-field hover:border-line-2 focus-within:border-accent/50'}`}>
           <span className={minWorth > 0 ? 'text-accent' : 'text-fg-4'}>Worth &gt;</span>
@@ -1138,7 +1143,7 @@ export default function LibraryView() {
           <span className={minWorth > 0 ? 'text-accent/70' : 'text-fg-4'}>g</span>
         </div>
         {hasHomes && <Btn on={misplacedOnly} onClick={() => setMisplacedOnly(!misplacedOnly)} title="Show only items not in their assigned preset bag">Misplaced</Btn>}
-        {anyFilter && <Btn v="danger" onClick={() => { setFilters([]); setMinWorth(0); setCatTop('all'); setCatSub(0); tf.setValue('all'); jf.setValue('all'); }} title="Clear all filters">Clear</Btn>}
+        {anyFilter && <Btn v="danger" onClick={() => { setFilters([]); setMinWorth(0); setCatTop('all'); setCatSub(0); tf.setValue('all'); jf.setValue('all'); sf.setValue(''); }} title="Clear all filters">Clear</Btn>}
         {!settings.ahServer && minWorth > 0 && <span className="shrink-0 text-[10px] text-amber-300 ml-0.5">needs an AH server</span>}
         {catTop !== 'all' && acMap.size === 0 && <span className="shrink-0 text-[10px] text-amber-300 ml-0.5">category data not loaded</span>}
         <div className="flex items-center gap-1.5 flex-wrap basis-full justify-start sm:basis-auto sm:ml-auto sm:justify-end">
@@ -1269,6 +1274,7 @@ export default function LibraryView() {
                       catMatch={catMatch}
                       tagMatches={tagMatches}
                       jobMatches={jobMatches}
+                      statMatches={statMatches}
                       medianOf={medianOf}
                       pending={pending}
                       tile={tile}

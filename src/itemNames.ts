@@ -152,6 +152,34 @@ export function itemNameMatches(id: number, shownName: string, lcQuery: string):
   }
   return false;
 }
+
+// Named-effect catalog (item_stat_options.json) that backs the Library "Stat" filter combobox. Lazy-loaded
+// the first time the filter renders; also pulls the per-item stat text so the filter can match.
+let statOptions: string[] = [];
+let optsStarted = false;
+async function loadStatOptions() {
+  if (optsStarted) return;
+  optsStarted = true;
+  void loadDescs();
+  try {
+    const resp = await fetch('/item_stat_options.json');
+    if (resp.ok) { const p = await resp.json(); if (Array.isArray(p)) statOptions = p; }
+  } catch { /* not built */ }
+  subs.forEach((s) => s());
+}
+
+export function useStatOptions(): string[] {
+  useSyncExternalStore((cb) => { subs.add(cb); return () => subs.delete(cb); }, () => statOptions, () => statOptions);
+  if (!optsStarted) void loadStatOptions();
+  return statOptions;
+}
+
+// True if this item's gear description contains the given (already-lowercased) stat text.
+export function itemHasStat(id: number, statLower: string): boolean {
+  if (!descStarted) void loadDescs();
+  const d = descById.get(id);
+  return d != null && d.includes(statLower);
+}
 void load();
 
 export function useItemNames(): ItemName[] {

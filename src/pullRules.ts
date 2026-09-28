@@ -9,7 +9,8 @@ import { appDataPath, inTauri } from './bridge';
 // dest: ordered destination bags to pull INTO (fill the first with room, then fall back). Empty = inventory only.
 // autoOnJobChange: when the character changes job while they can reach BOTH the Porter Moogle and a
 // job-change Moogle (i.e. Mog Garden / a Mog House with the Porter in range), run this pull automatically.
-export type PullRule = { id: string; name: string; tags: string[]; bags: number[]; jobOnly: boolean; slips?: boolean; slipSids?: number[]; autoGetSlips?: boolean; dest?: number[]; autoOnJobChange?: boolean };
+// jobs: when autoOnJobChange is on, restrict the auto-run to these main jobs (empty/undefined = any job).
+export type PullRule = { id: string; name: string; tags: string[]; bags: number[]; jobOnly: boolean; slips?: boolean; slipSids?: number[]; autoGetSlips?: boolean; dest?: number[]; autoOnJobChange?: boolean; jobs?: string[] };
 
 let rules: PullRule[] = [];
 let started = false;
@@ -33,6 +34,7 @@ async function load() {
         autoGetSlips: !!r.autoGetSlips,
         dest: Array.isArray(r.dest) ? r.dest.map(Number).filter((n: number) => Number.isFinite(n)) : undefined,
         autoOnJobChange: !!r.autoOnJobChange,
+        jobs: Array.isArray(r.jobs) ? r.jobs.map(String) : undefined,
       }));
       notify();
     }

@@ -339,6 +339,12 @@ function SettingsView() {
         >
           <Toggle on={settings.experimentalFeatures} onChange={(v) => setSettings({ ...settings, experimentalFeatures: v })} />
         </Row>
+        <Row
+          label="Bazaar All Items"
+          desc="Removes every restriction on putting an item in your bazaar, including Ex items and items outside your main inventory."
+        >
+          <Toggle on={settings.bazaarAllItems} onChange={(v) => setSettings({ ...settings, bazaarAllItems: v })} />
+        </Row>
       </Group>
       <Group title="DIAGNOSTICS">
         <Row

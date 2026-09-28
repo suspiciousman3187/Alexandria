@@ -511,7 +511,7 @@ async function writeJson(rel: string, data: unknown) {
 }
 
 const ORG_STORAGE = [5, 6, 7, 1, 9, 2, 4];
-const ORG_DEFAULT: OrganizeRules = { alwaysBring: [], keep: [], keepSingle: [], keepQty: [], storableBags: [5, 6, 7], storeUsable: true, reserve: 3, strictInventory: false };
+const ORG_DEFAULT: OrganizeRules = { alwaysBring: [], keep: [], keepSingle: [], keepQty: [], storableBags: [5, 6, 7], storeUsable: true, reserve: 3, strictInventory: false, taggedOnly: false };
 
 type Ctx = { conn: number; charName: string; target?: string; char: KnownChar };
 type Verb = { usage: string; run: (ctx: Ctx, args: string[]) => Promise<string> };

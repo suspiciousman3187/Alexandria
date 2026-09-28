@@ -20,6 +20,6 @@ export function StatFilterSelect({ value, onChange }: { value: string; onChange:
   const options = useStatOptions();
   return (
     <Select full searchable value={value} onChange={onChange} options={['', ...options]}
-      renderValue={(v) => (v === '' ? 'Gear Stat' : v)} renderOption={(v) => (v === '' ? 'Any Gear Stat' : v)} />
+      renderValue={(v) => (v === '' ? 'Equipment Stats' : v)} renderOption={(v) => (v === '' ? 'Any Equipment Stat' : v)} />
   );
 }

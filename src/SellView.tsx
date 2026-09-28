@@ -45,6 +45,21 @@ export default function SellView() {
     setAdd('');
   };
   const remove = (name: string) => set(sell.items.filter((x) => x !== name), sell.auto);
+  // Drag-paint multi-select (same shape as the inventory grid / consolidate prefs): pointer-down on a row sets
+  // add-vs-remove from that row's current state, then dragging across rows paints the rest; Remove Selected drops
+  // them all in one write.
+  const [sel, setSel] = useState<Set<string>>(() => new Set());
+  const dragRef = useRef<{ add: boolean } | null>(null);
+  const applySel = (name: string, add: boolean) => setSel((p) => { const n = new Set(p); if (add) n.add(name); else n.delete(name); return n; });
+  const paintDown = (name: string) => {
+    const add = !sel.has(name);
+    dragRef.current = { add };
+    applySel(name, add);
+    const end = () => { dragRef.current = null; window.removeEventListener('pointerup', end); };
+    window.addEventListener('pointerup', end);
+  };
+  const paintEnter = (name: string) => { if (dragRef.current) applySel(name, dragRef.current.add); };
+  const removeSelected = () => { const s = sel; set(sell.items.filter((x) => !s.has(x)), sell.auto); setSel(new Set()); };
 
   const matches = useMemo(() => {
     const q = add.trim().toLowerCase();
@@ -131,6 +146,27 @@ export default function SellView() {
                 className="bg-field border border-line rounded-md px-3 py-1.5 text-xs text-fg-2 placeholder-fg-4 outline-none focus:border-accent/50 transition-colors"
               />
             )}
+            {sell.items.length > 0 && (
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setSel(shown.length > 0 && shown.every((n) => sel.has(n)) ? new Set() : new Set(shown))}
+                  className="le-tap px-2.5 py-1 text-[11px] font-semibold rounded-md border border-line bg-surface text-fg-3 hover:text-fg-2 transition-colors"
+                >
+                  {shown.length > 0 && shown.every((n) => sel.has(n)) ? 'Deselect All' : 'Select All'}
+                </button>
+                {sel.size > 0 && (
+                  <>
+                    <span className="text-[11px] text-fg-4 tabular-nums">{sel.size} selected</span>
+                    <button
+                      onClick={removeSelected}
+                      className="le-tap ml-auto px-2.5 py-1 text-[11px] font-bold rounded-md border border-red-500/40 bg-red-500/15 text-red-300 hover:bg-red-500/25 transition-colors"
+                    >
+                      Remove Selected
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
           </div>
 
           {sell.items.length === 0 ? (
@@ -148,11 +184,14 @@ export default function SellView() {
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: 10 }}
                     transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
-                    className="flex items-center gap-2 px-3 py-1.5"
+                    onPointerDown={() => paintDown(name)}
+                    onPointerEnter={() => paintEnter(name)}
+                    className={`flex items-center gap-2 px-3 py-1.5 cursor-pointer select-none transition-colors ${sel.has(name) ? 'bg-accent/10' : 'hover:bg-field/40'}`}
                   >
+                    <input type="checkbox" checked={sel.has(name)} readOnly className="shrink-0 w-3.5 h-3.5 accent-[var(--color-accent)] pointer-events-none" />
                     <SmallIcon id={idByName.get(name.toLowerCase())} n={name} assets={assetsAny} iconSet={iconSet} />
                     <span className="min-w-0 flex-1 truncate text-[12px] text-fg-2">{name}</span>
-                    <button onClick={() => remove(name)} aria-label="Remove" className="shrink-0 grid place-items-center w-6 h-6 rounded text-fg-4 hover:text-fg hover:bg-line transition-colors">×</button>
+                    <button onPointerDown={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); remove(name); }} aria-label="Remove" className="shrink-0 grid place-items-center w-6 h-6 rounded text-fg-4 hover:text-fg hover:bg-line transition-colors">×</button>
                   </motion.div>
                 ))}
               </AnimatePresence>

@@ -1,6 +1,6 @@
 _addon.name = 'Alexandria'
 _addon.author = 'Noirblanc'
-_addon.version = '0.0.27'
+_addon.version = '0.0.28'
 _addon.commands = {'alexandria', 'alex', 'ax'}
 
 local socket = require('socket')
@@ -463,6 +463,7 @@ local function item_flags(id)
         if isset['No Auction'] or isset['Exclusive'] then m = m + 8 end
         if isset['No NPC Sale'] then m = m + 16 end
         if isset['No Delivery'] then m = m + 32 end
+        if isset['Can Send POL'] then m = m + 64 end   -- deliverable to same-POL-account chars even if Rare/Ex
     end
     flag_cache[id] = m
     return m
@@ -2066,6 +2067,7 @@ function build_dbox()
             local it = box[s]
             if it then
                 parts[#parts + 1] = '{"s":' .. s .. ',"id":' .. it.id .. ',"c":' .. (it.count or 1) ..
+                    ',"f":' .. item_flags(it.id) ..
                     ',"n":"' .. esc(it.name or '') .. '","who":"' .. esc(it.who or '') .. '","ts":' .. (it.ts or 0) .. (it.gil and ',"gil":true' or '') .. '}'
             end
         end
@@ -4880,6 +4882,9 @@ local function do_organize(rules, preview)
     local store_usable = rules.storeUsable ~= false
     local reserve = tonumber(rules.reserve) or 3
     local strict_inventory = rules.strictInventory == true
+    -- Tagged-only: restrict the whole organize to items with a tag-defined home (layout_map). Untagged/general
+    -- items are left where they are (the general classification sweep + strict-inventory sweep are skipped).
+    local tagged_only = rules.taggedOnly == true
 
     local keepqty = {}
     if type(rules.keepQty) == 'table' then
@@ -5192,7 +5197,7 @@ local function do_organize(rules, preview)
             if #plan == before then break end
         end
     end
-    sweep(false)
+    sweep(tagged_only)
 
 
     -- Whatever gear still sits outside its routed bag is genuine overflow (target truly over capacity or a
@@ -5208,7 +5213,7 @@ local function do_organize(rules, preview)
     -- Organize all items: sweep any non-stackable, unprotected item out of the
     -- main bag to its classified home, gear included. Equipped/bazaar items
     -- and anything on the keep/keepQty/alwaysBring/preset lists stay put.
-    if strict_inventory then
+    if strict_inventory and not tagged_only then
         local inv = windower.ffxi.get_items(0)
         if type(inv) == 'table' then
             for s = 1, (inv.max or 80) do
@@ -5720,9 +5725,9 @@ local function dispatch(line)
     elseif msg.cmd == 'tradepcoffer' and type(msg.items) == 'table' then
         do_trade_pc_offer(msg.target, msg.items)
     elseif msg.cmd == 'augcape' then
-        aug_cape_start(msg.job, msg.material, msg.path, msg.repeats, msg.bag, msg.slot, msg.confirm_mode)
+        aug_cape_start(msg.job, msg.material, msg.path, msg.repeats, msg.bag, msg.slot, msg.confirm_mode, msg.bulk)
     elseif msg.cmd == 'augcapeseq' then
-        aug_cape_seq_start(msg.job, msg.bag, msg.slot, msg.steps, msg.confirm_mode)
+        aug_cape_seq_start(msg.job, msg.bag, msg.slot, msg.steps, msg.confirm_mode, msg.bulk)
     elseif msg.cmd == 'auggear' then
         aug_gear_start(msg)
     elseif msg.cmd == 'auginfo' then
@@ -6590,7 +6595,15 @@ do
             end
         end
         -- Resolve OUR exact cape by fingerprint -- never first-match by id.
-        local ci = aug_cape_find(aug.cape_id, aug.cape_sig)
+        local ci, ncape = aug_cape_find(aug.cape_id, aug.cape_sig)
+        -- MONEY GUARD: if two or more capes share this exact fingerprint (e.g. two unaugmented Rudianos's Mantles),
+        -- we CANNOT tell which one is ours -- augmenting would land on an arbitrary/duplicate cape and split the run
+        -- across both. Stop cold before spending a single material.
+        if ncape and ncape > 1 then
+            amb_log(('AMBIGUOUS: %d capes match sig=[%s]; stopped before trading'):format(ncape, aug_sig_str(aug.cape_sig)))
+            aug_fail(('%d capes have identical augments right now, so the selected one cannot be told apart. Augment or store the duplicate(s) first, then retry.'):format(ncape))
+            return
+        end
         if not ci then
             aug.wait_since = aug.wait_since or os.clock()
             if (os.clock() - aug.wait_since) > 12 then aug_fail('selected cape not found in inventory; stopped') end
@@ -6602,11 +6615,24 @@ do
         if not mi then aug_fail('material left inventory') return end
         aug.verify_slot = aug.mat_slot
         aug.trade_mat_count = count_in_bag(aug.mat_id, 0)
-        amb_log(('TRADE roll %d/%d | mat=%s(%d) haveInInv=%d capeSlot=%d verifySlot=%s opt=%d sig=[%s]'):format(
-            (aug.done or 0) + 1, aug.total or 1, tostring(aug.cape_material), aug.mat_id, aug.trade_mat_count, ci, tostring(aug.mat_slot), aug.first_time and 512 or 256, aug_sig_str(aug.cape_sig)))
+        -- BULK TRADE: the NPC forces exactly one material on the FIRST roll of a path (that roll also picks the
+        -- option), then accepts the whole remaining stack in a single trade -- so a path finishes in two trades
+        -- (1 + rest) instead of one-per-material. Roll 1 of a path (aug.done == 0) is always qty 1; after that we
+        -- trade the remainder, capped to what sits in this one inventory slot (Item Count can't exceed a slot's
+        -- stack). 'Each Step' review mode stays one-at-a-time so every individual roll can still be inspected.
+        local qty = 1
+        if aug.bulk and (aug.done or 0) > 0 and (aug.confirm_mode or 'none') ~= 'step' then
+            local remaining = (aug.total or 1) - (aug.done or 0)
+            local inv0 = windower.ffxi.get_items(0)
+            local slotc = (type(inv0) == 'table' and type(inv0[mi]) == 'table' and inv0[mi].id == aug.mat_id and inv0[mi].count) or 1
+            qty = math.max(1, math.min(remaining, slotc))
+        end
+        aug.trade_qty = qty
+        amb_log(('TRADE roll %d/%d | mat=%s(%d) qty=%d haveInInv=%d capeSlot=%d verifySlot=%s opt=%d sig=[%s]'):format(
+            (aug.done or 0) + 1, aug.total or 1, tostring(aug.cape_material), aug.mat_id, qty, aug.trade_mat_count, ci, tostring(aug.mat_slot), aug.first_time and 512 or 256, aug_sig_str(aug.cape_sig)))
         packets.inject(packets.new('outgoing', 0x036, {
             ['Target'] = aug.npc_id, ['Target Index'] = aug.npc_index,
-            ['Item Count 1'] = 1, ['Item Count 2'] = 1,
+            ['Item Count 1'] = 1, ['Item Count 2'] = qty,
             ['Item Index 1'] = ci, ['Item Index 2'] = mi, ['Number of Items'] = 2,
         }))
         aug.awaiting = true
@@ -7020,7 +7046,10 @@ do
                 aug.awaiting = false
                 aug.last_progress = os.clock()
                 cape_confirm()
-                aug.done = (aug.done or 0) + 1
+                -- Credit the number of materials this trade actually carried (bulk trades apply the whole stack
+                -- on one confirm). Clamp to the path total so display never overshoots.
+                aug.done = (aug.done or 0) + (aug.trade_qty or 1)
+                if aug.total and aug.done > aug.total then aug.done = aug.total end
                 aug.attempts = aug.done
                 amb_log(('ROLL confirmed %d/%d | menu=0x%X'):format(aug.done, aug.total or 1, aug.menu or 0))
                 local step_done = aug.done >= (aug.total or 1)
@@ -7119,7 +7148,7 @@ do
         return nil
     end
 
-    function aug_cape_start(job, material, path, repeats, bag, slot, confirm_mode)
+    function aug_cape_start(job, material, path, repeats, bag, slot, confirm_mode, bulk)
         if not packets_ok then return end
         job = lc(job)
         material = lc(material)
@@ -7198,6 +7227,7 @@ do
         -- that specific instance among duplicates and never augment the wrong (blank) one.
         local sel_sig = aug_cape_sig_at(sb, ss, cape_id)
         if not sel_sig then aug_fail("could not read the selected cape's augments (need extdata); cannot safely target it among duplicates") return end
+        do local _, dupN = aug_cape_find(cape_id, sel_sig); if dupN and dupN > 1 then aug_fail(('you have %d capes with identical augments; Alexandria cannot tell them apart. Augment or store the duplicate(s) first, then retry.'):format(dupN)) return end end
         local mat_slot = ({ thread = 1, dust = 2, dye = 3, sap = 4, resin = 5 })[material]
         if not mat_slot then aug_fail('unknown material') return end
         local first_time = sel_sig[mat_slot] == 'none'
@@ -7207,6 +7237,7 @@ do
             cape_id = cape_id, cape_slot = cape_slot, mat_id = mat_id, path_index = path_index, cape_material = material,
             cape_sig = sel_sig, mat_slot = mat_slot, verify_pending = false,
             confirm_mode = (confirm_mode == 'step' or confirm_mode == 'path') and confirm_mode or 'none',
+            bulk = bulk ~= false,
             npc_id = aug_npc_id, npc_index = aug_npc_index, npc_name = 'Gorpa-Masorpa', menu = 0x183,
             zone = (windower.ffxi.get_info() or {}).zone or 0,
             first_time = first_time, next_at = 0, delay = (material == 'dye') and 2 or 1,
@@ -7220,7 +7251,7 @@ do
         alex_chat(207, '[Alexandria] augmenting ' .. cape_name .. ' x' .. aug.total, 'progress')
     end
 
-    function aug_cape_seq_start(job, bag, slot, steps, confirm_mode)
+    function aug_cape_seq_start(job, bag, slot, steps, confirm_mode, bulk)
         if not packets_ok then return end
         if type(steps) ~= 'table' or #steps == 0 then aug_fail('no steps') return end
         job = lc(job)
@@ -7293,6 +7324,7 @@ do
         -- Fingerprint the EXACT selected cape now (before any wardrobe move); see aug_cape_start.
         local sel_sig = aug_cape_sig_at(sb, ss, cape_id)
         if not sel_sig then aug_fail("could not read the selected cape's augments (need extdata); cannot safely target it among duplicates") return end
+        do local _, dupN = aug_cape_find(cape_id, sel_sig); if dupN and dupN > 1 then aug_fail(('you have %d capes with identical augments; Alexandria cannot tell them apart. Augment or store the duplicate(s) first, then retry.'):format(dupN)) return end end
         local fslot = ({ thread = 1, dust = 2, dye = 3, sap = 4, resin = 5 })[first.material]
         if not fslot then aug_fail('unknown material') return end
         local first_time = sel_sig[fslot] == 'none'
@@ -7303,6 +7335,7 @@ do
             path_index = first.path_index, cape_material = first.material,
             cape_sig = sel_sig, mat_slot = fslot, verify_pending = false,
             confirm_mode = (confirm_mode == 'step' or confirm_mode == 'path') and confirm_mode or 'none',
+            bulk = bulk ~= false,
             npc_id = aug_npc_id, npc_index = aug_npc_index, npc_name = 'Gorpa-Masorpa', menu = 0x183,
             zone = (windower.ffxi.get_info() or {}).zone or 0,
             first_time = first_time, next_at = 0, delay = (first.material == 'dye') and 2 or 1,

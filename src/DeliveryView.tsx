@@ -1,22 +1,29 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { useKnownCharacters, useAvailableIcons, dboxOpen, dboxClose, dboxTake, dboxTakeAll, dboxReturn, dboxSendMany, dboxSendGil, GIL_MAIL_CAP, dboxCancel, NOMAD_BAGS, inNomadZone, nomadReachable, type KnownChar, type DboxSlot, type InvItem, type DboxSendItem } from './bridge';
+import { useKnownCharacters, useAvailableIcons, dboxOpen, dboxClose, dboxTake, dboxReturn, dboxSendMany, dboxSendGil, GIL_MAIL_CAP, dboxCancel, NOMAD_BAGS, inNomadZone, nomadReachable, type KnownChar, type DboxSlot, type InvItem, type DboxSendItem } from './bridge';
 import { IconInner } from './atlasIcon';
 import { useItemHover } from './ItemTooltip';
 import { itemNameMatches } from './itemNames';
-import { CharacterSelect, Segmented, Stepper, GilInput, BagTag, SearchInput } from './ui';
+import { CharacterSelect, Segmented, Stepper, GilInput, BagTag, SearchInput, Toggle } from './ui';
 import { Modal, Collapse, Popover } from './overlay';
 import { GilIcon } from './GilIcon';
-import { useStickyChar } from './sticky';
+import { useStickyChar, useSticky } from './sticky';
 import { useSettings } from './settings';
 import { useAnon } from './anonymize';
 import { OpCard } from './OpCard';
-import { ALWAYS_BAGS, MOG_ONLY_BAGS as MOG_BAGS, FLAG_NOSEND } from './bagConstants';
+import { ALWAYS_BAGS, MOG_ONLY_BAGS as MOG_BAGS, FLAG_RARE, FLAG_NOSEND, FLAG_POLSEND } from './bagConstants';
 
 const NO_SEND = FLAG_NOSEND;
+const isPolSend = (it: InvItem) => ((it.f ?? 0) & FLAG_POLSEND) !== 0;
 // Augmented gear is bound to the character once augments are applied -- it can no longer
-// be mailed even if the base item is sendable. Exclude anything carrying augments.
-const sendable = (it: InvItem) => !((it.f ?? 0) & NO_SEND) && !(it.aug && it.aug.length > 0);
+// be mailed even if the base item is sendable. Exclude anything carrying augments. When `pol`
+// is on, an item flagged Can-Send-POL is offered even though it is Rare/Ex (No-Delivery) -- the
+// server permits it ONLY to characters on the same POL account, and bounces it back otherwise.
+const sendable = (it: InvItem, pol: boolean) => {
+  if (it.aug && it.aug.length > 0) return false;
+  if (!((it.f ?? 0) & NO_SEND)) return true;
+  return pol && isPolSend(it);
+};
 
 function reachableBag(bagId: number, nomadOk: boolean, mog: boolean) {
   if (ALWAYS_BAGS.has(bagId)) return true;
@@ -149,7 +156,7 @@ function BoxPanel({ slots, kind, assets, iconSet, selectable, selected, onSelDow
   );
 }
 
-type Picked = { key: string; id: number; bag: number; slot: number; n: string; max: number; count: number };
+type Picked = { key: string; id: number; bag: number; slot: number; n: string; max: number; count: number; pol?: boolean };
 
 function RecipientCombo({ value, onChange, chars }: { value: string; onChange: (v: string) => void; chars: KnownChar[] }) {
   const anon = useAnon();
@@ -195,6 +202,7 @@ function MailModal({ char, recipients, iconSet, onClose }: { char: KnownChar; re
   const conn = char.conn;
   const [target, setTarget] = useState('');
   const [q, setQ] = useState('');
+  const [polSend, setPolSend] = useSticky('dbox.polsend', false);
   const [picked, setPicked] = useState<Picked[]>([]);
   const haveGil = char.gil ?? 0;
   const gilCap = Math.min(GIL_MAIL_CAP, haveGil);
@@ -219,28 +227,28 @@ function MailModal({ char, recipients, iconSet, onClose }: { char: KnownChar; re
   const groups = useMemo(() => {
     const s = q.trim().toLowerCase();
     const mog = !!char.mog;
-    const out: { id: number; name: string; items: { id: number; bag: number; bagName: string; slot: number; n: string; c: number }[] }[] = [];
+    const out: { id: number; name: string; items: { id: number; bag: number; bagName: string; slot: number; n: string; c: number; pol: boolean }[] }[] = [];
     for (const bag of char.inv ?? []) {
       if (!reachableBag(bag.id, nomadOk, mog)) continue;
       const items = [];
       for (const it of bag.items) {
-        if (!sendable(it)) continue;
+        if (!sendable(it, polSend)) continue;
         if (s && !itemNameMatches(it.id, it.n, s)) continue;
-        items.push({ id: it.id, bag: bag.id, bagName: bag.b, slot: it.s, n: it.n, c: it.c });
+        items.push({ id: it.id, bag: bag.id, bagName: bag.b, slot: it.s, n: it.n, c: it.c, pol: polSend && isPolSend(it) && !!((it.f ?? 0) & NO_SEND) });
       }
       if (items.length) out.push({ id: bag.id, name: bag.b, items });
     }
     out.sort((a, b) => bagPickRank(a.id) - bagPickRank(b.id));
     return out;
-  }, [char.inv, char.mog, nomadOk, q]);
+  }, [char.inv, char.mog, nomadOk, q, polSend]);
   const poolCount = useMemo(() => groups.reduce((n, g) => n + g.items.length, 0), [groups]);
 
   const pickedKeys = useMemo(() => new Set(picked.map((p) => p.key)), [picked]);
-  const add = (x: { id: number; bag: number; slot: number; n: string; c: number }) => {
+  const add = (x: { id: number; bag: number; slot: number; n: string; c: number; pol?: boolean }) => {
     const key = `${x.bag}:${x.slot}`;
     if (pickedKeys.has(key)) { setPicked((p) => p.filter((y) => y.key !== key)); return; }
     if (full) return; // outbox can't hold another parcel
-    setPicked((p) => [...p, { key, id: x.id, bag: x.bag, slot: x.slot, n: x.n, max: x.c, count: x.c }]);
+    setPicked((p) => [...p, { key, id: x.id, bag: x.bag, slot: x.slot, n: x.n, max: x.c, count: x.c, pol: x.pol }]);
   };
   const setCount = (key: string, count: number) => setPicked((p) => p.map((y) => (y.key === key ? { ...y, count } : y)));
   const remove = (key: string) => setPicked((p) => p.filter((y) => y.key !== key));
@@ -277,6 +285,13 @@ function MailModal({ char, recipients, iconSet, onClose }: { char: KnownChar; re
               placeholder="Search items to send…"
               className="bg-field border border-line rounded-md px-3 py-1.5 text-xs text-fg-2 placeholder-fg-4 outline-none focus:border-accent/50 transition-colors"
             />
+            <div className={`flex items-start gap-2 rounded-md border px-2.5 py-2 transition-colors ${polSend ? 'border-amber-500/50 bg-amber-500/10' : 'border-line bg-field/40'}`}>
+              <div className="min-w-0 flex-1">
+                <div className={`text-[13px] font-semibold ${polSend ? 'text-amber-300' : 'text-fg-2'}`}>Enable POLSendable Items</div>
+                <div className={`text-[12px] leading-snug ${polSend ? 'text-amber-300' : 'text-fg-4'}`}>Allows sending of POLSendable items. WARNING: This will only work with items sent to characters on the same POL account as the sender. USE CAREFULLY!</div>
+              </div>
+              <div className="shrink-0 pt-0.5"><Toggle on={polSend} onChange={setPolSend} /></div>
+            </div>
             {haveGil > 0 && (
               <div className="flex items-center gap-2 rounded-md border border-line bg-field/40 px-2.5 py-1.5">
                 <GilIcon size={22} />
@@ -295,6 +310,10 @@ function MailModal({ char, recipients, iconSet, onClose }: { char: KnownChar; re
                 <div key={p.key} className="flex items-center gap-2.5 rounded-md border border-accent/40 bg-accent/5 px-2.5 py-1.5">
                   <Icon id={p.id} n={p.n} assets={char.assets} iconSet={iconSet} size={24} />
                   <span className="min-w-0 flex-1 truncate text-[12px] text-fg-2">{p.n}</span>
+                  {p.pol && <span className="shrink-0 inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide rounded bg-amber-500/20 text-amber-300 border border-amber-500/50" title="Rare/Ex: only deliverable to a character on the same POL account">
+                    <svg viewBox="0 0 24 24" className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2.4} strokeLinecap="round" strokeLinejoin="round"><path d="M12 9v4" /><path d="M12 17h.01" /><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" /></svg>
+                    POLSendable
+                  </span>}
                   {p.max > 1 ? <Stepper value={p.count} min={1} max={p.max} onChange={(v) => setCount(p.key, v)} className="shrink-0" /> : <span className="text-[11px] text-fg-4 tabular-nums">×1</span>}
                   <button onClick={() => remove(p.key)} aria-label="Remove" className="shrink-0 grid place-items-center w-6 h-6 rounded-md text-fg-4 hover:text-fg hover:bg-line transition-colors">
                     <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><path d="M6 6l12 12M18 6 6 18" /></svg>
@@ -333,6 +352,10 @@ function MailModal({ char, recipients, iconSet, onClose }: { char: KnownChar; re
                             >
                               <Icon id={x.id} n={x.n} assets={char.assets} iconSet={iconSet} size={24} />
                               <span className="min-w-0 flex-1 truncate text-[12px] text-fg-2">{x.n}</span>
+                              {x.pol && <span className="shrink-0 inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide rounded bg-amber-500/20 text-amber-300 border border-amber-500/50" title="Rare/Ex: only deliverable to a character on the same POL account">
+                                <svg viewBox="0 0 24 24" className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2.4} strokeLinecap="round" strokeLinejoin="round"><path d="M12 9v4" /><path d="M12 17h.01" /><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" /></svg>
+                                POLSendable
+                              </span>}
                               {x.c > 1 && <span className="shrink-0 text-[10px] font-bold tabular-nums text-accent">×{x.c}</span>}
                             </button>
                           );
@@ -378,6 +401,41 @@ export default function DeliveryView() {
   const conn = active?.conn;
   const dbox = active?.dbox;
   const status = active?.dboxStatus;
+
+  // Count of each id the character already holds across every bag (used for the Rare single-hold cap, same rule as
+  // consolidate). Collected items land in inventory (bag 0), so Collect All must respect the same restrictions the
+  // rest of the app does when moving items into a character:
+  //   - Rare: a character may hold only ONE. Skip a Rare it already owns, and take at most one copy per Rare id in
+  //     one batch (extra copies would be rejected by the server).
+  //   - Inventory space: each parcel lands in its own inventory slot, so never schedule more than the free slots in
+  //     bag 0 (the rest would fail / stay in the box). Gil parcels take no slot.
+  const heldById = useMemo(() => {
+    const m = new Map<number, number>();
+    for (const b of active?.inv ?? []) for (const it of b.items) m.set(it.id, (m.get(it.id) ?? 0) + it.c);
+    return m;
+  }, [active?.inv]);
+  const invFree = useMemo(() => {
+    const b0 = active?.inv?.find((b) => b.id === 0);
+    return b0 ? Math.max(0, b0.max - b0.used) : 0;
+  }, [active?.inv]);
+  const planCollect = (list: DboxSlot[]): number[] => {
+    let free = invFree;
+    const rareTaken = new Set<number>();
+    const out: number[] = [];
+    for (const it of list) {
+      if (it.gil) { out.push(it.s); continue; } // gil merges into your purse, needs no slot
+      if (free <= 0) break;                      // inventory full: nothing more will fit
+      if ((it.f ?? 0) & FLAG_RARE) {
+        if ((heldById.get(it.id) ?? 0) >= 1 || rareTaken.has(it.id)) continue; // already hold one / dup in batch
+        rareTaken.add(it.id);
+      }
+      out.push(it.s);
+      free -= 1;
+    }
+    return out;
+  };
+  const inCollect = useMemo(() => planCollect(dbox?.in ?? []), [dbox?.in, heldById, invFree]);
+  const outCollect = useMemo(() => planCollect(dbox?.out ?? []), [dbox?.out, heldById, invFree]);
 
   useEffect(() => {
     const cd = status?.cooldown ?? 0;
@@ -428,7 +486,6 @@ export default function DeliveryView() {
   const busy = !!status?.busy || (status?.queue ?? 0) > 0;
   const slots = view === 'in' ? (dbox?.in ?? []) : (dbox?.out ?? []);
   const canDeliver = !!(active?.atah ?? active?.ah?.atah) || inNomadZone(active?.zone) || !!active?.mog;
-  const outOpen = view === 'out' && (status?.open === 'out' || !!status?.loading);
   const inOpen = view === 'in' && (status?.open === 'in' || !!status?.loading);
 
   return (
@@ -477,6 +534,12 @@ export default function DeliveryView() {
             <svg viewBox="0 0 24 24" className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.9} strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18M6 6l12 12" /></svg>
           </button>
         </div>
+        {conn != null && view === 'out' && (
+          <button onClick={() => setMail(true)} className="le-tap inline-flex items-center justify-center gap-1.5 h-9 px-3 rounded-md bg-accent text-on-accent text-[12px] font-bold hover:bg-accent-hover transition-colors">
+            <svg viewBox="0 0 24 24" className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round"><path d="M4 4h16a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z" /><path d="m3 6 9 7 9-7" /></svg>
+            Mail Items
+          </button>
+        )}
         </>)}
       </div>
 
@@ -532,18 +595,40 @@ export default function DeliveryView() {
           </div>
         ) : (
           <div className="flex flex-col gap-2.5">
-            {outOpen && conn != null && (
-              <button onClick={() => setMail(true)} className="le-tap inline-flex items-center justify-center gap-1.5 h-9 px-3 rounded-md bg-accent text-on-accent text-[12px] font-bold hover:bg-accent-hover transition-colors">
-                <svg viewBox="0 0 24 24" className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round"><path d="M4 4h16a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z" /><path d="m3 6 9 7 9-7" /></svg>
-                Mail Items
-              </button>
-            )}
-            {inOpen && inboxUsed > 0 && conn != null && (
-              <button onClick={() => dboxTakeAll(conn)} className="le-tap inline-flex items-center justify-center gap-1.5 h-9 px-3 rounded-md bg-accent text-on-accent text-[12px] font-bold hover:bg-accent-hover transition-colors">
-                <svg viewBox="0 0 24 24" className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round"><path d="M21 8v13H3V8" /><path d="M1 3h22v5H1z" /><path d="M10 12h4" /></svg>
-                Take All ({inboxUsed})
-              </button>
-            )}
+            {inOpen && inboxUsed > 0 && conn != null && (() => {
+              const skipped = inboxUsed - inCollect.length;
+              return (
+                <div className="flex flex-col gap-1">
+                  <button
+                    onClick={() => { if (inCollect.length) { dboxTake(conn, inCollect); clearSel(); } }}
+                    disabled={inCollect.length === 0}
+                    title={inCollect.length === 0 ? 'Nothing collectable: inventory full, or every item is a Rare you already hold' : undefined}
+                    className="le-tap inline-flex items-center justify-center gap-1.5 h-9 px-3 rounded-md bg-accent text-on-accent text-[12px] font-bold hover:bg-accent-hover disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                  >
+                    <svg viewBox="0 0 24 24" className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round"><path d="M21 8v13H3V8" /><path d="M1 3h22v5H1z" /><path d="M10 12h4" /></svg>
+                    Collect All ({inCollect.length})
+                  </button>
+                  {skipped > 0 && <div className="text-[10px] text-amber-300 text-center leading-snug">{skipped} skipped: Rare you already hold, or no inventory space.</div>}
+                </div>
+              );
+            })()}
+            {view === 'out' && (status?.open === 'out') && outboxUsed > 0 && conn != null && (() => {
+              const skipped = outboxUsed - outCollect.length;
+              return (
+                <div className="flex flex-col gap-1">
+                  <button
+                    onClick={() => { if (outCollect.length) { dboxReturn(conn, outCollect); clearSel(); } }}
+                    disabled={outCollect.length === 0}
+                    title={outCollect.length === 0 ? 'Nothing collectable: inventory full, or every item is a Rare you already hold' : undefined}
+                    className="le-tap inline-flex items-center justify-center gap-1.5 h-9 px-3 rounded-md bg-accent text-on-accent text-[12px] font-bold hover:bg-accent-hover disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                  >
+                    <svg viewBox="0 0 24 24" className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round"><path d="M9 14 4 9l5-5" /><path d="M4 9h11a5 5 0 0 1 5 5v3" /></svg>
+                    Collect All ({outCollect.length})
+                  </button>
+                  {skipped > 0 && <div className="text-[10px] text-amber-300 text-center leading-snug">{skipped} skipped: Rare you already hold, or no inventory space.</div>}
+                </div>
+              );
+            })()}
             <BoxPanel
               slots={slots}
               kind={view}

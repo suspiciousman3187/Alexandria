@@ -7,6 +7,7 @@ import { usePullRules, setPullRules, newPullId, type PullRule } from './pullRule
 import { Modal } from './overlay';
 import OperationReport, { type ReportMove } from './OperationReport';
 import { Button, Toggle } from './ui';
+import { JOB_LIST } from './itemNames';
 import { SRC_BAGS, DEST_BAGS, bagLabel, destLabel, planPull, firePull, destsOf, destCapacity, type PullCtx } from './pullEngine';
 
 export default function PullButton({ char, conn, compact }: { char?: KnownChar; conn?: number; compact?: boolean }) {
@@ -250,6 +251,17 @@ function PullEditor({ rule, tags, slips, onCancel, onSave }: { rule: PullRule; t
           <Toggle on={!!r.autoOnJobChange} onChange={(v) => setR({ ...r, autoOnJobChange: v })} />
           <span>Auto-pull on job change <span className="text-fg-4">{r.slips ? '(where the Porter and these bags are reachable, e.g. a Mog Garden)' : '(where these source bags are reachable)'}</span></span>
         </label>
+        {r.autoOnJobChange && (
+          <div className="ml-9 flex flex-col gap-1.5">
+            <span className="text-[11px] text-fg-4">Run only when switching to {r.jobs && r.jobs.length ? 'these jobs' : 'any job'} <span className="text-fg-4/70">(leave empty for any job)</span></span>
+            <div className="grid grid-cols-4 gap-1.5">
+              {JOB_LIST.map((j) => {
+                const on = !!r.jobs?.includes(j);
+                return <Chip key={j} on={on} onClick={() => setR({ ...r, jobs: on ? (r.jobs ?? []).filter((x) => x !== j) : [...(r.jobs ?? []), j] })}>{j}</Chip>;
+              })}
+            </div>
+          </div>
+        )}
       </Section>
 
       <div className="flex gap-2 justify-end pt-0.5">

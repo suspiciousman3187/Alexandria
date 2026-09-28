@@ -74,6 +74,7 @@ export function usePullAutoRun() {
       if (last === undefined || last === main || auto.length === 0) continue; // first sighting, or no change
       const conn = ch.conn;
       for (const r of auto) {
+        if (r.jobs && r.jobs.length > 0 && !r.jobs.includes(main)) continue; // per-job preset targeting
         const slipsOk = !r.slips || ch.porterNear;                       // slip pulls need the Porter
         const bagsOk = r.bags.every((b) => reachableBag(ch, exp, b));     // bag pulls need those bags reachable
         if (!slipsOk || !bagsOk) continue;

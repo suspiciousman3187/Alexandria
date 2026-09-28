@@ -1,13 +1,20 @@
 import { useMemo, useRef, useState } from 'react';
-import { useAvailableIcons } from './bridge';
+import { useAvailableIcons, useKnownCharacters } from './bridge';
 import { useItemNames, itemNameMatches, type ItemName } from './itemNames';
 import { IconInner } from './atlasIcon';
 import { Popover } from './overlay';
 import { useConsolidateIgnore, toggleConsolidateIgnore } from './consolidateIgnore';
+import { useConsolidateTargetExclude, toggleConsolidateTargetExclude } from './consolidateTargetExclude';
+import { useAnon } from './anonymize';
 
 export default function ConsolidateExceptionsPanel() {
   const iconSet = useAvailableIcons();
   const db = useItemNames();
+  const anon = useAnon();
+  const known = useKnownCharacters();
+  const targetExcluded = useConsolidateTargetExclude();
+  const targetExclSet = useMemo(() => new Set(targetExcluded.map((n) => n.toLowerCase())), [targetExcluded]);
+  const chars = useMemo(() => [...known].sort((a, b) => (a.online === b.online ? a.name.localeCompare(b.name) : a.online ? -1 : 1)), [known]);
   const ignore = useConsolidateIgnore();
   const [q, setQ] = useState('');
   const inputWrap = useRef<HTMLDivElement | null>(null);
@@ -62,6 +69,35 @@ export default function ConsolidateExceptionsPanel() {
           </div>
         </div>
       )}
+
+      <div className="rounded-xl border border-line bg-surface p-3">
+        <div className="flex items-center gap-2">
+          <span className="text-[12px] font-bold text-fg">Excluded Collect Targets</span>
+          <span className="text-[11px] text-fg-4 tabular-nums">{targetExcluded.length} character{targetExcluded.length === 1 ? '' : 's'}</span>
+        </div>
+        <div className="text-[11px] text-fg-4 mt-2 leading-snug">Prevents consolidating to the selected characters.</div>
+        {chars.length === 0 ? (
+          <div className="text-center text-[12px] text-fg-4 py-6">No characters known yet. Connect the addon on your characters.</div>
+        ) : (
+          <div className="mt-2.5 grid grid-cols-[repeat(auto-fill,minmax(7.5rem,1fr))] gap-1.5">
+            {chars.map((c) => {
+              const off = targetExclSet.has(c.name.toLowerCase());
+              return (
+                <button
+                  key={c.name}
+                  onClick={() => toggleConsolidateTargetExclude(c.name)}
+                  title={off ? 'Excluded as a collector, click to allow' : 'Click to exclude as a collector'}
+                  className={`flex items-center gap-1.5 min-w-0 px-2 py-1 rounded-md text-[11px] border transition-colors ${off ? 'border-amber-500/50 bg-amber-500/10 text-amber-300' : 'border-line bg-field text-fg-3 hover:border-line-2'}`}
+                >
+                  <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${c.online ? 'bg-emerald-400' : 'bg-fg-4'}`} />
+                  <span className={`truncate flex-1 text-left ${off ? 'line-through opacity-80' : ''}`}>{anon(c.name)}</span>
+                  {off && <span className="shrink-0 text-[8px] font-bold uppercase tracking-wide">excl</span>}
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

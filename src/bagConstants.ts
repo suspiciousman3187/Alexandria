@@ -8,5 +8,7 @@ export const MOG_ONLY_BAGS = new Set([1, 2, 4, 9]); // Safe, Storage, Locker, Sa
 // traded, stored, or tagged, so tagging and Organize ignore anything held here.
 export const TEMPORARY_BAG = 3;
 
+export const FLAG_RARE = 0x01;
 export const FLAG_NOTRADE = 0x02;
 export const FLAG_NOSEND = 0x20;
+export const FLAG_POLSEND = 0x40; // 'Can Send POL': deliverable to same-account chars even when Rare/Ex

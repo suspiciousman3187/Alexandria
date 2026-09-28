@@ -3,7 +3,7 @@ import { AnimatePresence, motion } from 'motion/react';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { useBoxes, useKnownCharacters, useAvailableIcons, useDropIconMap, broadcastDropNow, dropClean, NOMAD_BAGS, nomadReachable, inTauri, type KnownChar } from './bridge';
 import { useDrop, setDrop } from './drop';
-import { Group, Row, Toggle, SearchInput } from './ui';
+import { Group, Row, Toggle, SearchInput, Segmented } from './ui';
 import { useSticky } from './sticky';
 import { useSettings } from './settings';
 import { useItemValues, getCachedValue } from './priceStore';
@@ -142,14 +142,30 @@ export default function DropView() {
   };
   const removeItem = (name: string) => setDrop({ ...cfg, drop: cfg.drop.filter((x) => x !== name) });
   const [filter, setFilter] = useSticky('drop.filter', '');
-  const shown = useMemo(() => {
+  const [sortMode, setSortMode] = useSticky<'off' | 'name' | 'value'>('drop.sort', 'off');
+  const idForName = (name: string) => iconMap[name] ?? nameToId.get(name.toLowerCase());
+  const filtered = useMemo(() => {
     const q = filter.trim().toLowerCase();
     return q ? cfg.drop.filter((n) => nameMatches(n, q)) : cfg.drop;
   }, [cfg.drop, filter]);
   const world = useSettings().ahServer || known.find((c) => c.online)?.server;
-  const shownIds = useMemo(() => shown.map((name) => iconMap[name] ?? nameToId.get(name.toLowerCase())).filter((id): id is number => typeof id === 'number' && id > 0), [shown, iconMap, nameToId]);
-  const dropValues = useItemValues(world, shownIds);
-  const valuableCount = useMemo(() => shownIds.filter((id) => (dropValues.get(id)?.median ?? 0) >= DROP_VALUABLE).length, [shownIds, dropValues]);
+  // Value fetch is over the filtered set; sort order doesn't change which ids we need.
+  const filteredIds = useMemo(() => filtered.map((name) => idForName(name)).filter((id): id is number => typeof id === 'number' && id > 0), [filtered, iconMap, nameToId]);
+  const dropValues = useItemValues(world, filteredIds);
+  const valuableCount = useMemo(() => filteredIds.filter((id) => (dropValues.get(id)?.median ?? 0) >= DROP_VALUABLE).length, [filteredIds, dropValues]);
+  const shown = useMemo(() => {
+    if (sortMode === 'off') return filtered;
+    const arr = [...filtered];
+    if (sortMode === 'name') {
+      arr.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+    } else {
+      // By value: highest median first so recently-changed / top-value items surface at the top; items with no
+      // known price sort last, then alphabetical as a tiebreak.
+      const val = (name: string) => { const id = idForName(name); return id != null ? (dropValues.get(id)?.median ?? 0) : 0; };
+      arr.sort((a, b) => (val(b) - val(a)) || a.toLowerCase().localeCompare(b.toLowerCase()));
+    }
+    return arr;
+  }, [filtered, sortMode, dropValues, iconMap, nameToId]);
 
   return (
     <div className="flex-1 min-h-0 overflow-y-auto p-4 flex flex-col gap-4">
@@ -229,6 +245,16 @@ export default function DropView() {
             placeholder="Filter list…"
             className="bg-field border border-line rounded-md px-3 py-1.5 text-xs text-fg-2 placeholder-fg-4 outline-none focus:border-accent/50 transition-colors"
           />
+        )}
+        {cfg.drop.length > 0 && (
+          <div className="mb-2.5">
+            <Segmented
+              full
+              value={sortMode}
+              onChange={(v) => setSortMode(v as 'off' | 'name' | 'value')}
+              options={[{ v: 'off', label: 'Unsorted' }, { v: 'name', label: 'Name' }, { v: 'value', label: 'Value' }]}
+            />
+          </div>
         )}
         <Collapse open={valuableCount > 0}>
           <div className="mb-2.5 px-3 py-2 rounded-md border border-red-500/40 bg-red-500/10 text-[11px] font-semibold text-red-300">

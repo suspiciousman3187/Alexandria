@@ -6,6 +6,7 @@ import { CharacterSelect, SearchInput } from './ui';
 import { itemNameMatches } from './itemNames';
 import { Collapse } from './overlay';
 import { useConsolidate, runConsolidate, stopConsolidate, reachableTotal, isNoTrade } from './consolidate';
+import { useConsolidateTargetExclude } from './consolidateTargetExclude';
 import { useSettings } from './settings';
 import { useAnon } from './anonymize';
 
@@ -32,7 +33,13 @@ export default function ConsolidatePanel() {
   const [sel, setSel] = useState<Set<number>>(new Set());
   const [q, setQ] = useState('');
 
-  const collName = online.find((k) => k.name === collector)?.name ?? online[0]?.name ?? '';
+  // Characters excluded as a consolidation TARGET (managed in the Exceptions tab): they can't be the collector,
+  // but still send their spares.
+  const excludedTargets = useConsolidateTargetExclude();
+  const exclSet = useMemo(() => new Set(excludedTargets.map((n) => n.toLowerCase())), [excludedTargets]);
+  const targetChoices = useMemo(() => online.filter((k) => !exclSet.has(k.name.toLowerCase())), [online, exclSet]);
+
+  const collName = targetChoices.find((k) => k.name === collector)?.name ?? targetChoices[0]?.name ?? '';
   const senders = useMemo(() => online.filter((k) => k.name !== collName), [online, collName]);
   const assetsAny = online.find((c) => c.assets)?.assets;
   const itemName = useMemo(() => {
@@ -85,8 +92,11 @@ export default function ConsolidatePanel() {
       <div className="shrink-0 px-4 pt-3 pb-3 border-b border-line flex flex-col gap-2.5">
         <div className="flex items-center gap-2">
           <span className="text-[11px] font-semibold uppercase tracking-wide text-fg-3 shrink-0">Collect To</span>
-          <div className="flex-1 min-w-0"><CharacterSelect value={collName} onChange={setCollector} chars={online} /></div>
+          <div className="flex-1 min-w-0"><CharacterSelect value={collName} onChange={setCollector} chars={targetChoices} /></div>
         </div>
+        {targetChoices.length === 0 && (
+          <div className="text-[11px] text-amber-300">Every character is excluded as a target. Un-exclude one to consolidate.</div>
+        )}
         <SearchInput
           value={q}
           onChange={setQ}
@@ -183,7 +193,7 @@ export default function ConsolidatePanel() {
             {run.running ? (
               <motion.button key="stop" initial={{ opacity: 0, scale: 0.96 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.96 }} transition={{ duration: 0.14, ease: [0.22, 1, 0.36, 1] }} onClick={stopConsolidate} className="le-tap px-4 py-1.5 text-[12px] font-bold rounded-md bg-red-500/90 text-white hover:bg-red-500 transition-colors">Stop</motion.button>
             ) : (
-              <motion.button key="go" initial={{ opacity: 0, scale: 0.96 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.96 }} transition={{ duration: 0.14, ease: [0.22, 1, 0.36, 1] }} onClick={start} disabled={sel.size === 0 || affected === 0} className="le-tap px-4 py-1.5 text-[12px] font-bold rounded-md bg-accent text-on-accent enabled:hover:bg-accent-hover disabled:opacity-40 transition-colors">Consolidate</motion.button>
+              <motion.button key="go" initial={{ opacity: 0, scale: 0.96 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.96 }} transition={{ duration: 0.14, ease: [0.22, 1, 0.36, 1] }} onClick={start} disabled={sel.size === 0 || affected === 0 || !collName} className="le-tap px-4 py-1.5 text-[12px] font-bold rounded-md bg-accent text-on-accent enabled:hover:bg-accent-hover disabled:opacity-40 transition-colors">Consolidate</motion.button>
             )}
           </AnimatePresence>
         </div>

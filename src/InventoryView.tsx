@@ -527,9 +527,11 @@ export function RowActions({ char, bag, item, canAct, bags }: { char: KnownChar;
   const sellOk = vendorable && sell.anywhere && exp && !!char.inTown && reachable;
   const tradeTargets = useMemo(() => (char.mog ? [] : known.filter((k) => k.name !== char.name && k.online && k.conn != null && !k.mog && withinTradeRange(k, char))), [known, char]);
   const canTrade = canAct && !char.mog && bag.id === 0 && !(item.f && (item.f & 0x02)) && tradeTargets.length > 0;
-  // Bazaar sells from your main inventory; Ex/No-Trade items can't be bazaared. Unlike auction,
-  // augmented gear is fine (the exact item changes hands) and no auction house is required.
-  const canBazaar = canAct && !isRecycle && bag.id === 0 && !(item.f && (item.f & 0x02));
+  // Bazaar sells from your main inventory; Ex items can't normally be bazaared. Unlike auction,
+  // augmented gear is fine (the exact item changes hands) and no auction house is required. The
+  // "Bazaar All Items" experimental setting drops both gates (Ex flag + main-inventory-only).
+  const bazaarAll = useSettings().bazaarAllItems;
+  const canBazaar = canAct && !isRecycle && (bazaarAll || (bag.id === 0 && !(item.f && (item.f & 0x02))));
   const doRetrieve = () => { if (char.conn != null) moveItem(char.conn, item.id, 17, 0, item.c, item.s); };
   const doMoveToInv = () => { if (char.conn == null) return; if (item.c > 1) setMovingInv(true); else moveItem(char.conn, item.id, bag.id, 0, item.c, item.s); };
 
@@ -1185,7 +1187,7 @@ function BulkModal({ kind, char, items, bags, iconSet, assets, onClose, onDone }
 
   const shown = kind === 'use' ? items.filter((it) => !!it.u)
     : kind === 'sell' ? items.filter((it) => !(it.f && (it.f & 0x10)))
-    : kind === 'bazaar' ? items.filter((it) => it.bag === 0)
+    : kind === 'bazaar' ? (settings.bazaarAllItems ? items : items.filter((it) => it.bag === 0))
     : items;
 
   const meta = {

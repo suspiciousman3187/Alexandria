@@ -236,6 +236,7 @@ export default function OrganizeView() {
         <>
           <Group>
             <Row label="Target"><div className="w-44"><Select value={target} onChange={setTarget} options={targetOptions} full /></div></Row>
+            <Row label="Only Organize Tagged Items"><Toggle on={!!rules.taggedOnly} onChange={(v) => set('taggedOnly', v)} /></Row>
             <RowStacked label="" desc="Stores stackable items into storage by the rules above, then pulls your Keep All and Bring items back into inventory.">
               <div className="flex flex-col gap-2">
                 <button onClick={() => void org.openPreview()} disabled={boxes.length === 0 || targetBusy || org.targetCount === 0} className="le-tap w-full px-3 py-2 text-[12px] font-semibold rounded-md bg-accent text-on-accent hover:bg-accent-hover disabled:opacity-40 transition-colors">

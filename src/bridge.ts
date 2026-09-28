@@ -48,7 +48,7 @@ export type AhSlot = { s: number; st: string; id: number; n: string; c: number; 
 export type AhState = { atah: boolean; init: boolean; qn: number; slots: AhSlot[] };
 export type AhCatItem = { id: number; n: string; cat: string; lvl: number; il?: number; j: string[]; st: number; ac?: number };
 
-export type DboxSlot = { s: number; id: number; c: number; n: string; who: string; ts: number; gil?: boolean };
+export type DboxSlot = { s: number; id: number; c: number; n: string; who: string; ts: number; gil?: boolean; f?: number };
 export type DboxState = { in: DboxSlot[]; out: DboxSlot[] };
 export type DboxStatus = { busy: boolean; queue: number; kind: string; phase: string; note: string; cooldown?: number; opening?: boolean; loading?: boolean; open?: string };
 export type TradeStatus = { active: boolean; stage?: string; done?: number; total?: number; target?: string; result?: string };
@@ -1404,9 +1404,10 @@ export type OrganizeRules = {
   storeUsable: boolean;
   reserve: number;
   strictInventory: boolean;
+  taggedOnly: boolean;
 };
 
-export const DEFAULT_ORGANIZE_RULES: OrganizeRules = { alwaysBring: [], keep: [], keepSingle: [], keepQty: [], storableBags: [5, 6, 7], storeUsable: true, reserve: 3, strictInventory: false };
+export const DEFAULT_ORGANIZE_RULES: OrganizeRules = { alwaysBring: [], keep: [], keepSingle: [], keepQty: [], storableBags: [5, 6, 7], storeUsable: true, reserve: 3, strictInventory: false, taggedOnly: false };
 
 // Migrate the old passive modes into the active model: Keep All -> Bring everything
 // to inventory (alwaysBring), Keep 1 Stack -> Bring 1 stack (keepQty stacks=1).
@@ -1505,10 +1506,10 @@ export function slipStore(conn: number, ids: number[]) { sendBoxCommand(conn, JS
 export function slipRetrieve(conn: number, ids: number[]) { sendBoxCommand(conn, JSON.stringify({ cmd: 'slipretrieve', ids })); }
 
 export type ConfirmMode = 'none' | 'step' | 'path';
-export type CapeAugArg = { job: string; material: string; path: string; repeats: number; bag: number; slot: number; confirmMode?: ConfirmMode };
-export function augCape(conn: number, a: CapeAugArg) { const { confirmMode, ...rest } = a; sendBoxCommand(conn, JSON.stringify({ cmd: 'augcape', ...rest, confirm_mode: confirmMode ?? 'none' })); }
+export type CapeAugArg = { job: string; material: string; path: string; repeats: number; bag: number; slot: number; confirmMode?: ConfirmMode; bulk?: boolean };
+export function augCape(conn: number, a: CapeAugArg) { const { confirmMode, bulk, ...rest } = a; sendBoxCommand(conn, JSON.stringify({ cmd: 'augcape', ...rest, confirm_mode: confirmMode ?? 'none', bulk: bulk !== false })); }
 export type CapeSeqStep = { material: string; path: string; repeats: number };
-export function augCapeSeq(conn: number, a: { job: string; bag: number; slot: number; steps: CapeSeqStep[]; confirmMode?: ConfirmMode }) { sendBoxCommand(conn, JSON.stringify({ cmd: 'augcapeseq', job: a.job, bag: a.bag, slot: a.slot, steps: a.steps, confirm_mode: a.confirmMode ?? 'none' })); }
+export function augCapeSeq(conn: number, a: { job: string; bag: number; slot: number; steps: CapeSeqStep[]; confirmMode?: ConfirmMode; bulk?: boolean }) { sendBoxCommand(conn, JSON.stringify({ cmd: 'augcapeseq', job: a.job, bag: a.bag, slot: a.slot, steps: a.steps, confirm_mode: a.confirmMode ?? 'none', bulk: a.bulk !== false })); }
 export type GearAugArg = { mode: string; item: string; bag?: number; slot?: number; material?: string; style?: string; augment_1?: string; augment_2?: string; augment_3?: string; watch_1?: number; watch_2?: number; watch_3?: number; augment_mode?: 'and' | 'or'; delay?: number; max?: number; manual?: boolean; dm?: number; dm_all?: boolean };
 export function augGear(conn: number, a: GearAugArg) { sendBoxCommand(conn, JSON.stringify({ cmd: 'auggear', ...a })); }
 export function augStop(conn: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'augstop' })); }

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { useKnownCharacters, useAvailableIcons, useItemDescription, augCape, augCapeSeq, augGear, augStop, augKeep, augReroll, augStepContinue, augStopAll, requestCurrency, type InvBag, type AugState, type KnownChar, type CapeSeqStep, type ConfirmMode, type Currency } from './bridge';
 
@@ -11,6 +11,7 @@ import { OpGlyph } from './OpCard';
 import { Crossfade, Modal } from './overlay';
 import { useStickyChar, useStickyPersisted } from './sticky';
 import { JOBS, JOB_TO_CAPE, MATERIALS, AUG_PATHS, CAPE_MAX, STYLES, AUG_STATS, TRADE_TYPES, VIEW_TRADE_TYPES, augPathLabel } from './augData';
+import { capeUsage, remaining as remainingTrades, MATERIAL_ORDER, type Material } from './capeAugments';
 import { gearInstancesFor, augKey, readGearCfg, cfgReady, wantedSummary, buildGearArg, resolveSel, instKey, nameFromSelKey } from './augConfig';
 import { useNowTick } from './reltime';
 import { useSettings } from './settings';
@@ -263,9 +264,53 @@ function AmbuscadePanel({ conn, assets, inv, zone, fixedNear, experimental, runn
   const setPath = (p: string) => setPathMap((m) => ({ ...m, [material]: p }));
   const [repeats, setRepeats] = useStickyPersisted('aug.amb.repeats', 10);
   const [confirmMode, setConfirmMode] = useStickyPersisted<ConfirmMode>('aug.amb.confirmMode', 'none');
+  const [bulkTrade, setBulkTrade] = useStickyPersisted('aug.amb.bulk', true);
   const [tab, setTab] = useStickyPersisted<'single' | 'multi'>('aug.amb.tab', 'single');
 
-  const max = CAPE_MAX[material] ?? 20;
+  // Per-material augment state on the selected cape: how many trades of each material are already applied, and
+  // therefore how many are left (the cap is per-material total, not per-stat). Auto-detected from the cape's
+  // augments; the user can override any count when Thread/Dust/Dye can't be split exactly.
+  const autoUsage = useMemo(() => capeUsage(sel?.aug ?? []), [sel?.aug]);
+  const capeKey = sel?.key ?? '';
+  // Signature of the cape's current augments; changes the instant a trade lands (inv re-push, ~0.6s). Used to
+  // expire a stale manual override when the cape's real augments change (e.g. after a run/cancel).
+  const augSig = useMemo(() => (sel?.aug ?? []).join('\u0001'), [sel?.aug]);
+  // Duplicate-cape guard: the addon augments ONLY the copy in the character's Inventory bag (bag 0), pulling the
+  // selected cape there first if needed. Ambiguity is therefore only about how many identical-fingerprint capes end
+  // up in Inventory during the run: the copies already in bag 0, plus the selected one if it lives in another bag.
+  // Duplicates parked in Sack / Case / Wardrobe are fine, so the user can disambiguate by storing all but one.
+  const ambigCount = useMemo(() => {
+    if (!sel) return 0;
+    const inInv = instances.filter((i) => i.bagId === 0 && i.name === sel.name && (i.aug ?? []).join('\u0001') === augSig).length;
+    return inInv + (sel.bagId === 0 ? 0 : 1); // the selected cape joins Inventory during the run if it isn't already
+  }, [instances, sel, augSig]);
+  const ambiguous = ambigCount > 1;
+  // v2 key: the old 'aug.amb.used' could hold values seeded from a buggy earlier detection; abandon it so a fresh
+  // cape shows the (now correct) auto-detect. An entry exists here ONLY when the user hand-edits a stepper.
+  const [usedOverrides, setUsedOverrides] = useStickyPersisted<Record<string, Partial<Record<Material, number>>>>('aug.amb.used2', {});
+  const [usedSig, setUsedSig] = useStickyPersisted<Record<string, string>>('aug.amb.usedsig', {});
+  const usedFor = (m: Material) => usedOverrides[capeKey]?.[m] ?? autoUsage.used[m];
+  const setUsed = (m: Material, val: number) => {
+    setUsedOverrides((o) => ({ ...o, [capeKey]: { ...(o[capeKey] ?? {}), [m]: Math.max(0, Math.min(CAPE_MAX[m] ?? 0, val)) } }));
+    setUsedSig((s) => ({ ...s, [capeKey]: augSig })); // stamp the augs this override was made against
+  };
+  const hasOverride = !!usedOverrides[capeKey] && Object.keys(usedOverrides[capeKey]!).length > 0;
+  const resetOverride = () => {
+    setUsedOverrides((o) => { const n = { ...o }; delete n[capeKey]; return n; });
+    setUsedSig((s) => { const n = { ...s }; delete n[capeKey]; return n; });
+  };
+  // Auto-expire an override once the cape's real augments change from what it was set against, so a run (or a
+  // cancel mid-run) re-syncs detection even on an overridden cape. Adopt the current sig if none was recorded.
+  useEffect(() => {
+    if (!capeKey || !usedOverrides[capeKey]) return;
+    if (usedSig[capeKey] === undefined) setUsedSig((s) => ({ ...s, [capeKey]: augSig }));
+    else if (usedSig[capeKey] !== augSig) resetOverride();
+  }, [capeKey, augSig]);
+  const appliedSel = usedFor(material as Material);
+  const remainSel = remainingTrades(material as Material, appliedSel);
+
+  const max = Math.max(1, remainSel);          // Repeats caps to what's LEFT for this material (per-material total cap)
+  const effRepeats = Math.min(repeats, max);
 
   return (
     <>
@@ -274,6 +319,17 @@ function AmbuscadePanel({ conn, assets, inv, zone, fixedNear, experimental, runn
           <EquipList items={instances} selected={sel?.key ?? ''} onSelect={setSelKey} res={res} assets={assets} />
         </div>
       </Group>
+      {ambiguous && (
+        <div className="my-3 rounded-lg border-2 border-red-500/70 bg-red-500/15 px-3.5 py-3 flex items-start gap-3">
+          <svg viewBox="0 0 24 24" className="w-7 h-7 shrink-0 text-red-400" fill="none" stroke="currentColor" strokeWidth={2.2} strokeLinecap="round" strokeLinejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
+          <div className="min-w-0">
+            <div className="text-[13px] font-bold text-red-300 uppercase tracking-wide">Duplicate Cape Detected</div>
+            <div className="text-[12px] text-red-200/90 leading-snug mt-0.5">
+              <span className="font-bold">{ambigCount}</span> {sel?.name ?? 'capes'} with the exact same augments would be in your Inventory, so Alexandria cannot tell which one to augment. Move all but the one you want into another bag (Sack, Case, or a Wardrobe) so only that cape is in Inventory, then try again.
+            </div>
+          </div>
+        </div>
+      )}
       <div className="my-3"><SectionTabs value={tab} onChange={setTab} tabs={[{ id: 'single', label: 'Single' }, { id: 'multi', label: 'Multi' }]} /></div>
       {tab === 'single' ? (
         <>
@@ -282,20 +338,47 @@ function AmbuscadePanel({ conn, assets, inv, zone, fixedNear, experimental, runn
               <MaterialStock inv={inv} names={MATERIALS.map((m) => `Abdhaljs ${m}`)} res={res} assets={assets} selected={`Abdhaljs ${material}`} onSelect={(n) => setMaterial(n.slice('Abdhaljs '.length))} />
             </div>
           </Group>
+          {sel && (
+            <Group title="Materials Applied So Far" right={hasOverride ? <button onClick={resetOverride} className="le-tap px-2 py-0.5 text-[11px] font-semibold rounded-md border border-line bg-surface text-fg-3 hover:text-fg-2 transition-colors">Reset to detected</button> : undefined}>
+              <div className="px-3.5 py-2.5 flex flex-col gap-2.5">
+                {hasOverride && <div className="text-[11px] text-sky-300 leading-snug">Showing your manual counts. Reset to use the values detected from the cape.</div>}
+                {autoUsage.approx && <div className="text-[11px] text-amber-300 leading-snug">Estimated from the cape's current augments. Thread, Dust and Dye share stats and can't always be split exactly. Correct any count below if you mixed materials.</div>}
+                <div className="grid grid-cols-[1fr_auto_auto] items-center gap-x-3 gap-y-2.5 w-full">
+                  {MATERIAL_ORDER.map((m) => {
+                    const u = usedFor(m); const rem = remainingTrades(m, u);
+                    const full = `Abdhaljs ${m}`; const iid = res.idOf(full);
+                    return (
+                      <Fragment key={m}>
+                        <span className="flex items-center gap-2 min-w-0">
+                          <span className="relative shrink-0 w-6 h-6 rounded bg-field grid place-items-center overflow-hidden">
+                            <IconInner id={iid ?? 0} size={24} name={full} assets={assets} bmpHas={res.has(iid)} />
+                          </span>
+                          <span className="text-[12px] font-medium text-fg-2 truncate">{full}</span>
+                        </span>
+                        <Stepper value={u} min={0} max={CAPE_MAX[m] ?? 0} onChange={(v) => setUsed(m, v)} title="Trades already applied (edit to override)" numW="w-12" />
+                        <span className="text-[12px] tabular-nums text-fg-4 whitespace-nowrap text-right">/ {CAPE_MAX[m]} · <span className={rem === 0 ? 'text-rose-300 font-semibold' : 'text-emerald-300 font-semibold'}>{rem}</span> left</span>
+                      </Fragment>
+                    );
+                  })}
+                </div>
+              </div>
+            </Group>
+          )}
           {job && (
             <>
               <Group title="Path">
                 <Row label="Stat Path"><div className="w-60"><Select value={path} onChange={setPath} options={paths} renderOption={augPathLabel} renderValue={augPathLabel} menuMaxH={320} full /></div></Row>
-                <RowStacked label="Repeats" desc={`Trades the material this many times (max ${max} for ${material.toLowerCase()})`}>
-                  <Slider value={repeats} min={1} max={max} step={1} onChange={setRepeats} />
+                <RowStacked label="Repeats" desc={`${appliedSel}/${CAPE_MAX[material] ?? 0} ${material.toLowerCase()} already applied · ${remainSel} left on this cape`}>
+                  <Slider value={effRepeats} min={1} max={max} step={1} onChange={setRepeats} />
                 </RowStacked>
                 <Row label="Confirm" desc="Require confirmation of stats before proceeding to next step."><Segmented value={confirmMode === 'step' ? 'step' : 'none'} onChange={setConfirmMode} options={[{ v: 'none', label: 'Off' }, { v: 'step', label: 'Each Step' }]} /></Row>
+                <Row label="Bulk Trade Materials" desc="Trades the maximum number of materials to complete each augment after the first initial trade."><Toggle on={bulkTrade} onChange={setBulkTrade} /></Row>
               </Group>
               <div className="px-1">
                 <button
-                  onClick={() => { if (sel) augCape(conn, { job, material: material.toLowerCase(), path, repeats, bag: sel.bagId, slot: sel.slot, confirmMode: confirmMode === 'step' ? 'step' : 'none' }); }}
-                  disabled={!inZone || !sel || running}
-                  title={running ? 'An augment is already running' : undefined}
+                  onClick={() => { if (sel && !ambiguous) augCape(conn, { job, material: material.toLowerCase(), path, repeats: effRepeats, bag: sel.bagId, slot: sel.slot, confirmMode: confirmMode === 'step' ? 'step' : 'none', bulk: bulkTrade }); }}
+                  disabled={!inZone || !sel || running || remainSel === 0 || ambiguous}
+                  title={ambiguous ? 'Duplicate cape: resolve it first' : running ? 'An augment is already running' : remainSel === 0 ? `${material} is maxed on this cape` : undefined}
                   className="w-full px-3 py-2 text-[12px] font-bold rounded-md bg-accent text-on-accent hover:bg-accent-hover transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   Start Augment
@@ -306,7 +389,7 @@ function AmbuscadePanel({ conn, assets, inv, zone, fixedNear, experimental, runn
           )}
         </>
       ) : (
-        <AmbuscadeMulti conn={conn} sel={sel} job={job} inZone={inZone} inv={inv} assets={assets} res={res} running={running} />
+        <AmbuscadeMulti conn={conn} sel={sel} job={job} inZone={inZone} inv={inv} assets={assets} res={res} running={running} bulk={bulkTrade} ambiguous={ambiguous} />
       )}
     </>
   );
@@ -316,17 +399,24 @@ function stepNeed(steps: CapeSeqStep[], material: string): number {
   return steps.filter((s) => s.material === material).reduce((n, s) => n + s.repeats, 0);
 }
 
-function AmbuscadeMulti({ conn, sel, job, inZone, inv, assets, res, running }: { conn: number; sel?: Inst; job?: string; inZone: boolean; inv?: InvBag[]; assets?: string; res: Resolver; running?: boolean }) {
+function AmbuscadeMulti({ conn, sel, job, inZone, inv, assets, res, running, bulk, ambiguous }: { conn: number; sel?: Inst; job?: string; inZone: boolean; inv?: InvBag[]; assets?: string; res: Resolver; running?: boolean; bulk?: boolean; ambiguous?: boolean }) {
   const [steps, setSteps] = useStickyPersisted<CapeSeqStep[]>('aug.amb.steps', []);
+  // Per-material total cap on the selected cape (shares the SINGLE tab's auto-detect + manual override store).
+  const autoUsage = useMemo(() => capeUsage(sel?.aug ?? []), [sel?.aug]);
+  const [usedOverrides] = useStickyPersisted<Record<string, Partial<Record<Material, number>>>>('aug.amb.used2', {});
+  const capeKey = sel?.key ?? '';
+  const usedFor = (m: Material) => usedOverrides[capeKey]?.[m] ?? autoUsage.used[m];
   const used = useMemo(() => new Set(steps.map((s) => s.material)), [steps]);
-  const avail = useMemo(() => (MATERIALS as readonly string[]).filter((m) => !used.has(m)), [used]);
+  // Only offer a material that is neither already in the sequence nor already maxed on the cape.
+  const avail = useMemo(() => (MATERIALS as readonly string[]).filter((m) => !used.has(m) && remainingTrades(m as Material, usedFor(m as Material)) > 0), [used, usedOverrides, autoUsage, capeKey]);
   const [mat, setMat] = useState<string>(avail[0] ?? 'Thread');
   useEffect(() => { if (avail.length && !avail.includes(mat)) setMat(avail[0]); }, [avail, mat]);
   const paths = AUG_PATHS[mat] ?? [];
   const [pathMap, setPathMap] = useStickyPersisted<Record<string, string>>('aug.amb.multipathmap', {});
   const path = paths.includes(pathMap[mat]) ? pathMap[mat] : (paths[0] ?? '');
   const setPath = (p: string) => setPathMap((m) => ({ ...m, [mat]: p }));
-  const max = CAPE_MAX[mat] ?? 20;
+  const remainMat = remainingTrades(mat as Material, usedFor(mat as Material));   // trades left for this material on the cape
+  const max = Math.max(1, remainMat);
   const [reps, setReps] = useState(Math.min(10, max));
   useEffect(() => { setReps((r) => Math.min(Math.max(1, r), max)); }, [max]);
   const [confirming, setConfirming] = useState(false);
@@ -335,7 +425,7 @@ function AmbuscadeMulti({ conn, sel, job, inZone, inv, assets, res, running }: {
   const addStep = () => { if (!mat || !path) return; setSteps((s) => [...s, { material: mat, path, repeats: Math.min(reps, max) }]); };
   const removeStep = (i: number) => setSteps((s) => s.filter((_, idx) => idx !== i));
   const editReps = (i: number, repeats: number) => setSteps((s) => s.map((st, idx) => idx === i ? { ...st, repeats } : st));
-  const startSeq = () => { if (sel && job) { augCapeSeq(conn, { job, bag: sel.bagId, slot: sel.slot, steps, confirmMode }); setConfirming(false); } };
+  const startSeq = () => { if (sel && job && !ambiguous) { augCapeSeq(conn, { job, bag: sel.bagId, slot: sel.slot, steps, confirmMode, bulk }); setConfirming(false); } };
 
   const canReview = inZone && !!sel && steps.length > 0;
 
@@ -346,15 +436,15 @@ function AmbuscadeMulti({ conn, sel, job, inZone, inv, assets, res, running }: {
           <>
             <Row label="Material"><Segmented value={mat} onChange={setMat} options={avail.map((m) => ({ v: m, label: m }))} /></Row>
             <Row label="Stat Path"><div className="w-60"><Select value={path} onChange={setPath} options={paths} renderOption={augPathLabel} renderValue={augPathLabel} menuMaxH={320} full /></div></Row>
-            <RowStacked label="Repeats" desc={`max ${max} for ${mat.toLowerCase()}`}>
+            <RowStacked label="Repeats" desc={`${usedFor(mat as Material)}/${CAPE_MAX[mat] ?? 0} ${mat.toLowerCase()} applied · ${remainMat} left on this cape`}>
               <Slider value={Math.min(reps, max)} min={1} max={max} step={1} onChange={setReps} />
             </RowStacked>
             <div className="px-3.5 pb-3 pt-1">
-              <button onClick={addStep} disabled={!path} className="w-full px-3 py-1.5 text-[11px] font-bold rounded-md bg-field border border-line text-fg-2 hover:border-accent/40 disabled:opacity-40 transition-colors">Add Step</button>
+              <button onClick={addStep} disabled={!path || remainMat === 0 || ambiguous} title={ambiguous ? 'Duplicate cape: resolve it first' : undefined} className="w-full px-3 py-1.5 text-[11px] font-bold rounded-md bg-field border border-line text-fg-2 hover:border-accent/40 disabled:opacity-40 transition-colors">Add Step</button>
             </div>
           </>
         ) : (
-          <div className="px-3.5 py-3 text-[11px] text-fg-4">All five materials are in the sequence.</div>
+          <div className="px-3.5 py-3 text-[11px] text-fg-4">Every material is either in the sequence or already maxed on this cape.</div>
         )}
       </Group>
       <Group title={`Sequence${steps.length ? ` · ${steps.length}` : ''}`}>
@@ -372,7 +462,7 @@ function AmbuscadeMulti({ conn, sel, job, inZone, inv, assets, res, running }: {
                   <div className="text-[12px] font-semibold text-fg-2 truncate">{s.material} → {augPathLabel(s.path)}</div>
                   <div className={`text-[10px] ${short ? 'text-red-300' : 'text-fg-4'}`}>have {have}{short ? ` (need ${need})` : ''}</div>
                 </div>
-                <Stepper value={s.repeats} onChange={(v) => editReps(i, v)} min={1} max={CAPE_MAX[s.material] ?? 20} title="Repeats" />
+                <Stepper value={s.repeats} onChange={(v) => editReps(i, v)} min={1} max={Math.max(1, remainingTrades(s.material as Material, usedFor(s.material as Material)))} title="Repeats" />
                 <button onClick={() => removeStep(i)} aria-label="Remove" className="shrink-0 grid place-items-center w-6 h-6 rounded text-fg-4 hover:text-red-300 hover:bg-red-500/10 transition-colors">
                   <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M6 6l12 12M18 6 6 18" /></svg>
                 </button>
@@ -420,7 +510,7 @@ function AmbuscadeMulti({ conn, sel, job, inZone, inv, assets, res, running }: {
               </div>
               <div className="flex items-center gap-2">
                 <button onClick={close} className="flex-1 px-3 py-2 text-[12px] font-bold rounded-md bg-field border border-line text-fg-3 hover:text-fg-2 transition-colors">Cancel</button>
-                <button onClick={startSeq} disabled={running} className="flex-1 px-3 py-2 text-[12px] font-bold rounded-md bg-accent text-on-accent hover:bg-accent-hover disabled:opacity-40 transition-colors">Augment {steps.length} Step{steps.length === 1 ? '' : 's'}</button>
+                <button onClick={startSeq} disabled={running || ambiguous} title={ambiguous ? 'Duplicate cape: resolve it first' : undefined} className="flex-1 px-3 py-2 text-[12px] font-bold rounded-md bg-accent text-on-accent hover:bg-accent-hover disabled:opacity-40 transition-colors">Augment {steps.length} Step{steps.length === 1 ? '' : 's'}</button>
               </div>
             </>
           )}

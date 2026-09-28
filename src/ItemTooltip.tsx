@@ -97,18 +97,23 @@ function flagBadges(f?: number) {
 }
 
 function locate(id: number, chars: KnownChar[]) {
-  const byChar: { name: string; online: boolean; spots: { bag: string; bagId: number; c: number }[]; total: number }[] = [];
+  const byChar: { name: string; online: boolean; spots: { bag: string; bagId: number; c: number }[]; total: number; augs: string[] }[] = [];
   let total = 0;
   for (const ch of chars) {
     if (!ch.inv) continue;
     const spots: { bag: string; bagId: number; c: number }[] = [];
+    const augSet = new Set<string>();   // distinct augment summaries this character holds for the item
     let ct = 0;
     for (const bag of ch.inv) {
       let n = 0;
-      for (const it of bag.items) if (it.id === id) n += it.c;
+      for (const it of bag.items) {
+        if (it.id !== id) continue;
+        n += it.c;
+        if (it.aug && it.aug.length) augSet.add(it.aug.join(' · '));
+      }
       if (n > 0) { spots.push({ bag: bag.b, bagId: bag.id, c: n }); ct += n; }
     }
-    if (ct > 0) { byChar.push({ name: ch.name, online: !!ch.online, spots, total: ct }); total += ct; }
+    if (ct > 0) { byChar.push({ name: ch.name, online: !!ch.online, spots, total: ct, augs: [...augSet] }); total += ct; }
   }
   byChar.sort((a, b) => b.total - a.total);
   return { byChar, total };
@@ -144,6 +149,7 @@ export function WhereOwned({ id, collapsible = true, defaultOpen = false }: { id
               <span className="truncate">{c.name}</span>
               <span className="ml-auto text-amber-300 font-bold tabular-nums">×{c.total.toLocaleString()}</span>
             </div>
+            {c.augs.map((a, i) => <div key={i} className="ml-3 text-[10px] text-violet-300/90 truncate">{a}</div>)}
             <Collapse open={showBags}>
               <div className="ml-3 flex flex-wrap gap-x-2.5 gap-y-0.5 text-[10px] tabular-nums">
                 {c.spots.map((s) => <span key={s.bag} className="whitespace-nowrap"><span className={`font-medium ${bagColor(s.bagId).text}`}>{s.bag}</span> <span className="text-sky-300 font-semibold">×{s.c.toLocaleString()}</span></span>)}

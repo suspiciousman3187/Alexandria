@@ -4,7 +4,7 @@ import { AnimatePresence, motion } from 'motion/react';
 import { Modal, Popover, Collapse } from './overlay';
 import { openDistribute } from './distributeHost';
 import { useTradeJob, startTradeJob, type TradeJob, type TradeRow } from './tradeJob';
-import { useKnownCharacters, useAvailableIcons, useItemDescription, moveItem, dropOne, useItem, useStop, shopSell, bzApply, NOMAD_BAGS, nomadReachable, withinTradeRange, useAcMap, type InvItem, type InvBag, type SelItem, type KnownChar } from './bridge';
+import { useKnownCharacters, useAvailableIcons, useItemDescription, moveItem, dropOne, useItem, useStop, shopSell, bzApply, NOMAD_BAGS, nomadReachable, withinTradeRange, useAcMap, ahSell, addPendingListing, newBatchId, dismissBatch, type InvItem, type InvBag, type SelItem, type KnownChar } from './bridge';
 import { useSettings } from './settings';
 import { useShopSell, setShopSell } from './shop';
 import { getCachedValue } from './priceStore';
@@ -23,7 +23,7 @@ import { useDrop, setDrop, dropItemEverywhere, countItemEverywhere } from './dro
 import { usePoolStore, addRuleToChars, setCharRules, emptyRules } from './poolRules';
 import { useConsolidatePrefs, addConsolidateItem, removeConsolidateItem } from './consolidatePrefs';
 import { useStoragePrefs, setCharLayout, STORABLE_BAGS, type LayoutEntry } from './storagePrefs';
-import { SellDrawer } from './SellDrawer';
+import { SellDrawer, StageRow, BatchProgress, priceOf } from './SellDrawer';
 import { useAnimatedList } from './useAnimatedList';
 import { useItemHover } from './ItemTooltip';
 import { openUseAll } from './useAllHost';
@@ -993,14 +993,18 @@ function GlobalConsolidateBar({ plan, stacks, qty, known, activeName, experiment
 
 // The action menu for a cross-character selection (all-characters search + MULTI). Consolidate
 // keeps its own dedicated bar; Move/Use/Drop run per character via GlobalBulkModal.
-function GlobalBulkBar({ groups, qty, onSelectAll, onClear, onClose, onConsolidate, onTrade, onAction }: {
+function GlobalBulkBar({ groups, qty, onSelectAll, onClear, onClose, onConsolidate, onTrade, onList, onAction }: {
   groups: { char: KnownChar; items: SelItem[] }[]; qty: number;
   onSelectAll: () => void; onClear: () => void; onClose: () => void;
-  onConsolidate: () => void; onTrade: () => void; onAction: (k: 'move' | 'use' | 'drop') => void;
+  onConsolidate: () => void; onTrade: () => void; onList: () => void; onAction: (k: 'move' | 'use' | 'drop') => void;
 }) {
   const stacks = groups.reduce((n, g) => n + g.items.length, 0);
   const chars = groups.length;
   const usableN = groups.reduce((n, g) => n + g.items.filter((it) => !!it.u).length, 0);
+  // Auctionable across the selection: the char must be at an auction house and the item not Ex/No-Trade/No-AH
+  // (0x0A) nor augmented. Only then can "List on AH" do anything.
+  const listN = groups.reduce((n, g) => n + ((g.char.atah ?? g.char.ah?.atah)
+    ? g.items.filter((it) => !((it.f ?? 0) & 0x0A) && !(it.aug && it.aug.length)).length : 0), 0);
   const miniBtn = 'le-tap px-2.5 py-1 text-[11px] font-semibold rounded-md border border-line bg-field text-fg-3 hover:text-fg hover:border-line-2 disabled:opacity-40 disabled:cursor-not-allowed transition-colors';
   const base = 'px-3 py-2 text-[11px] font-semibold rounded-md border disabled:opacity-40 disabled:cursor-not-allowed transition-colors';
   const neutral = `${base} border-line bg-field text-fg-2 enabled:hover:border-accent/40`;
@@ -1017,6 +1021,7 @@ function GlobalBulkBar({ groups, qty, onSelectAll, onClear, onClose, onConsolida
       <div className="flex flex-nowrap gap-1.5 px-3 py-2.5 [&>button]:flex-1 [&>button]:min-w-0 [&>button]:whitespace-nowrap">
         <button onClick={onConsolidate} disabled={stacks === 0} className={accentBtn}>Consolidate</button>
         <button onClick={onTrade} disabled={stacks === 0} className={neutral}>Trade</button>
+        <button onClick={onList} disabled={listN === 0} title={listN === 0 ? 'No auctionable items on characters at an auction house' : undefined} className={neutral}>List on AH{listN ? ` (${listN})` : ''}</button>
         <button onClick={() => onAction('move')} disabled={stacks === 0} className={neutral}>Move</button>
         <button onClick={() => onAction('use')} disabled={usableN === 0} className={neutral}>Use{usableN ? ` (${usableN})` : ''}</button>
         <button onClick={() => onAction('drop')} disabled={stacks === 0} className={dangerBtn}>Drop</button>
@@ -1095,6 +1100,116 @@ function GlobalBulkModal({ kind, groups, iconSet, experimental, onClose, onDone 
             <button onClick={run} disabled={total === 0} className={`flex-1 px-3 py-2 text-[12px] font-bold rounded-md disabled:opacity-40 transition-colors ${meta.tone === 'red' ? 'bg-red-500/15 text-red-300 border border-red-500/40 hover:bg-red-500/25' : 'bg-accent text-on-accent hover:bg-accent-hover'}`}>{meta.verb} {total}</button>
           </div>
         </>
+      )}
+    </Modal>
+  );
+}
+
+// Cross-character AH listing: list the selected items across EVERY selected character at once, each from its own
+// connection, under ONE batch so progress tracks the whole run. Reuses SellDrawer's StageRow (per-item price +
+// single/stack + qty) and BatchProgress (the progress bar + per-listing result). Only auctionable items on
+// characters currently at an auction house are listed; everything else is filtered out of the stage.
+type GStage = { char: KnownChar; item: SelItem; single: number; price: string; qty: number };
+function GlobalSellModal({ groups, iconSet, experimental, onClose, onDone }: {
+  groups: { char: KnownChar; items: SelItem[] }[]; iconSet: Set<number>; experimental: boolean; onClose: () => void; onDone: () => void;
+}) {
+  const anon = useAnon();
+  // Eligible rows: char online + at an auction house, item auctionable (not Ex/No-Trade/No-AH 0x0A, not augmented)
+  // and in a bag the char can reach (the addon moves it to Inventory before listing).
+  const eligible = useMemo(() => groups.map((g) => {
+    const atah = !!(g.char.atah ?? g.char.ah?.atah);
+    const ok = atah && g.char.online && g.char.conn != null;
+    const nomadOk = nomadReachable(g.char, experimental);
+    const items = ok ? g.items.filter((it) => it.bag !== 17
+      && (it.bag === 0 || bagReachable(it.bag, !!g.char.mog, nomadOk))
+      && !((it.f ?? 0) & 0x0A) && !(it.aug && it.aug.length)) : [];
+    return { char: g.char, atah, items };
+  }).filter((g) => g.items.length > 0), [groups, experimental]);
+
+  const [stage, setStage] = useState<GStage[]>(() => eligible.flatMap((g) => g.items.map((it) => ({ char: g.char, item: it, single: 1, price: '', qty: 1 }))));
+  const [batchId, setBatchId] = useState<number | null>(null);
+  const [bulkPrice, setBulkPrice] = useState('');
+
+  const keyOf = (r: GStage) => `${r.char.name}:${r.item.bag}:${r.item.s}`;
+  const patchRow = (key: string, p: Partial<GStage>) => setStage((s) => s.map((x) => (keyOf(x) === key ? { ...x, ...p } : x)));
+  const removeRow = (key: string) => setStage((s) => s.filter((x) => keyOf(x) !== key));
+  const setAllPrices = (d: string) => setStage((s) => s.map((x) => ({ ...x, price: d })));
+
+  const ready = stage.filter((r) => priceOf(r.price) > 0);
+  const noAhChars = groups.filter((g) => !(g.char.atah ?? g.char.ah?.atah)).map((g) => g.char.name);
+  const canList = ready.length > 0;
+
+  const listAll = () => {
+    if (!canList) return;
+    const id = newBatchId();
+    for (const r of ready) {
+      const conn = r.char.conn;
+      if (conn == null) continue;
+      const price = priceOf(r.price);
+      const fromBag = r.item.bag !== 0;
+      ahSell(conn, r.item.id, r.single, price, r.qty, fromBag ? r.item.bag : undefined, fromBag ? r.item.s : undefined);
+      for (let i = 0; i < r.qty; i++) addPendingListing(conn, `${anon(r.char.name)} · ${r.item.n}`, id);
+    }
+    setBatchId(id);
+  };
+
+  const finalize = () => { if (batchId != null) { dismissBatch(batchId); onDone(); } onClose(); };
+
+  // Group the stage rows back under their character for display.
+  const byChar = useMemo(() => {
+    const m = new Map<string, { char: KnownChar; rows: GStage[] }>();
+    for (const r of stage) { const e = m.get(r.char.name) ?? { char: r.char, rows: [] }; e.rows.push(r); m.set(r.char.name, e); }
+    return [...m.values()];
+  }, [stage]);
+
+  return (
+    <Modal onClose={finalize} panelClass="w-[min(94vw,480px)] max-h-[88vh]">
+      {(close) => (
+        <div className="flex flex-col min-h-0">
+          <div className="shrink-0 flex items-center gap-2 px-4 pt-3.5 pb-2.5 border-b border-line">
+            <div className="text-[14px] font-bold text-fg">{batchId != null ? 'Listing Items' : `List ${stage.length} Item${stage.length === 1 ? '' : 's'} on AH`}{batchId == null && byChar.length > 0 && <span className="text-fg-4 font-medium"> · {byChar.length} character{byChar.length === 1 ? '' : 's'}</span>}</div>
+            <button onClick={close} aria-label="Close" className="le-tap ml-auto grid place-items-center w-7 h-7 rounded-md text-fg-4 hover:text-fg hover:bg-line transition-colors">
+              <svg viewBox="0 0 24 24" className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><path d="M6 6l12 12M18 6 6 18" /></svg>
+            </button>
+          </div>
+          <div className="flex-1 min-h-0 overflow-y-auto p-3 flex flex-col gap-2">
+            {batchId != null ? (
+              <BatchProgress batchId={batchId} onClear={close} />
+            ) : stage.length === 0 ? (
+              <div className="text-center text-[12px] text-fg-4 py-8">No auctionable items on characters at an auction house.{noAhChars.length > 0 ? ' Some selected characters aren’t at one.' : ''}</div>
+            ) : (
+              <>
+                {noAhChars.length > 0 && <div className="text-[11px] text-amber-300 border border-amber-500/30 bg-amber-500/10 rounded-md px-2.5 py-1.5">Not at an auction house (skipped): {noAhChars.map((n) => anon(n)).join(', ')}.</div>}
+                <div className="flex items-center gap-2">
+                  <span className="text-[11px] text-fg-4 shrink-0">Set all prices</span>
+                  <GilInput value={bulkPrice} onChange={(d) => { setBulkPrice(d); setAllPrices(d); }} placeholder="price each" className="flex-1 min-w-0 bg-field border border-line rounded-md px-2.5 py-1.5 text-xs text-fg-2 placeholder-fg-4 outline-none focus:border-accent/50 tabular-nums" />
+                </div>
+                {byChar.map((g) => (
+                  <div key={g.char.name} className="flex flex-col gap-1.5">
+                    <div className="flex items-center gap-2 px-0.5 pt-1">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" />
+                      <span className="text-[12px] font-semibold text-fg-2 truncate">{anon(g.char.name)}</span>
+                      <span className="text-[10px] text-fg-4 tabular-nums">{g.rows.length}</span>
+                    </div>
+                    {g.rows.map((r) => (
+                      <StageRow key={keyOf(r)} row={r} assets={g.char.assets} iconSet={iconSet} server={g.char.server}
+                        onChange={(p) => patchRow(keyOf(r), p)} onRemove={() => removeRow(keyOf(r))} />
+                    ))}
+                  </div>
+                ))}
+              </>
+            )}
+          </div>
+          {batchId == null && stage.length > 0 && (
+            <div className="shrink-0 flex items-center gap-2 px-3 py-2.5 border-t border-line">
+              <button onClick={close} className="le-tap px-3 py-1.5 text-[12px] rounded-md border border-line text-fg-3 hover:text-fg-2 transition-colors">Cancel</button>
+              <button onClick={listAll} disabled={!canList} className="le-tap ml-auto inline-flex items-center gap-1.5 px-4 py-1.5 text-[12px] font-semibold rounded-md bg-accent text-on-accent hover:bg-accent-hover disabled:opacity-40 transition-colors">
+                <svg viewBox="0 0 24 24" className="w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z" /><circle cx="7" cy="7" r="1.2" /></svg>
+                {ready.length === stage.length ? `List ${ready.length} Item${ready.length === 1 ? '' : 's'}` : `List ${ready.length} of ${stage.length} (${stage.length - ready.length} need a price)`}
+              </button>
+            </div>
+          )}
+        </div>
       )}
     </Modal>
   );
@@ -1654,8 +1769,8 @@ export default function InventoryView() {
   };
   const lSelEnter = (e: Entry) => { if (dragRef.current) lApply(lKey(e), dragRef.current.add); };
 
-  const enterSelect = () => { setSelMode(true); setSelSlots(new Set()); setGsel(new Set()); setLsel(new Set()); setGMode('menu'); setGBulk(null); setGTrade(false); };
-  const exitSelect = () => { setSelMode(false); setSelSlots(new Set()); setGsel(new Set()); setLsel(new Set()); setGMode('menu'); setGBulk(null); setGTrade(false); };
+  const enterSelect = () => { setSelMode(true); setSelSlots(new Set()); setGsel(new Set()); setLsel(new Set()); setGMode('menu'); setGBulk(null); setGTrade(false); setGSell(false); };
+  const exitSelect = () => { setSelMode(false); setSelSlots(new Set()); setGsel(new Set()); setLsel(new Set()); setGMode('menu'); setGBulk(null); setGTrade(false); setGSell(false); };
   const [bulk, setBulk] = useState<BulkKind>(null);
   const selAllInBag = () => setSelSlots(new Set((bag?.items ?? []).map((it) => it.s)));
 
@@ -1671,7 +1786,7 @@ export default function InventoryView() {
     if ((!search && !tf.active && !jf.active) || globalFind) return null;
     const out: Entry[] = [];
     for (const bg of bags) for (const it of bg.items) {
-      if (tf.matches && !tf.matches(it.id)) continue;
+      if (tf.matches && !tf.matches(it.id, it.aug)) continue;
       if (jf.matches && !jf.matches(it.id)) continue;
       if (!search || itemNameMatches(it.id, it.n, search) || (SHOW_INV_AH_CATEGORY && search.length >= 3 && acPathLabel(acMap.get(it.id)).toLowerCase().includes(search))) out.push({ bag: bg.b, bagObj: bg, item: it });
     }
@@ -1694,7 +1809,7 @@ export default function InventoryView() {
       const hits: Entry[] = [];
       let total = 0;
       for (const bg of c.inv ?? []) for (const it of bg.items) {
-        if (tf.matches && !tf.matches(it.id)) continue;
+        if (tf.matches && !tf.matches(it.id, it.aug)) continue;
         if (jf.matches && !jf.matches(it.id)) continue;
         if (!dSearch || itemNameMatches(it.id, it.n, dSearch) || (SHOW_INV_AH_CATEGORY && dSearch.length >= 3 && acPathLabel(acMap.get(it.id)).toLowerCase().includes(dSearch))) { hits.push({ bag: bg.b, bagObj: bg, item: it }); total += it.c; }
       }
@@ -1738,6 +1853,7 @@ export default function InventoryView() {
   const [gMode, setGMode] = useState<'menu' | 'consolidate'>('menu');
   const [gBulk, setGBulk] = useState<'move' | 'use' | 'drop' | null>(null);
   const [gTrade, setGTrade] = useState(false);
+  const [gSell, setGSell] = useState(false);
 
   if (known.length === 0) {
     return (
@@ -1777,6 +1893,7 @@ export default function InventoryView() {
           <div className="flex items-center gap-2">
             <div className="flex-1 min-w-0">
               <Select
+                searchable
                 value={sort}
                 onChange={(v) => setSort(v as SortMode)}
                 options={sortOpts.map((s) => s.id)}
@@ -1944,7 +2061,7 @@ export default function InventoryView() {
           <GlobalBulkBar
             groups={gSelGroups} qty={gSelQty}
             onSelectAll={gSelectAll} onClear={() => setGsel(new Set())} onClose={exitSelect}
-            onConsolidate={() => setGMode('consolidate')} onTrade={() => setGTrade(true)} onAction={setGBulk}
+            onConsolidate={() => setGMode('consolidate')} onTrade={() => setGTrade(true)} onList={() => setGSell(true)} onAction={setGBulk}
           />
         )}
       </Collapse>
@@ -1955,6 +2072,10 @@ export default function InventoryView() {
       {gTrade && globalFind && selMode && (
         <GlobalTradeModal groups={gSelGroups} known={known} experimental={experimental}
           onClose={() => setGTrade(false)} onDone={() => setGTrade(false)} />
+      )}
+      {gSell && globalFind && selMode && (
+        <GlobalSellModal groups={gSelGroups} iconSet={iconSet} experimental={experimental}
+          onClose={() => setGSell(false)} onDone={() => { setGSell(false); exitSelect(); }} />
       )}
 
       {sellOpen && active && (

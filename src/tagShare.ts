@@ -5,7 +5,7 @@ import { TAG_COLORS, type TagStore, type TagDef } from './itemTags';
 // The shareable file Alexandria writes for item tags: the tag definitions + the per-item assignments
 // (keyed by item id, which is universal across accounts, so a friend's import lands on the same items).
 export function tagFileText(store: TagStore): string {
-  return JSON.stringify({ alexandria_item_tags: 1, tags: store.tags, assign: store.assign }, null, 2) + '\n';
+  return JSON.stringify({ alexandria_item_tags: 1, tags: store.tags, assign: store.assign, ...(store.assignAug && Object.keys(store.assignAug).length ? { assignAug: store.assignAug } : {}) }, null, 2) + '\n';
 }
 
 // Parse a shared tag file back into a TagStore, dropping anything malformed and any assignment that points
@@ -30,6 +30,18 @@ export function parseTagShare(txt: string): TagStore {
       const arr = Array.isArray(a[k]) ? (a[k] as unknown[]).filter((x): x is string => typeof x === 'string' && valid.has(x)) : [];
       if (arr.length) out.assign[id] = arr;
     }
+  }
+  const aa = (p as { assignAug?: unknown }).assignAug;
+  if (aa && typeof aa === 'object') {
+    const m = aa as Record<string, unknown>;
+    const dst: Record<string, string[]> = {};
+    for (const k in m) {
+      const hash = k.indexOf('#');
+      if (hash <= 0 || hash === k.length - 1 || !Number.isInteger(Number(k.slice(0, hash)))) continue;
+      const arr = Array.isArray(m[k]) ? (m[k] as unknown[]).filter((x): x is string => typeof x === 'string' && valid.has(x)) : [];
+      if (arr.length) dst[k] = arr;
+    }
+    if (Object.keys(dst).length) out.assignAug = dst;
   }
   return out;
 }

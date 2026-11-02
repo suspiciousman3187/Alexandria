@@ -23,7 +23,8 @@ import { SORTS, tagSorts, sortBy, type SortMode } from './itemSort';
 import { AH_CATEGORY_TREE, AH_CATEGORY_TOP, acPathLabel, acLeaf } from './ahCategories';
 import { useStoragePrefs, setCharLayout, layoutFor, STORABLE_BAGS } from './storagePrefs';
 import { resolveLayout, useTagRules } from './tagRules';
-import { useItemTags, bulkSetTag } from './itemTags';
+import { useItemTags, bulkSetTag, bulkSetPieceTag, pieceTagIdsOf } from './itemTags';
+import { hasAug } from './augSig';
 import { useTagFilter, TagFilterSelect } from './tagFilter';
 import { useJobFilter, JobFilterSelect } from './jobFilter';
 import { useStatFilter, StatFilterSelect } from './statFilter';
@@ -73,8 +74,17 @@ function beamGeom(from: { x: number; y: number }, to: { x: number; y: number }):
 }
 const STORABLE_SET = new Set(STORABLE_BAGS.map((b) => b.id));
 
-const reachable = (bagId: number, char: KnownChar | undefined, exp = false): boolean =>
-  ALWAYS_BAGS.has(bagId) || (MOG_ONLY_BAGS.has(bagId) && (!!char?.mog || (NOMAD_BAGS.has(bagId) && nomadReachable(char, exp))));
+const reachable = (bagId: number, char: KnownChar | undefined, exp = false): boolean => {
+  if (ALWAYS_BAGS.has(bagId)) return true;
+  if (!MOG_ONLY_BAGS.has(bagId)) return false;
+  // Must physically own the mog storage bag. A bag the character never unlocked (e.g. Mog Safe 2)
+  // is never reported by the addon, so it won't appear in inv; without this, reachable() passed on
+  // the "at a Moogle" heuristic alone and let a move fire at a bag the character doesn't have,
+  // stranding the items in a reserved-but-unopenable bag.
+  const owns = (char?.inv ?? []).some((b) => b.id === bagId && b.max > 0);
+  if (!owns) return false;
+  return !!char?.mog || (NOMAD_BAGS.has(bagId) && nomadReachable(char, exp));
+};
 
 // Sorting (options + logic) is shared with Inventory via ./itemSort so both views match.
 
@@ -91,13 +101,13 @@ const FILTER_CHIPS: { k: FilterKey; label: string; title: string }[] = [
 ];
 type Filt = { rare: boolean; ex: boolean; aug: boolean; equip: boolean; sellable: boolean; worth: boolean; cat: boolean; minWorth: number };
 
-type Drag = { id: number; n: string; c: number; s: number; f?: number; u?: number; bz?: number; from: number; char: string; conn: number };
+type Drag = { id: number; n: string; c: number; s: number; f?: number; u?: number; bz?: number; aug?: string[]; from: number; char: string; conn: number };
 const keyOf = (charName: string, bag: number, slot: number) => `${charName}|${bag}:${slot}`;
 const parseKey = (k: string) => { const i = k.indexOf('|'); const [b, s] = k.slice(i + 1).split(':').map(Number); return { char: k.slice(0, i), bag: b, slot: s }; };
 const WARDROBES = new Set([8, 10, 11, 12, 13, 14, 15, 16]);
 const isEquippable = (id: number) => itemCategory(id) !== 'other';
 // Shared item filter predicate so the grid and Select All narrow identically.
-const passesFilt = (it: InvItem, filt: Filt, catMatch?: Set<number> | null, medianOf?: Map<number, number>, tagMatches?: ((id: number) => boolean) | null, jobMatches?: ((id: number) => boolean) | null, statMatches?: ((id: number) => boolean) | null) => {
+const passesFilt = (it: InvItem, filt: Filt, catMatch?: Set<number> | null, medianOf?: Map<number, number>, tagMatches?: ((id: number, aug?: string[]) => boolean) | null, jobMatches?: ((id: number) => boolean) | null, statMatches?: ((id: number) => boolean) | null) => {
   const f = it.f ?? 0;
   if (filt.rare && !(f & 0x01)) return false;
   if (filt.ex && !(f & 0x02)) return false;
@@ -106,7 +116,7 @@ const passesFilt = (it: InvItem, filt: Filt, catMatch?: Set<number> | null, medi
   if (filt.sellable && (f & 0x08)) return false;
   if (filt.worth && (medianOf?.get(it.id) ?? 0) < filt.minWorth) return false;
   if (catMatch && !catMatch.has(it.id)) return false;
-  if (tagMatches && !tagMatches(it.id)) return false;
+  if (tagMatches && !tagMatches(it.id, it.aug)) return false;
   if (jobMatches && !jobMatches(it.id)) return false;
   if (statMatches && !statMatches(it.id)) return false;
   return true;
@@ -243,7 +253,7 @@ const EMPTY_HOME: Map<string, number[]> = new Map();
 
 const BagCard = memo(function BagCard({ charName, bag, name, items, max, used, reach, isDrop, receiving, sel, query, homeBags, misplacedOnly, filt, catMatch, tagMatches, jobMatches, statMatches, medianOf, pending, tile, tileCols, assets, iconSet, fleetTotals, onDown, onContext, onDouble }: {
   charName: string; bag: number; name: string; items: InvItem[]; max: number; used: number; reach: boolean; isDrop: boolean; receiving?: boolean; sel: Set<string>; query: string; homeBags: Map<string, number[]>; misplacedOnly: boolean;
-  filt: Filt; catMatch?: Set<number> | null; tagMatches?: ((id: number) => boolean) | null; jobMatches?: ((id: number) => boolean) | null; statMatches?: ((id: number) => boolean) | null; medianOf?: Map<number, number>; pending?: Set<string>; tile: number; tileCols?: number;
+  filt: Filt; catMatch?: Set<number> | null; tagMatches?: ((id: number, aug?: string[]) => boolean) | null; jobMatches?: ((id: number) => boolean) | null; statMatches?: ((id: number) => boolean) | null; medianOf?: Map<number, number>; pending?: Set<string>; tile: number; tileCols?: number;
   assets?: string; iconSet: Set<number>; fleetTotals?: Map<number, number>;
   onDown: (e: React.PointerEvent, item: InvItem, from: number, charName: string) => void;
   onContext: (e: React.MouseEvent, item: InvItem, from: number, charName: string) => void;
@@ -318,6 +328,9 @@ export default function LibraryView() {
   const experimental = settings.experimentalFeatures;
   const [pick, setPick] = useStickyChar();
   const [sort, setSort] = useStickyPersisted<SortMode>('library.sort', 'slot');
+  // A numeric Stat filter also sorts by that stat's value (its direction toggle), overriding the sort
+  // dropdown; clearing the stat returns to the dropdown's choice.
+  const effSort = sf.sortMode ?? sort;
   const [misplacedOnly, setMisplacedOnly] = useSticky<boolean>('library.misplaced', false);
   const [compact, setCompact] = useSticky<boolean>('library.compact', false);
   const [tipSeen, setTipSeen] = useSticky<boolean>('library.tipseen', false);
@@ -529,7 +542,7 @@ export default function LibraryView() {
     const { char: cn, bag: b, slot: s } = parseKey(k);
     const ch = charByName(cn);
     const it = bagOf(ch, b)?.items.find((x) => x.s === s);
-    return it && ch && ch.conn != null ? { id: it.id, n: it.n, c: it.c, s: it.s, f: it.f, u: it.u, bz: it.bz, from: b, char: cn, conn: ch.conn } : null;
+    return it && ch && ch.conn != null ? { id: it.id, n: it.n, c: it.c, s: it.s, f: it.f, u: it.u, bz: it.bz, aug: it.aug, from: b, char: cn, conn: ch.conn } : null;
   };
   const keyToSel = (k: string): SelItem | null => {
     const { char: cn, bag: b, slot: s } = parseKey(k);
@@ -668,7 +681,7 @@ export default function LibraryView() {
     const ch = charByName(charName);
     if (e.button !== 0 || !ch?.online || ch.conn == null) return;
     const key = keyOf(charName, from, item.s);
-    const single1: Drag = { id: item.id, n: item.n, c: item.c, s: item.s, f: item.f, u: item.u, bz: item.bz, from, char: charName, conn: ch.conn };
+    const single1: Drag = { id: item.id, n: item.n, c: item.c, s: item.s, f: item.f, u: item.u, bz: item.bz, aug: item.aug, from, char: charName, conn: ch.conn };
     const items = sel.has(key) ? [...sel].map(keyToItem).filter((x): x is Drag => !!x && x.char === charName) : [single1];
     drag.current = { items: items.length ? items : [single1], sx: e.clientX, sy: e.clientY, started: false, clickKey: key, canDrag: reachable(from, ch, experimental) && item.bz == null };
     window.addEventListener('pointermove', onMove);
@@ -678,7 +691,7 @@ export default function LibraryView() {
     e.preventDefault();
     const key = keyOf(charName, from, item.s);
     const ch = charByName(charName);
-    const single1: Drag = { id: item.id, n: item.n, c: item.c, s: item.s, f: item.f, u: item.u, bz: item.bz, from, char: charName, conn: ch?.conn ?? -1 };
+    const single1: Drag = { id: item.id, n: item.n, c: item.c, s: item.s, f: item.f, u: item.u, bz: item.bz, aug: item.aug, from, char: charName, conn: ch?.conn ?? -1 };
     const items = sel.has(key) ? [...sel].map(keyToItem).filter((x): x is Drag => !!x && x.char === charName) : [single1];
     setMenu({ x: e.clientX, y: e.clientY, items: items.length ? items : [single1] });
   };
@@ -1114,7 +1127,7 @@ export default function LibraryView() {
     <div className="h-full flex flex-col">
       <div className="shrink-0 flex flex-wrap items-center gap-2 p-3 border-b border-line">
         <div className="flex-1 min-w-[46%] sm:flex-none sm:w-44"><CharacterSelect value={isAll ? ALL : (single?.name ?? '')} onChange={(v) => startTransition(() => setPick(v))} chars={pickChars} /></div>
-        <div className="flex-1 min-w-[46%] sm:flex-none sm:w-40"><Select full value={sort} onChange={(v) => setSort(v as SortMode)} options={sortOpts.map((s) => s.id)} renderOption={(v) => sortOpts.find((s) => s.id === v)?.label ?? v} renderValue={(v) => <span className="flex items-center gap-1.5"><svg viewBox="0 0 24 24" className="w-3.5 h-3.5 shrink-0 text-fg-4" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h12" /><path d="M3 12h9" /><path d="M3 18h6" /><path d="m17 8 4 4-4 4" /></svg><span className="truncate">{sortOpts.find((s) => s.id === v)?.label ?? 'Sort'}</span></span>} /></div>
+        <div className="flex-1 min-w-[46%] sm:flex-none sm:w-40"><Select full searchable value={sort} onChange={(v) => setSort(v as SortMode)} options={sortOpts.map((s) => s.id)} renderOption={(v) => sortOpts.find((s) => s.id === v)?.label ?? v} renderValue={(v) => <span className="flex items-center gap-1.5"><svg viewBox="0 0 24 24" className="w-3.5 h-3.5 shrink-0 text-fg-4" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h12" /><path d="M3 12h9" /><path d="M3 18h6" /><path d="m17 8 4 4-4 4" /></svg><span className="truncate">{sortOpts.find((s) => s.id === v)?.label ?? 'Sort'}</span></span>} /></div>
         <div ref={searchWrap} className="flex-1 min-w-[160px]"><SearchInput value={q} onChange={setQ} placeholder="Find by name or stat…  (Ctrl+F)" className="w-full bg-field border border-line rounded-md px-3 py-1.5 text-xs text-fg-2 placeholder-fg-4 outline-none focus:border-accent/50 transition-colors" /></div>
         <div className="shrink-0 flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border border-line bg-field text-[11px] tabular-nums">
           {viewBusy && <svg viewBox="0 0 24 24" className="w-3.5 h-3.5 text-accent animate-spin shrink-0" fill="none" stroke="currentColor" strokeWidth={2.4} strokeLinecap="round"><path d="M21 12a9 9 0 1 1-6.2-8.5" /></svg>}
@@ -1135,7 +1148,7 @@ export default function LibraryView() {
         <div className="w-32 shrink-0" title="Filter by auction-house category"><Select full value={catTop} onChange={(v) => { setCatTop(v); setCatSub(0); }} options={['all', ...AH_CATEGORY_TREE.map((g) => g.top)]} renderValue={(v) => (v === 'all' ? 'AH Category' : v)} renderOption={(v) => (v === 'all' ? 'All AH Categories' : v)} /></div>
         {tf.tags.length > 0 && <div className="w-28 shrink-0" title="Filter by tag"><TagFilterSelect value={tf.value} onChange={tf.setValue} tags={tf.tags} /></div>}
         <div className="w-24 shrink-0" title="Filter by job"><JobFilterSelect value={jf.value} onChange={jf.setValue} /></div>
-        <div className="w-64 shrink-0" title="Filter by equipment stat (e.g. Fast Cast)"><StatFilterSelect value={sf.value} onChange={sf.setValue} /></div>
+        <div className="w-64 shrink-0" title="Filter by equipment stat, and sort by its value"><StatFilterSelect value={sf.value} onChange={sf.setValue} dir={sf.dir} onDir={sf.setDir} sortable={sf.numeric} /></div>
         {catGroup && catGroup.subs.length > 1 && <div className="w-36 shrink-0"><Select full value={String(catSub)} onChange={(v) => setCatSub(Number(v))} options={['0', ...catGroup.subs.map((s) => String(s.id))]} renderValue={(v) => (v === '0' ? 'All' : (catGroup.subs.find((s) => String(s.id) === v)?.label ?? v))} renderOption={(v) => (v === '0' ? `All ${catTop}` : (catGroup.subs.find((s) => String(s.id) === v)?.label ?? v))} /></div>}
         <div className={`shrink-0 inline-flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-semibold rounded-md border transition-colors ${minWorth > 0 ? 'border-accent bg-accent/15' : 'border-line bg-field hover:border-line-2 focus-within:border-accent/50'}`}>
           <span className={minWorth > 0 ? 'text-accent' : 'text-fg-4'}>Worth &gt;</span>
@@ -1260,7 +1273,7 @@ export default function LibraryView() {
                       charName={ch.name}
                       bag={b.id}
                       name={b.name}
-                      items={sortBy(bo.items, (x) => x, sort, (it) => getMovedAt(ch.name, b.id, it.s, it.id))}
+                      items={sortBy(bo.items, (x) => x, effSort, (it) => getMovedAt(ch.name, b.id, it.s, it.id))}
                       max={bo.max}
                       used={bo.used}
                       reach={reachable(b.id, ch, experimental)}
@@ -1374,7 +1387,7 @@ export default function LibraryView() {
       {menu && createPortal(
         <>
           <div className="fixed inset-0 z-[9990]" onPointerDown={() => setMenu(null)} onContextMenu={(e) => { e.preventDefault(); setMenu(null); }} />
-          <motion.div ref={menuRef} className="fixed z-[9991] w-60 rounded-lg border border-line-2 bg-popover shadow-2xl py-1.5 max-h-[92vh] overflow-y-auto" style={{ left: menuPos?.left ?? Math.min(menu.x / uiZoom(), logicalViewport().w - 252), top: menuPos?.top ?? Math.max(8, menu.y / uiZoom()), transformOrigin: 'top left' }} initial={{ opacity: 0, scale: 0.96, y: -4 }} animate={{ opacity: 1, scale: 1, y: 0 }} transition={{ duration: 0.14, ease: [0.22, 1, 0.36, 1] }}>
+          <motion.div ref={menuRef} className="fixed z-[9991] w-60 rounded-lg border border-line-2 bg-popover shadow-2xl py-1.5 overflow-y-auto" style={{ left: menuPos?.left ?? Math.min(menu.x / uiZoom(), logicalViewport().w - 252), top: menuPos?.top ?? Math.max(8, menu.y / uiZoom()), maxHeight: logicalViewport().h - 16, transformOrigin: 'top left' }} initial={{ opacity: 0, scale: 0.96, y: -4 }} animate={{ opacity: 1, scale: 1, y: 0 }} transition={{ duration: 0.14, ease: [0.22, 1, 0.36, 1] }}>
             <div className="px-3 py-1 text-[11px] font-bold text-fg truncate">{menuOne ? menuOne.n : `${menu.items.length} items`}<span className="text-fg-4 font-normal"> · {menuChar}</span></div>
             <div className="px-3 pt-1.5 pb-1 text-[9px] font-bold uppercase tracking-wide text-fg-4">Move to</div>
             <div className="px-2 pb-1.5 flex flex-wrap gap-1">
@@ -1422,12 +1435,36 @@ export default function LibraryView() {
               if (!ids.length) return null;
               return (
                 <>
-                  <div className="px-3 pt-1.5 pb-1 text-[9px] font-bold uppercase tracking-wide text-fg-4 border-t border-line">Tags</div>
-                  <div className="px-2 pb-1.5 flex flex-wrap gap-1">
+                  <div className="px-3 pt-1.5 pb-1 text-[9px] font-bold uppercase tracking-wide text-fg-4 border-t border-line">Tags{tagStore.tags.length > 18 ? <span className="text-fg-4/60 normal-case font-normal"> · scroll for more</span> : null}</div>
+                  <div className="px-2 pb-1.5 flex flex-wrap gap-1 max-h-[180px] overflow-y-auto overscroll-contain">
                     {tagStore.tags.map((t) => {
                       const allHave = ids.every((id) => (tagStore.assign[id] ?? []).includes(t.id));
                       return (
                         <button key={t.id} onClick={() => bulkSetTag(ids, t.id, !allHave)} title={allHave ? `Remove ${t.name}` : `Tag as ${t.name}`}
+                          className="px-2 py-0.5 rounded text-[10px] border font-semibold flex items-center gap-1 transition-colors"
+                          style={allHave ? { backgroundColor: `${t.color}26`, color: t.color, borderColor: `${t.color}66` } : { color: t.color, borderColor: 'var(--color-line)' }}>
+                          <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ backgroundColor: t.color }} />{t.name}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </>
+              );
+            })()}
+            {tagStore.tags.length > 0 && (() => {
+              // Exact-piece tags: only the selected copies with distinguishing augments, tagged by their
+              // augment fingerprint (not the item name), so a pull preset grabs ONLY these pieces and not
+              // every same-name copy. The pull engine moves the exact slot for these.
+              const pieces = menu.items.filter((it) => it.from !== TEMPORARY_BAG && hasAug(it.aug)).map((it) => ({ id: it.id, aug: it.aug }));
+              if (!pieces.length) return null;
+              return (
+                <>
+                  <div className="px-3 pt-1.5 pb-1 text-[9px] font-bold uppercase tracking-wide text-fg-4 border-t border-line">This exact piece <span className="text-fg-4/60 normal-case font-normal">· by augments</span></div>
+                  <div className="px-2 pb-1.5 flex flex-wrap gap-1 max-h-[180px] overflow-y-auto overscroll-contain">
+                    {tagStore.tags.map((t) => {
+                      const allHave = pieces.every((p) => pieceTagIdsOf(p).includes(t.id));
+                      return (
+                        <button key={t.id} onClick={() => bulkSetPieceTag(pieces, t.id, !allHave)} title={allHave ? `Remove ${t.name} from ${pieces.length > 1 ? 'these pieces' : 'this piece'}` : `Tag ${pieces.length > 1 ? 'these exact pieces' : 'this exact piece'} as ${t.name}`}
                           className="px-2 py-0.5 rounded text-[10px] border font-semibold flex items-center gap-1 transition-colors"
                           style={allHave ? { backgroundColor: `${t.color}26`, color: t.color, borderColor: `${t.color}66` } : { color: t.color, borderColor: 'var(--color-line)' }}>
                           <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ backgroundColor: t.color }} />{t.name}

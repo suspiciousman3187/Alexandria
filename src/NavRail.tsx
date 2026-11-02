@@ -12,9 +12,9 @@ export type Section =
   | 'pool' | 'lotlist' | 'passlist' | 'pricelist' | 'alertlist'
   | 'shop' | 'selllist' | 'resupply' | 'vendors' | 'auction' | 'bazaar' | 'delivery' | 'sparks' | 'networth'
   | 'organize' | 'sequences' | 'commands' | 'store' | 'tags'
-  | 'slips' | 'ambuscade' | 'skirmish' | 'reive' | 'geasfete' | 'reforge'
+  | 'slips' | 'ambuscade' | 'skirmish' | 'reive' | 'geasfete' | 'reforge' | 'unity'
   | 'gearsets'
-  | 'settings';
+  | 'settings' | 'setchars' | 'setcommands' | 'setnotify' | 'setupdates';
 
 const S = { fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round' as const, strokeLinejoin: 'round' as const };
 
@@ -60,8 +60,13 @@ const ICONS: Record<Section, ReactElement> = {
   reive:     cape,
   geasfete:  armor,
   reforge:   hammer,
+  unity:     (<svg viewBox="0 0 24 24" {...S}><path d="M4 21V4" /><path d="M4 4c3-1.5 6 1.5 9 0s5-1.5 7 0v9c-2-1.5-4 1.5-7 0s-6-1.5-9 0" /></svg>),
   gearsets:  sword,
   settings:  (<svg viewBox="0 0 24 24" {...S}><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2V21a2 2 0 1 1-4 0v-.1A1.7 1.7 0 0 0 7 19.4a1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0-1.2-2.9H1a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 2.6 7a1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H7a1.7 1.7 0 0 0 1-1.5V1a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V7a1.7 1.7 0 0 0 1.5 1H23a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z" /></svg>),
+  setchars:  (<svg viewBox="0 0 24 24" {...S}><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="3" /><path d="M22 21v-2a4 4 0 0 0-3-3.87" /><path d="M16 3.13a4 4 0 0 1 0 7.75" /></svg>),
+  setcommands: (<svg viewBox="0 0 24 24" {...S}><path d="M4 6h10" /><path d="M14 12h6" /><path d="M4 18h6" /><circle cx="18" cy="6" r="2" /><circle cx="10" cy="12" r="2" /><circle cx="14" cy="18" r="2" /></svg>),
+  setnotify: (<svg viewBox="0 0 24 24" {...S}><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" /><path d="M13.7 21a2 2 0 0 1-3.4 0" /></svg>),
+  setupdates: (<svg viewBox="0 0 24 24" {...S}><path d="M21 12a9 9 0 1 1-3-6.7" /><path d="M21 4v5h-5" /></svg>),
 };
 
 const LABELS: Record<Section, string> = {
@@ -69,19 +74,22 @@ const LABELS: Record<Section, string> = {
   currency: 'Currency', trade: 'Trade', pool: 'Pool', lotlist: 'Lot List', passlist: 'Pass List', pricelist: 'Price Display', alertlist: 'Alerts',
   shop: 'Shop', selllist: 'Sell List', resupply: 'Curio', vendors: 'Vendors', auction: 'Auction', bazaar: 'Bazaar', delivery: 'Delivery', sparks: 'Sparks/Unity', networth: 'Net Worth',
   organize: 'Organize', sequences: 'Sequences', commands: 'Commands', store: 'Storage NPC', tags: 'Tagging',
-  slips: 'Storage Slips', ambuscade: 'Ambuscade', skirmish: 'Skirmish', reive: 'Reive', geasfete: 'Geas Fete', reforge: 'Reforge',
+  slips: 'Storage Slips', ambuscade: 'Ambuscade', skirmish: 'Skirmish', reive: 'Reive', geasfete: 'Geas Fete', reforge: 'Reforge', unity: 'Unity',
   gearsets: 'Gearsets',
-  settings: 'Settings',
+  settings: 'Appearance',
+  setchars: 'Characters', setcommands: 'Behavior', setnotify: 'Notifications & Chat', setupdates: 'Updates & Other',
 };
 
-const EXPERIMENTAL: Partial<Record<Section, boolean>> = { bazaar: true, ambuscade: true, reive: true, skirmish: true, geasfete: true, store: true, sparks: true, reforge: true };
-const TOGGLE_EXPERIMENTAL = new Set<Section>(['ambuscade', 'reive', 'skirmish', 'geasfete', 'store', 'bazaar', 'sparks', 'reforge']);
+const EXPERIMENTAL: Partial<Record<Section, boolean>> = { bazaar: true, ambuscade: true, reive: true, skirmish: true, geasfete: true, store: true, sparks: true, reforge: true, unity: true };
+const TOGGLE_EXPERIMENTAL = new Set<Section>(['ambuscade', 'reive', 'skirmish', 'geasfete', 'store', 'bazaar', 'sparks', 'reforge', 'unity']);
 
 const GROUP_ICON = {
   market: (<svg viewBox="0 0 24 24" {...S}><path d="M6 8h12l-1 12H7z" /><path d="M9 8a3 3 0 0 1 6 0" /></svg>),
   tools:  (<svg viewBox="0 0 24 24" {...S}><path d="M5 21v-6" /><path d="M5 11V3" /><path d="M12 21v-9" /><path d="M12 8V3" /><path d="M19 21v-4" /><path d="M19 13V3" /><path d="M2 15h6" /><path d="M9 8h6" /><path d="M16 17h6" /></svg>),
 };
 
+// Gearsets is still in development: hidden from release builds. Flip back to true to re-enable the tab +
+// its pop-out window (the feature code is intact, just not surfaced).
 export const GEARSETS_ENABLED = false;
 
 type NavGroup = { id: string; label: string; icon: ReactElement; primary?: Section; children: Section[] };
@@ -91,9 +99,13 @@ const GROUPS: NavGroup[] = [
   { id: 'pool', label: 'Pool', icon: ICONS.pool, primary: 'pool', children: ['lotlist', 'passlist', 'pricelist', 'alertlist'] },
   { id: 'market', label: 'Market', icon: GROUP_ICON.market, primary: 'auction', children: ['delivery', 'bazaar', 'shop', 'networth'] },
   { id: 'tools', label: 'Tools', icon: GROUP_ICON.tools, primary: 'organize', children: ['tags', 'dupe', 'store', 'slips', 'resupply', 'vendors', 'sparks'] },
-  { id: 'augment', label: 'Augment', icon: armor, primary: 'ambuscade', children: ['reive', 'skirmish', 'geasfete', 'reforge'] },
+  { id: 'augment', label: 'Augment', icon: armor, primary: 'ambuscade', children: ['reive', 'skirmish', 'geasfete', 'reforge', 'unity'] },
   { id: 'gearsets', label: 'Gearsets', icon: ICONS.gearsets, primary: 'gearsets', children: [] },
 ];
+
+// Settings lives in the bottom rail as a flyout (opens upward). Its primary 'settings' section is the
+// Appearance page; the rest are its own sub-pages.
+const SETTINGS_GROUP: NavGroup = { id: 'settings', label: 'Settings', icon: ICONS.settings, primary: 'settings', children: ['setchars', 'setcommands', 'setnotify', 'setupdates'] };
 
 const railBtn = 'le-tap group relative w-[60px] h-[58px] @max-[460px]:w-11 @max-[460px]:h-11 rounded-xl flex flex-col items-center justify-center gap-1 transition-colors';
 
@@ -108,7 +120,7 @@ function RailButton({ id, label, icon, active, onSelect }: { id: Section; label:
   );
 }
 
-function GroupItem({ group, active, onSelect, badge = 0 }: { group: NavGroup; active: Section; onSelect: (s: Section) => void; badge?: number }) {
+function GroupItem({ group, active, onSelect, badge = 0, up = false }: { group: NavGroup; active: Section; onSelect: (s: Section) => void; badge?: number; up?: boolean }) {
   const exp = useSettings().experimentalFeatures;
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement | null>(null);
@@ -144,7 +156,7 @@ function GroupItem({ group, active, onSelect, badge = 0 }: { group: NavGroup; ac
           <motion.div
             initial={{ opacity: 0, x: -6 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -6 }}
             transition={{ duration: 0.14, ease: [0.22, 1, 0.36, 1] }}
-            className="absolute left-full top-0 ml-2 z-50 min-w-[208px] rounded-xl border border-line bg-popover shadow-xl p-2 flex flex-col gap-1"
+            className={`absolute left-full ${up ? 'bottom-0' : 'top-0'} ml-2 z-50 min-w-[208px] rounded-xl border border-line bg-popover shadow-xl p-2 flex flex-col gap-1`}
           >
             <div className="px-3 py-1.5 text-[11px] font-bold uppercase tracking-wide text-fg-4">{group.label}</div>
             {(group.primary ? [group.primary, ...kids] : kids).map((s) => (
@@ -160,16 +172,19 @@ function GroupItem({ group, active, onSelect, badge = 0 }: { group: NavGroup; ac
   );
 }
 
-export default function NavRail({ active, onSelect }: { active: Section; onSelect: (s: Section) => void }) {
+export default function NavRail({ active, onSelect, gearsetOpen }: { active: Section; onSelect: (s: Section) => void; gearsetOpen?: boolean }) {
   const rfCount = useActiveReforgeCount();
+  // Gearsets is a pop-out window, not a main view: highlight it whenever that window is open, regardless of
+  // which main section is showing.
+  const isActive = (s: Section) => active === s || (s === 'gearsets' && !!gearsetOpen);
   return (
     <nav className="bg-nav relative z-40 w-[76px] @max-[460px]:w-14 shrink-0 h-full flex flex-col items-center gap-1 py-3 border-r border-line">
       {GROUPS.filter((g) => GEARSETS_ENABLED || g.id !== 'gearsets').map((g) => (g.children.length === 0 && g.primary
-        ? <RailButton key={g.id} id={g.primary} label={g.label} icon={g.icon} active={active === g.primary} onSelect={onSelect} />
+        ? <RailButton key={g.id} id={g.primary} label={g.label} icon={g.icon} active={isActive(g.primary)} onSelect={onSelect} />
         : <GroupItem key={g.id} group={g} active={active} onSelect={onSelect} badge={g.id === 'augment' ? rfCount : 0} />))}
 
       <div className="mt-auto w-full flex flex-col items-center gap-1 pt-1 border-t border-line">
-        <RailButton id="settings" label={LABELS.settings} icon={ICONS.settings} active={active === 'settings'} onSelect={onSelect} />
+        <GroupItem group={SETTINGS_GROUP} active={active} onSelect={onSelect} up />
         <button
           onClick={() => openExternal(DISCORD_URL)}
           aria-label="Discord"

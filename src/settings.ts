@@ -3,8 +3,11 @@ import { useEffect, useMemo, useSyncExternalStore } from 'react';
 import { appDataPath, inTauri, broadcastBoxCommand, sendBoxCommand, useBoxes } from './bridge';
 
 export type ChatSilence = { action: boolean; progress: boolean; error: boolean };
-export type AppSettings = { watchFreqMin: number; silence: ChatSilence; recentHours: number; autoOrganizeOnMog: boolean; autoOrganizeDelaySec: number; experimentalFeatures: boolean; bazaarAllItems: boolean; anonymizeNames: boolean; memLog: boolean; ahServer?: string; gearswapPath?: string; ahPollMin: number; sparksDelaySec: number; autoSortBags: number[]; autoSortExclude: string[]; skipSellConfirm: boolean; uiScale: number; libraryAutoResize: boolean; bigItemCard: boolean };
-const DEFAULTS: AppSettings = { watchFreqMin: 15, silence: { action: false, progress: false, error: false }, recentHours: 6, autoOrganizeOnMog: false, autoOrganizeDelaySec: 5, experimentalFeatures: false, bazaarAllItems: false, anonymizeNames: false, memLog: false, ahPollMin: 15, sparksDelaySec: 0, autoSortBags: [], autoSortExclude: [], skipSellConfirm: false, uiScale: 1, libraryAutoResize: true, bigItemCard: false };
+export type ItemizerMatch = 'strict' | 'loose';
+export type AppSettings = { watchFreqMin: number; silence: ChatSilence; recentHours: number; autoOrganizeOnMog: boolean; autoOrganizeDelaySec: number; experimentalFeatures: boolean; bazaarAllItems: boolean; anonymizeNames: boolean; memLog: boolean; ahServer?: string; gearswapPath?: string; ahPollMin: number; sparksDelaySec: number; autoSortBags: number[]; autoSortExclude: string[]; skipSellConfirm: boolean; uiScale: number; libraryAutoResize: boolean; bigItemCard: boolean; itemizerMatch: ItemizerMatch; keepStoreBags: number[]; ahListDelaySec: number };
+// Default order the `keep` command stores overflow into: Satchel/Sack/Case (reachable anywhere), then Mog storage.
+export const KEEP_STORE_BAGS_DEFAULT = [5, 6, 7, 1, 2, 4, 9];
+const DEFAULTS: AppSettings = { watchFreqMin: 15, silence: { action: false, progress: false, error: false }, recentHours: 6, autoOrganizeOnMog: false, autoOrganizeDelaySec: 5, experimentalFeatures: false, bazaarAllItems: false, anonymizeNames: false, memLog: false, ahPollMin: 15, sparksDelaySec: 0, autoSortBags: [], autoSortExclude: [], skipSellConfirm: false, uiScale: 1, libraryAutoResize: true, bigItemCard: false, itemizerMatch: 'strict', keepStoreBags: KEEP_STORE_BAGS_DEFAULT, ahListDelaySec: 1 };
 
 function normSilence(p: Record<string, unknown> | undefined): ChatSilence {
   const s = p?.silence as Record<string, unknown> | undefined;
@@ -27,7 +30,7 @@ async function load() {
     try {
       const txt = await invoke<string>('read_text_file', { path: await appDataPath('app_settings.json') });
       const p = JSON.parse(txt);
-      cfg = { watchFreqMin: Number(p?.watchFreqMin) || DEFAULTS.watchFreqMin, silence: normSilence(p), recentHours: Number(p?.recentHours) || DEFAULTS.recentHours, autoOrganizeOnMog: !!p?.autoOrganizeOnMog, autoOrganizeDelaySec: Number(p?.autoOrganizeDelaySec) > 0 ? Number(p.autoOrganizeDelaySec) : DEFAULTS.autoOrganizeDelaySec, experimentalFeatures: !!p?.experimentalFeatures, bazaarAllItems: !!p?.bazaarAllItems, anonymizeNames: !!p?.anonymizeNames, memLog: !!p?.memLog, ahServer: typeof p?.ahServer === 'string' ? p.ahServer : undefined, gearswapPath: typeof p?.gearswapPath === 'string' ? p.gearswapPath : undefined, ahPollMin: typeof p?.ahPollMin === 'number' && p.ahPollMin >= 0 ? p.ahPollMin : DEFAULTS.ahPollMin, sparksDelaySec: typeof p?.sparksDelaySec === 'number' && p.sparksDelaySec >= 0 ? p.sparksDelaySec : DEFAULTS.sparksDelaySec, autoSortBags: Array.isArray(p?.autoSortBags) ? p.autoSortBags.filter((n: unknown): n is number => typeof n === 'number') : DEFAULTS.autoSortBags, autoSortExclude: Array.isArray(p?.autoSortExclude) ? p.autoSortExclude.filter((n: unknown): n is string => typeof n === 'string') : DEFAULTS.autoSortExclude, skipSellConfirm: !!p?.skipSellConfirm, uiScale: typeof p?.uiScale === 'number' && p.uiScale >= 0.5 && p.uiScale <= 3 ? p.uiScale : DEFAULTS.uiScale, libraryAutoResize: p?.libraryAutoResize !== false, bigItemCard: !!p?.bigItemCard };
+      cfg = { watchFreqMin: Number(p?.watchFreqMin) || DEFAULTS.watchFreqMin, silence: normSilence(p), recentHours: Number(p?.recentHours) || DEFAULTS.recentHours, autoOrganizeOnMog: !!p?.autoOrganizeOnMog, autoOrganizeDelaySec: Number(p?.autoOrganizeDelaySec) > 0 ? Number(p.autoOrganizeDelaySec) : DEFAULTS.autoOrganizeDelaySec, experimentalFeatures: !!p?.experimentalFeatures, bazaarAllItems: !!p?.bazaarAllItems, anonymizeNames: !!p?.anonymizeNames, memLog: !!p?.memLog, ahServer: typeof p?.ahServer === 'string' ? p.ahServer : undefined, gearswapPath: typeof p?.gearswapPath === 'string' ? p.gearswapPath : undefined, ahPollMin: typeof p?.ahPollMin === 'number' && p.ahPollMin >= 0 ? p.ahPollMin : DEFAULTS.ahPollMin, sparksDelaySec: typeof p?.sparksDelaySec === 'number' && p.sparksDelaySec >= 0 ? p.sparksDelaySec : DEFAULTS.sparksDelaySec, autoSortBags: Array.isArray(p?.autoSortBags) ? p.autoSortBags.filter((n: unknown): n is number => typeof n === 'number') : DEFAULTS.autoSortBags, autoSortExclude: Array.isArray(p?.autoSortExclude) ? p.autoSortExclude.filter((n: unknown): n is string => typeof n === 'string') : DEFAULTS.autoSortExclude, skipSellConfirm: !!p?.skipSellConfirm, uiScale: typeof p?.uiScale === 'number' && p.uiScale >= 0.5 && p.uiScale <= 3 ? p.uiScale : DEFAULTS.uiScale, libraryAutoResize: p?.libraryAutoResize !== false, bigItemCard: !!p?.bigItemCard, itemizerMatch: p?.itemizerMatch === 'loose' ? 'loose' : 'strict', keepStoreBags: Array.isArray(p?.keepStoreBags) ? p.keepStoreBags.filter((n: unknown): n is number => typeof n === 'number') : DEFAULTS.keepStoreBags, ahListDelaySec: typeof p?.ahListDelaySec === 'number' && p.ahListDelaySec >= 0.3 && p.ahListDelaySec <= 5 ? p.ahListDelaySec : DEFAULTS.ahListDelaySec };
     } catch { /* none saved — keep defaults */ }
   }
   ready = true;
@@ -64,6 +67,10 @@ export function useSettingsSync() {
     if (!ready) return;
     void broadcastBoxCommand(JSON.stringify({ cmd: 'memlog', on: c.memLog }));
   }, [c.memLog, onlineKey]);
+  useEffect(() => {
+    if (!ready) return;
+    void broadcastBoxCommand(JSON.stringify({ cmd: 'ahdelay', sec: c.ahListDelaySec }));
+  }, [c.ahListDelaySec, onlineKey]);
   useEffect(() => {
     if (!ready) return;
     const excl = new Set(c.autoSortExclude);

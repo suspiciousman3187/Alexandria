@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { useKnownCharacters, useAvailableIcons, storeRequest, storeStop, type KnownChar } from './bridge';
+import { useKnownCharacters, useAvailableIcons, storeRequest, storeStop, cipherTurnIn, type KnownChar } from './bridge';
 import { IconInner } from './atlasIcon';
 import { Group, Stepper, Toggle, Button } from './ui';
 import { useSettings } from './settings';
@@ -24,7 +24,7 @@ const isRemTale = (id: number) => id >= 4064 && id <= 4073;
 
 type Holder = { c: KnownChar; count: number };
 type ItemAgg = { id: number; n: string; holders: Holder[]; total: number };
-type NpcAgg = { npc: string; chars: KnownChar[]; items: ItemAgg[]; batch?: number };
+type NpcAgg = { npc: string; chars: KnownChar[]; items: ItemAgg[]; batch?: number; kind?: 'cipher' };
 
 const snapAmt = (v: number, total: number, batch?: number) => {
   if (!batch || batch <= 1) return Math.max(1, Math.min(v, total));
@@ -70,12 +70,13 @@ export default function StoreView() {
   const [dropExtra, setDropExtra] = useState(false);
 
   const npcs = useMemo<NpcAgg[]>(() => {
-    const m = new Map<string, { chars: Set<KnownChar>; items: Map<number, ItemAgg>; batch?: number }>();
+    const m = new Map<string, { chars: Set<KnownChar>; items: Map<number, ItemAgg>; batch?: number; kind?: 'cipher' }>();
     for (const c of online) {
       for (const z of c.storeZone ?? []) {
         let e = m.get(z.npc);
         if (!e) { e = { chars: new Set(), items: new Map() }; m.set(z.npc, e); }
         if (z.batch && z.batch > 1) e.batch = z.batch;
+        if (z.kind) e.kind = z.kind;
         e.chars.add(c);
         for (const it of z.items) {
           let ia = e.items.get(it.id);
@@ -89,6 +90,7 @@ export default function StoreView() {
       chars: [...e.chars],
       items: [...e.items.values()].sort((a, b) => a.id - b.id),
       batch: e.batch,
+      kind: e.kind,
     })).sort((a, b) => a.npc.localeCompare(b.npc));
   }, [online]);
 
@@ -114,6 +116,9 @@ export default function StoreView() {
   const dropIt = (npc: string, id: number) => npc === 'Monisette' && dropExtra && isRemTale(id);
   const amtOf = (ia: ItemAgg, batch?: number) => snapAmt(amounts[`${ia.id}`] ?? ia.total, ia.total, batch);
   const storeNpcAll = (n: NpcAgg) => { for (const ia of n.items) if (!isUse(ia.id)) storeAmount(n.npc, ia, ia.total, n.batch, dropIt(n.npc, ia.id)); };
+  // Cipher NPC: every character standing at it turns in all its held ciphers (the addon does the whole
+  // held set per character in one run).
+  const turnInCiphers = (n: NpcAgg) => { for (const c of n.chars) if (c.conn != null) cipherTurnIn(c.conn); };
   const stopAll = () => { for (const c of online) if (c.conn != null) storeStop(c.conn); };
 
   if (online.length === 0) {
@@ -172,7 +177,11 @@ export default function StoreView() {
                       <span className="font-semibold text-fg-3">Drop Extra</span>
                     </label>
                   )}
-                  <Button variant="primary" size="sm" onClick={() => storeNpcAll(n)}>Store All</Button>
+                  {n.kind === 'cipher'
+                    ? (() => { const total = n.items.reduce((s, ia) => s + ia.total, 0); return (
+                        <Button variant="primary" size="sm" disabled={total === 0} onClick={() => turnInCiphers(n)}>Turn In All{total > 0 ? ` (${fmt(total)})` : ''}</Button>
+                      ); })()
+                    : <Button variant="primary" size="sm" onClick={() => storeNpcAll(n)}>Store All</Button>}
                 </span>
               }>
                 {n.items.map((ia) => {
@@ -201,7 +210,9 @@ export default function StoreView() {
                           ) : 'none held'}
                         </div>
                       </div>
-                      {has ? (
+                      {n.kind === 'cipher' ? (
+                        <span className="shrink-0 text-[11px] font-bold tabular-nums text-fg-3">{held ? `×${fmt(ia.total)}` : 'none'}</span>
+                      ) : has ? (
                         <>
                           <Stepper value={amtOf(ia, batch)} min={batch ?? 1} max={maxStore} step={batch ?? 1} onChange={(v) => setAmounts((a) => ({ ...a, [`${ia.id}`]: v }))} className="shrink-0" />
                           <button onClick={() => storeAmount(n.npc, ia, amtOf(ia, batch), batch, dropIt(n.npc, ia.id))} className="le-tap shrink-0 px-3 py-1.5 text-[11px] font-bold rounded-md bg-accent text-on-accent hover:bg-accent-hover transition-colors">{isUse(ia.id) ? 'Use' : 'Store'}</button>

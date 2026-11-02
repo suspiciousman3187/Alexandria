@@ -11,9 +11,10 @@ import { useSettings } from './settings';
 import { openPoolWindow, isPoolOverlay } from './overlayWindow';
 import { openAhDetail } from './ahNav';
 import { useDrop, setDrop } from './drop';
-import { usePoolStore, setCharRules, addRuleToChars, emptyRules, usePassOnLot, setPassOnLot, useAutoLotEnabled, setAutoLotEnabled, useAutoLotOff, setAutoLotChar } from './poolRules';
+import { usePoolStore, setCharRules, addRuleToChars, emptyRules, usePassOnLot, setPassOnLot, usePassRareOwned, setPassRareOwned, useAutoLotEnabled, setAutoLotEnabled, useAutoLotOff, setAutoLotChar } from './poolRules';
 import { usePoolPriceMode, setPoolPriceMode, usePoolPriceDefault, setPoolPriceDefault } from './poolPriceMode';
-import { useAlertNames, setAlertNames, useAlertOn, setAlertOn, useAlertVolume, setAlertVolume, testAlertTone, toggleAlert, hasAlert, useAlertActiveNames, dismissAlerts } from './poolAlerts';
+import { useAlertNames, setAlertNames, useAlertOn, setAlertOn, useAlertVolume, setAlertVolume, useAlertSound, setAlertSound, testAlertTone, toggleAlert, hasAlert, useAlertActiveNames, dismissAlerts } from './poolAlerts';
+import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { useSticky, useStickyChar } from './sticky';
 import { logicalRect, logicalViewport } from './uiZoom';
 import { Group, CharacterSelect, Select, Row, Toggle, SearchInput, Segmented, Stepper } from './ui';
@@ -351,15 +352,20 @@ export default function PoolView({ view = 'pool', compact = false, dense = false
   const anon = useAnon();
   const known = useKnownCharacters();
   const online = known.filter((k) => k.online && k.conn != null);
+  // Every registered character (online first), so the selector lists offline ones too; lot/pass rules are
+  // config stored by name and edit fine while a character is offline.
+  const chars = useMemo(() => [...known].sort((a, b) => (a.online === b.online ? a.name.localeCompare(b.name) : a.online ? -1 : 1)), [known]);
   const allCharNames = useMemo(() => known.map((k) => k.name).filter(Boolean), [known]);
   const [name, setName] = useStickyChar();
   const poolStore = usePoolStore();
   const passOnLot = usePassOnLot();
+  const passRareOwned = usePassRareOwned();
   const autoLotEnabled = useAutoLotEnabled();
   const autoLotOff = useAutoLotOff();
   const alertNames = useAlertNames();
   const alertOn = useAlertOn();
   const alertVol = useAlertVolume();
+  const alertSound = useAlertSound();
   const alertActive = useAlertActiveNames();
   const iconMap = useDropIconMap();
   const now = useNow();
@@ -367,7 +373,7 @@ export default function PoolView({ view = 'pool', compact = false, dense = false
   const [importing, setImporting] = useState(false);
   const [allMenu, setAllMenu] = useState<{ rect: DOMRect; kind: 'lot' | 'pass' } | null>(null);
 
-  const active: KnownChar | undefined = online.find((k) => k.name === name) ?? online[0];
+  const active: KnownChar | undefined = chars.find((k) => k.name === name) ?? chars[0];
   useEffect(() => { if (active && active.name !== name) setName(active.name); }, [active, name]);
   const settings = useSettings();
   const world = settings.ahServer || active?.server;
@@ -447,12 +453,12 @@ export default function PoolView({ view = 'pool', compact = false, dense = false
 
   const pool = (lead?.pool ?? []).slice().sort((a, b) => a.i - b.i);
 
-  if (online.length === 0) {
+  if (chars.length === 0) {
     return (
       <div className="h-full grid place-items-center">
         <div className="text-center max-w-sm">
-          <div className="text-[15px] font-bold text-fg mb-1">No Connected Characters</div>
-          <div className="text-[12px] text-fg-4 leading-relaxed">The treasure pool is live data. Load the Alexandria addon in-game to see and manage your pool here.</div>
+          <div className="text-[15px] font-bold text-fg mb-1">No Characters Yet</div>
+          <div className="text-[12px] text-fg-4 leading-relaxed">Load the Alexandria addon in-game once so a character is registered; lot and pass rules can then be managed here even while offline.</div>
         </div>
       </div>
     );
@@ -508,7 +514,7 @@ export default function PoolView({ view = 'pool', compact = false, dense = false
             {headerRight}
           </div>
         ) : (
-          <div className="flex-1 min-w-0"><CharacterSelect value={active?.name ?? ''} onChange={setName} chars={online} /></div>
+          <div className="flex-1 min-w-0"><CharacterSelect value={active?.name ?? ''} onChange={setName} chars={chars} /></div>
         )}
       </div>
       )}
@@ -596,6 +602,9 @@ export default function PoolView({ view = 'pool', compact = false, dense = false
               <Row label="Pass When Other Characters Lot">
                 <Toggle on={passOnLot} onChange={setPassOnLot} />
               </Row>
+              <Row label="Pass Rare Items You Already Own">
+                <Toggle on={passRareOwned} onChange={setPassRareOwned} />
+              </Row>
             </Group>
             <Group title={`Pass List · ${editName}`} right={
               <div className="flex items-center gap-2">
@@ -619,6 +628,16 @@ export default function PoolView({ view = 'pool', compact = false, dense = false
                 <div className="flex items-center gap-2">
                   <input type="range" min={0} max={1} step={0.05} value={alertVol} onChange={(e) => setAlertVolume(Number(e.target.value))} className="w-32 accent-accent" />
                   <button onClick={() => testAlertTone()} className="le-tap px-2.5 py-1 text-[11px] font-semibold rounded-md border border-line bg-field text-fg-3 hover:text-fg hover:border-accent/40 transition-colors">Test</button>
+                </div>
+              </Row>
+              <Row label="Alert Sound" desc="Upload your own audio (mp3, wav, ogg) to play instead of the default beep. Hit Test above to preview.">
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="text-[11px] text-fg-3 truncate max-w-[150px]" title={alertSound || 'Default beep'}>{alertSound ? (alertSound.split(/[\\/]/).pop() || alertSound) : 'Default beep'}</span>
+                  <button
+                    onClick={async () => { const picked = await openDialog({ multiple: false, title: 'Select an alert sound', filters: [{ name: 'Audio', extensions: ['mp3', 'wav', 'ogg', 'm4a', 'flac', 'aac', 'opus'] }] }); if (typeof picked === 'string') setAlertSound(picked); }}
+                    className="le-tap shrink-0 px-2.5 py-1 text-[11px] font-semibold rounded-md border border-line bg-field text-fg-3 hover:text-fg hover:border-accent/40 transition-colors"
+                  >Upload</button>
+                  {alertSound && <button onClick={() => setAlertSound('')} className="le-tap shrink-0 px-2 py-1 text-[11px] rounded-md border border-line text-fg-4 hover:text-fg-2 transition-colors" title="Use the default beep">Reset</button>}
                 </div>
               </Row>
             </Group>

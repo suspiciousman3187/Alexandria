@@ -1,5 +1,6 @@
 import type { InvItem } from './bridge';
-import { ITEM_CATEGORIES, itemCategory, itemCategoryRank, type ItemCategory } from './itemNames';
+import { ITEM_CATEGORIES, itemCategory, itemCategoryRank, itemLevel, type ItemCategory } from './itemNames';
+import { getItemMods } from './gearset/gearsetStats';
 import { getItemTags } from './itemTags';
 
 // Shared item sorting for Inventory and Library so both views offer the exact same options.
@@ -7,12 +8,14 @@ import { getItemTags } from './itemTags';
 // items, so callers pass a getItem accessor. Sorting is display-only -- each element keeps
 // its own slot, so drag/move stays correct regardless of visual order.
 export type SortMode =
-  | 'slot' | 'type' | 'recent' | 'az' | 'za' | 'qty'
-  | 'rare' | 'notrade' | 'noah' | 'unstack' | 'usable' | `cat:${ItemCategory}` | `tag:${string}`;
+  | 'slot' | 'type' | 'recent' | 'az' | 'za' | 'qty' | 'level'
+  | 'rare' | 'notrade' | 'noah' | 'unstack' | 'usable' | `cat:${ItemCategory}` | `tag:${string}`
+  | `stat:${string}` | `statasc:${string}`; // stat value: high->low / low->high. Driven by the Stat filter, not the dropdown.
 
 export const SORTS: { id: SortMode; label: string }[] = [
   { id: 'slot', label: 'Default' },
   { id: 'type', label: 'Type' },
+  { id: 'level', label: 'Equip Level' },
   { id: 'recent', label: 'Recently Moved' },
   { id: 'az', label: 'Name A-Z' },
   { id: 'za', label: 'Name Z-A' },
@@ -24,6 +27,7 @@ export const SORTS: { id: SortMode; label: string }[] = [
   { id: 'usable', label: 'Consumable' },
   ...ITEM_CATEGORIES.filter((c) => c.id !== 'other').map((c) => ({ id: `cat:${c.id}` as SortMode, label: c.label })),
 ];
+
 
 // Per-tag sort options, appended to SORTS by the views (tags are user-defined and change at
 // runtime). Selecting one puts items carrying that tag first, like the category sorts do for
@@ -48,8 +52,23 @@ export function sortBy<T>(arr: T[], getItem: (t: T) => InvItem, mode: SortMode, 
     const has = (id: number) => (assign[id] ?? []).includes(tid);
     return out.sort((a, b) => ((has(getItem(a).id) ? 0 : 1) - (has(getItem(b).id) ? 0 : 1)) || name(a, b));
   }
+  if (mode.startsWith('stat:') || mode.startsWith('statasc:')) {
+    // Order by the chosen stat's value. Items that don't carry it (or before item_mods loads) always go last,
+    // in both directions. Driven by the Stat filter's direction toggle.
+    const asc = mode.startsWith('statasc:');
+    const stat = mode.slice(asc ? 8 : 5);
+    const val = (t: T) => getItemMods(getItem(t).id)?.[stat];
+    return out.sort((a, b) => {
+      const va = val(a), vb = val(b);
+      if (va == null && vb == null) return name(a, b);
+      if (va == null) return 1;
+      if (vb == null) return -1;
+      return (asc ? va - vb : vb - va) || name(a, b);
+    });
+  }
   switch (mode) {
     case 'type': return out.sort((a, b) => itemCategoryRank(getItem(a).id) - itemCategoryRank(getItem(b).id) || name(a, b));
+    case 'level': return out.sort((a, b) => (itemLevel(getItem(b).id) - itemLevel(getItem(a).id)) || name(a, b));
     case 'recent': return out.sort((a, b) => (movedAt?.(b) ?? 0) - (movedAt?.(a) ?? 0));
     case 'az': return out.sort(name);
     case 'za': return out.sort((a, b) => name(b, a));

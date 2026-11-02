@@ -9,7 +9,8 @@ import { AH_CATEGORY_TREE, AH_CATEGORY_TOP } from './ahCategories';
 import { Segmented, Select, Button } from './ui';
 import { setTip, clearTip, suppressTip, HoverTip } from './hoverTip';
 import { logicalRect, logicalViewport } from './uiZoom';
-import { useItemTags, createTag, renameTag, recolorTag, deleteTag, reorderTags, bulkSetTag, countForTag, TAG_COLORS, type TagDef } from './itemTags';
+import { useItemTags, createTag, renameTag, recolorTag, deleteTag, reorderTags, bulkSetTag, setPieceTag, pieceTagIdsOf, countForTag, TAG_COLORS, type TagDef } from './itemTags';
+import { augSig, hasAug } from './augSig';
 import { exportTags } from './tagShare';
 import TagImportModal from './TagImportModal';
 import { TEMPORARY_BAG } from './bagConstants';
@@ -108,6 +109,7 @@ export default function TagBuilderView() {
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
   const [box, setBox] = useState<Box | null>(null);
   const [itemDrag, setItemDrag] = useState<{ x: number; y: number; count: number; over: string | null } | null>(null);
+  const [augPop, setAugPop] = useState<{ id: number; rect: DOMRect } | null>(null); // open "augmented copies" popover for one item
   const [tipDismissed, setTipDismissed] = useSticky<boolean>('tagging.selectTip', false);
   const [dragId, setDragId] = useState<string | null>(null);
   const [over, setOver] = useState<{ id: string; pos: 'before' | 'after' } | null>(null);
@@ -164,6 +166,22 @@ export default function TagBuilderView() {
     return m;
   }, [known]);
   const myItems = useMemo(() => [...ownedMeta.entries()].map(([id, v]) => ({ id, n: v.n })).sort((a, b) => a.n.localeCompare(b.n)), [ownedMeta]);
+  // Distinct AUGMENTED copies per owned item id, so a tile can drill into individual pieces (e.g. only
+  // the snapshot Taeon) and tag them to the exact-piece dimension, not every same-name copy. Keyed by
+  // augment signature; un-augmented items never appear here.
+  const augCopiesById = useMemo(() => {
+    const m = new Map<number, Map<string, { aug: string[]; count: number }>>();
+    for (const c of known) for (const b of c.inv ?? []) {
+      if (b.id === TEMPORARY_BAG) continue;
+      for (const it of b.items) {
+        if (!hasAug(it.aug)) continue;
+        const sig = augSig(it.aug);
+        let g = m.get(it.id); if (!g) { g = new Map(); m.set(it.id, g); }
+        const e = g.get(sig); if (e) e.count += 1; else g.set(sig, { aug: it.aug as string[], count: 1 });
+      }
+    }
+    return m;
+  }, [known]);
   const nameById = useMemo(() => { const m = new Map<number, string>(); for (const it of db) if (!m.has(it.id)) m.set(it.id, it.n); for (const [id, v] of ownedMeta) if (!m.has(id)) m.set(id, v.n); return m; }, [db, ownedMeta]);
   const catOptions = useMemo(() => ['All', ...AH_CATEGORY_TREE.map((g) => g.top)], []);
   const untaggedCount = useMemo(() => myItems.reduce((n, it) => n + (assign[it.id]?.length ? 0 : 1), 0), [myItems, assign]);
@@ -367,6 +385,12 @@ export default function TagBuilderView() {
                   onMouseLeave={clearTip}
                   className={`relative w-9 h-9 rounded bg-field grid place-items-center overflow-hidden select-none transition-shadow ${selected ? 'ring-2 ring-accent z-[1] cursor-grab' : 'cursor-pointer hover:ring-1 hover:ring-line-2'}`}>
                   <IconInner id={r.id} size={34} name={r.n} assets={assets} bmpHas={iconSet.has(r.id)} />
+                  {augCopiesById.has(r.id) && (
+                    <button data-augbadge onPointerDown={(e) => e.stopPropagation()}
+                      onClick={(e) => { e.stopPropagation(); clearTip(); setAugPop({ id: r.id, rect: (e.currentTarget.closest('[data-tile]') as HTMLElement).getBoundingClientRect() }); }}
+                      title="Tag individual augmented pieces" aria-label="Tag individual augmented pieces"
+                      className="absolute top-0 left-0 px-0.5 leading-none text-[8px] font-bold rounded-br bg-accent/85 text-on-accent hover:bg-accent transition-colors">A</button>
+                  )}
                   {ids.length > 0 && (
                     <div className="absolute bottom-0 right-0 flex gap-px p-[1px] bg-black/40 rounded-tl pointer-events-none">
                       {ids.slice(0, 4).map((tid) => { const t = tagById.get(tid); return t ? <span key={tid} className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: t.color }} /> : null; })}
@@ -393,6 +417,47 @@ export default function TagBuilderView() {
         </div>,
         document.body,
       )}
+
+      {augPop && (() => {
+        // Per-copy tagging popover: each distinct augment set on this owned item, each taggable to the
+        // exact-piece dimension (setPieceTag) so a pull preset can target only these pieces.
+        const copies = [...(augCopiesById.get(augPop.id)?.entries() ?? [])];
+        const nm = nameById.get(augPop.id) ?? `#${augPop.id}`;
+        const left = Math.max(8, Math.min(augPop.rect.left, window.innerWidth - 332));
+        const top = Math.max(8, Math.min(augPop.rect.bottom + 4, window.innerHeight - 48));
+        return createPortal(
+          <>
+            <div className="fixed inset-0 z-[110]" onPointerDown={() => setAugPop(null)} />
+            <div className="fixed z-[111] w-[320px] max-h-[60vh] overflow-y-auto rounded-lg border border-line-2 bg-popover shadow-2xl p-2" style={{ left, top }}>
+              <div className="flex items-center gap-2 px-1 pb-1.5 mb-1 border-b border-line">
+                <div className="w-6 h-6 rounded bg-field grid place-items-center overflow-hidden shrink-0"><IconInner id={augPop.id} size={24} name={nm} assets={assets} bmpHas={iconSet.has(augPop.id)} /></div>
+                <div className="min-w-0"><div className="text-[12px] font-bold text-fg truncate">{nm}</div><div className="text-[9px] uppercase tracking-wide text-fg-4">{copies.length} augmented piece{copies.length === 1 ? '' : 's'}</div></div>
+                <button onClick={() => setAugPop(null)} aria-label="Close" className="ml-auto shrink-0 w-5 h-5 grid place-items-center rounded text-fg-4 hover:text-fg hover:bg-field transition-colors">
+                  <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                </button>
+              </div>
+              {tags.length === 0 ? <div className="text-[11px] text-fg-4 px-1 py-2">Create a tag first, then tag individual pieces here.</div> : copies.map(([sig, info]) => (
+                <div key={sig} className="rounded-md border border-line bg-surface/60 p-1.5 mb-1.5 last:mb-0">
+                  <div className="text-[10px] text-fg-3 leading-snug mb-1">{info.aug.length ? info.aug.join(', ') : 'No augments'}{info.count > 1 ? <span className="text-fg-4"> · ×{info.count}</span> : null}</div>
+                  <div className="flex flex-wrap gap-1">
+                    {tags.map((t) => {
+                      const on = pieceTagIdsOf({ id: augPop.id, aug: info.aug }).includes(t.id);
+                      return (
+                        <button key={t.id} onClick={() => setPieceTag({ id: augPop.id, aug: info.aug }, t.id, !on)} title={on ? `Remove ${t.name}` : `Tag this piece as ${t.name}`}
+                          className="px-2 py-0.5 rounded text-[10px] border font-semibold flex items-center gap-1 transition-colors"
+                          style={on ? { backgroundColor: `${t.color}26`, color: t.color, borderColor: `${t.color}66` } : { color: t.color, borderColor: 'var(--color-line)' }}>
+                          <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ backgroundColor: t.color }} />{t.name}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>,
+          document.body,
+        );
+      })()}
 
       {confirmDel && (() => {
         const t = tagById.get(confirmDel);

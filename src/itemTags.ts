@@ -1,13 +1,23 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useSyncExternalStore } from 'react';
 import { appDataPath, inTauri } from './bridge';
+import { pieceKey } from './augSig';
 
 // Item classification shared across all your characters. A tag says what an item
 // IS ("Consumables", "Omen", "Beastman Seals"); an item can carry many tags.
 // Routing rules (tag -> bag) layer on top and reuse the storage-preset
 // precedence. One shared file, keyed by item id, so every character sees the same tags.
+//
+// `assign` is the name-level dimension: itemId -> tags, applying to EVERY physical copy of that id.
+// `assignAug` is the exact-piece dimension: "<id>#<augSig>" -> tags, applying only to the one
+// augmented copy whose augments match (e.g. tag only your 5 snapshot Taeon pieces, not every Taeon
+// Gloves). It is optional and purely additive -- an item's effective tags are the UNION of both, so
+// old tag files with no `assignAug` behave exactly as before.
 export type TagDef = { id: string; name: string; color: string };
-export type TagStore = { tags: TagDef[]; assign: Record<number, string[]> };
+export type TagStore = { tags: TagDef[]; assign: Record<number, string[]>; assignAug?: Record<string, string[]> };
+
+// A physical item copy, as far as tag resolution cares: its id plus its augment list.
+export type Taggable = { id: number; aug?: string[] };
 
 export const TAG_COLORS = ['#f87171', '#fb923c', '#facc15', '#4ade80', '#2dd4bf', '#60a5fa', '#a78bfa', '#f472b6', '#a3e635', '#94a3b8'];
 
@@ -36,6 +46,21 @@ function normalize(v: unknown): TagStore {
       const arr = Array.isArray(a[k]) ? (a[k] as unknown[]).filter((x): x is string => typeof x === 'string' && valid.has(x)) : [];
       if (arr.length) out.assign[id] = arr;
     }
+  }
+  // Exact-piece assignments: keys look like "12345#aug a|aug b". Keep only well-formed composite keys
+  // (numeric id + '#' + non-empty signature) pointing at tags the file defines.
+  const aa = (v as { assignAug?: unknown }).assignAug;
+  if (aa && typeof aa === 'object') {
+    const m = aa as Record<string, unknown>;
+    const dst: Record<string, string[]> = {};
+    for (const k in m) {
+      const hash = k.indexOf('#');
+      if (hash <= 0 || hash === k.length - 1) continue;
+      if (!Number.isInteger(Number(k.slice(0, hash)))) continue;
+      const arr = Array.isArray(m[k]) ? (m[k] as unknown[]).filter((x): x is string => typeof x === 'string' && valid.has(x)) : [];
+      if (arr.length) dst[k] = arr;
+    }
+    if (Object.keys(dst).length) out.assignAug = dst;
   }
   return out;
 }
@@ -120,7 +145,18 @@ export function mergeTagStore(incoming: TagStore): { tagsAdded: number; itemsCha
     for (const tid of mapped) cur.add(tid);
     if (cur.size !== before) { assign[id] = [...cur]; itemsChanged++; }
   }
-  commit({ tags, assign });
+  // Exact-piece assignments carry over the same way: the "<id>#<augSig>" key is portable across
+  // accounts (same item + same augments), so a friend's exact-piece tags land on your matching copy.
+  const assignAug: Record<string, string[]> = { ...store.assignAug };
+  for (const k in incoming.assignAug) {
+    const mapped = incoming.assignAug[k].map((tid) => idMap.get(tid)).filter((x): x is string => !!x);
+    if (!mapped.length) continue;
+    const cur = new Set(assignAug[k] ?? []);
+    const before = cur.size;
+    for (const tid of mapped) cur.add(tid);
+    if (cur.size !== before) { assignAug[k] = [...cur]; itemsChanged++; }
+  }
+  commit({ tags, assign, ...(Object.keys(assignAug).length ? { assignAug } : {}) });
   return { tagsAdded, itemsChanged };
 }
 
@@ -134,7 +170,9 @@ export function recolorTag(id: string, color: string) {
 export function deleteTag(id: string) {
   const assign: Record<number, string[]> = {};
   for (const k in store.assign) { const left = store.assign[k].filter((x) => x !== id); if (left.length) assign[Number(k)] = left; }
-  commit({ tags: store.tags.filter((t) => t.id !== id), assign });
+  const assignAug: Record<string, string[]> = {};
+  for (const k in store.assignAug) { const left = store.assignAug[k].filter((x) => x !== id); if (left.length) assignAug[k] = left; }
+  commit({ tags: store.tags.filter((t) => t.id !== id), assign, ...(Object.keys(assignAug).length ? { assignAug } : {}) });
 }
 export function reorderTags(ids: string[]) {
   const byId = new Map(store.tags.map((t) => [t.id, t]));
@@ -168,11 +206,63 @@ export function bulkSetTag(itemIds: number[], tagId: string, on: boolean) {
 }
 
 export function tagIdsOf(itemId: number): string[] { return store.assign[itemId] ?? []; }
+
+// Exact-piece reads/writes. The key is pieceKey(id, aug); exact tagging is only meaningful for an
+// augmented copy (an un-augmented item has an empty signature -> pieceKey falls back to the plain id,
+// which is the name-level dimension, so we never write an aug entry for one).
+export function pieceTagIdsOf(it: Taggable): string[] {
+  const key = pieceKey(it.id, it.aug);
+  return key.includes('#') ? (store.assignAug?.[key] ?? []) : [];
+}
+
+// Every tag that applies to a physical copy: the UNION of its id's name-level tags and its own
+// exact-piece tags. This is the single source every consumer (pull matcher, filters) should use.
+export function effectiveTagsOf(it: Taggable): string[] {
+  const base = store.assign[it.id] ?? [];
+  const key = pieceKey(it.id, it.aug);
+  const piece = key.includes('#') ? (store.assignAug?.[key] ?? []) : [];
+  if (!piece.length) return base;
+  if (!base.length) return piece;
+  return [...new Set([...base, ...piece])];
+}
+
+export function setPieceTag(it: Taggable, tagId: string, on: boolean) {
+  const key = pieceKey(it.id, it.aug);
+  if (!key.includes('#')) { setItemTag(it.id, tagId, on); return; } // no augments -> plain id tag
+  const cur = store.assignAug?.[key] ?? [];
+  if (on === cur.includes(tagId)) return;
+  const next = on ? [...cur, tagId] : cur.filter((x) => x !== tagId);
+  const assignAug = { ...store.assignAug };
+  if (next.length) assignAug[key] = next; else delete assignAug[key];
+  commit({ ...store, assignAug });
+}
+
+// Apply/remove one tag across many exact pieces in a single write.
+export function bulkSetPieceTag(pieces: Taggable[], tagId: string, on: boolean) {
+  const assignAug = { ...store.assignAug };
+  const plainIds: number[] = [];
+  let changed = false;
+  for (const it of pieces) {
+    const key = pieceKey(it.id, it.aug);
+    if (!key.includes('#')) { plainIds.push(it.id); continue; }
+    const cur = assignAug[key] ?? [];
+    if (on === cur.includes(tagId)) continue;
+    const next = on ? [...cur, tagId] : cur.filter((x) => x !== tagId);
+    if (next.length) assignAug[key] = next; else delete assignAug[key];
+    changed = true;
+  }
+  if (changed) commit({ ...store, assignAug });
+  if (plainIds.length) bulkSetTag(plainIds, tagId, on);
+}
+
 export function itemsWithTag(id: string): number[] {
   const out: number[] = [];
   for (const k in store.assign) if (store.assign[k].includes(id)) out.push(Number(k));
   return out;
 }
 export function countForTag(id: string): number {
-  let n = 0; for (const k in store.assign) if (store.assign[k].includes(id)) n++; return n;
+  let n = 0;
+  for (const k in store.assign) if (store.assign[k].includes(id)) n++;
+  for (const k in store.assignAug) if (store.assignAug[k].includes(id)) n++;
+  return n;
 }

@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from 'react';
-import { inTauri, type InvBag } from './bridge';
+import { inTauri, type InvBag, type Slip } from './bridge';
 import { MOG_ONLY_BAGS } from './bagConstants';
 
 // The recipe DB is generated from the bg-wiki reforge tables (see scratchpad/parse_all.js) and shipped
@@ -92,7 +92,21 @@ export function reforgeBagOf(inv: InvBag[] | undefined, id: number | null): stri
   return null;
 }
 
-export type IngredientNeed = { id: number | null; name: string; have: number; inInv: number; need: number; currency?: boolean; stored?: number; mog?: number };
+export type IngredientNeed = { id: number | null; name: string; have: number; inInv: number; need: number; currency?: boolean; stored?: number; mog?: number; slip?: number };
+
+// How many of an item sit on a Porter Moogle Storage Slip the character can reach from here (ready, or
+// pullable via an auto-fetched slip). A slip the player owns but can't reach (in a Mog House they aren't
+// at) counts as `stranded`, not `pull`. Each stored entry is a single item (slips carry no quantity).
+export function reforgeSlipCount(slips: Slip[] | undefined, id: number | null): { pull: number; stranded: number } {
+  if (id == null || !slips) return { pull: 0, stranded: 0 };
+  let pull = 0, stranded = 0;
+  for (const s of slips) {
+    if (s.owned === false) continue; // holds items for this slip but doesn't own it -> can't retrieve
+    const reachable = s.ready || s.getable;
+    for (const it of s.stored) if (it.id === id) { if (reachable) pull++; else stranded++; }
+  }
+  return { pull, stranded };
+}
 
 // How many of an item sit in Mog storage (Locker/Safe/Storage) -- the bags reforgeCount excludes because
 // they need a Moogle. Lets the UI explain a shortfall the player can't act on here: they own it, but it's in
@@ -107,7 +121,7 @@ export function reforgeMogCount(inv: InvBag[] | undefined, id: number | null): n
 // Rem's Tale Ch.1-10 occupy item ids 4064-4073, so a chapter's item id maps 1:1 to its number.
 export const REM_CH_LO = 4064, REM_CH_HI = 4073;
 export const remChapterOf = (id: number | null): number | null => (id != null && id >= REM_CH_LO && id <= REM_CH_HI ? id - (REM_CH_LO - 1) : null);
-export type PathStatus = ReforgePath & { inputCount: number; inputInInv: number; inputBag: string | null; hasInput: boolean; needs: IngredientNeed[]; partNeeds?: IngredientNeed[][]; ingredientsOk: boolean; doable: boolean; needsPull: boolean; multiPart: boolean };
+export type PathStatus = ReforgePath & { inputCount: number; inputInInv: number; inputBag: string | null; hasInput: boolean; onSlip: boolean; inputSlipPull: number; inputSlipStranded: number; needs: IngredientNeed[]; partNeeds?: IngredientNeed[][]; ingredientsOk: boolean; doable: boolean; needsPull: boolean; multiPart: boolean };
 export type Opportunity = { key: string; type: ArmorType; job: string; slot: string; step: ReforgeStep; paths: PathStatus[]; doable: boolean; owned: boolean };
 
 function currencyValue(cur: ReforgeCurrency | undefined, name: string): number {
@@ -124,19 +138,20 @@ export function remStoredCount(cur: ReforgeCurrency | undefined, id: number | nu
 
 // Resolve one recipe ingredient into a have/need readout: currency reads the currency page; items read
 // the bags (plus Monisette-stored Rem's Tale chapters, which the reforge auto-retrieves).
-function needOf(inv: InvBag[] | undefined, cur: ReforgeCurrency | undefined, i: ReforgeIngredient): IngredientNeed {
+function needOf(inv: InvBag[] | undefined, cur: ReforgeCurrency | undefined, i: ReforgeIngredient, slips?: Slip[]): IngredientNeed {
   if (i.currency) { const v = currencyValue(cur, i.name); return { id: null, name: i.name, have: v, inInv: v, need: i.qty, currency: true }; }
   const c = reforgeCount(inv, i.id);
   const stored = remStoredCount(cur, i.id);
   const mog = reforgeMogCount(inv, i.id);
-  return { id: i.id, name: i.name, have: c.have + stored, inInv: c.inInv, need: i.qty, stored: stored || undefined, mog: mog || undefined };
+  const slip = slips ? reforgeSlipCount(slips, i.id).pull : 0;
+  return { id: i.id, name: i.name, have: c.have + stored, inInv: c.inInv, need: i.qty, stored: stored || undefined, mog: mog || undefined, slip: slip || undefined };
 }
 
 // Every upgrade step in the DB with a per-path have/need readout (across all reachable bags), tagged
 // with `owned` (player holds an input for a path) and `doable` (owns input + has the mats). The context-
 // aware "Ready" view filters to owned; the "All" catalog view shows everything. needsPull = doable but
 // the input or an ingredient sits in another bag and must be moved to inventory first.
-export function buildOpportunities(db: ReforgeDB, inv: InvBag[] | undefined, cur?: ReforgeCurrency): Opportunity[] {
+export function buildOpportunities(db: ReforgeDB, inv: InvBag[] | undefined, cur?: ReforgeCurrency, slips?: Slip[]): Opportunity[] {
   const out: Opportunity[] = [];
   for (const type of ARMOR_TYPES) {
     const jobs = db[type];
@@ -150,21 +165,23 @@ export function buildOpportunities(db: ReforgeDB, inv: InvBag[] | undefined, cur
           const step = sd.steps[si];
           const paths: PathStatus[] = step.paths.map((p) => {
             const ic = reforgeCount(inv, p.input.id);
-            const needs: IngredientNeed[] = p.ingredients.map((i) => needOf(inv, cur, i));
+            const isl = reforgeSlipCount(slips, p.input.id);
+            const needs: IngredientNeed[] = p.ingredients.map((i) => needOf(inv, cur, i, slips));
             // For a multi-day reforge, the per-day requirement lists (each with its own Escha Beads
             // amount) so the UI can show Day 1 / Day 2 groups instead of one crowded row.
             const partNeeds: IngredientNeed[][] | undefined = p.parts?.map((part) => {
-              const arr = part.ingredients.map((i) => needOf(inv, cur, i));
+              const arr = part.ingredients.map((i) => needOf(inv, cur, i, slips));
               for (const cc of part.currency ?? []) { const v = currencyValue(cur, cc.name); arr.push({ id: null, name: cc.name, have: v, inInv: v, need: cc.qty, currency: true }); }
               return arr;
             });
             const ingredientsOk = needs.every((n) => n.have >= n.need);  // `have` already includes Monisette-stored chapters
-            const hasInput = ic.have > 0;
+            const hasInput = ic.have > 0; // in a reachable BAG -> directly reforgeable (drives doable)
+            const onSlip = isl.pull + isl.stranded > 0; // owned on a Porter slip (must be pulled first; not doable here)
             const doable = hasInput && ingredientsOk;
             const needsPull = doable && (ic.inInv < 1 || needs.some((n) => n.inInv < n.need));
-            return { ...p, inputCount: ic.have, inputInInv: ic.inInv, inputBag: reforgeBagOf(inv, p.input.id), hasInput, needs, partNeeds, ingredientsOk, doable, needsPull, multiPart: !!(p.parts && p.parts.length > 1) };
+            return { ...p, inputCount: ic.have, inputInInv: ic.inInv, inputBag: reforgeBagOf(inv, p.input.id), hasInput, onSlip, inputSlipPull: isl.pull, inputSlipStranded: isl.stranded, needs, partNeeds, ingredientsOk, doable, needsPull, multiPart: !!(p.parts && p.parts.length > 1) };
           });
-          out.push({ key: `${type}.${job}.${slot}.${si}`, type, job, slot, step, paths, owned: paths.some((p) => p.hasInput), doable: paths.some((p) => p.doable) });
+          out.push({ key: `${type}.${job}.${slot}.${si}`, type, job, slot, step, paths, owned: paths.some((p) => p.hasInput || p.onSlip), doable: paths.some((p) => p.doable) });
         }
       }
     }

@@ -1,6 +1,6 @@
 import { useMemo, useState, useEffect, useLayoutEffect, useRef, useContext, createContext, useSyncExternalStore, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { useKnownCharacters, useAvailableIcons, reforgeStart, reforgeStop, reforgeStep, reforgeRemGet, reforgePause, reforgeResume, ahBuy, useAhCatalog, type KnownChar, type ReforgeState, type ReforgeStepPlan } from './bridge';
+import { useKnownCharacters, useAvailableIcons, reforgeStart, reforgeStop, reforgeStep, reforgeRemGet, reforgePause, reforgeResume, ahBuy, useAhCatalog, slipRetrieve, type KnownChar, type ReforgeState, type ReforgeStepPlan } from './bridge';
 import { IconInner } from './atlasIcon';
 import { logicalRect, logicalViewport } from './uiZoom';
 import { useItemHover, type HoverMeta } from './ItemTooltip';
@@ -124,6 +124,9 @@ type ReforgeBuy = {
   remNear: boolean; remStored: (chapter: number) => number; remGet: (chapter: number, count: number) => void;
   // Is the active character standing next to this reforge NPC? Pieces can only be queued at their own NPC.
   nearNpc: (npc: string) => boolean;
+  // Porter Moogle proximity + a one-item retrieve, for pulling a slip-stored reforge piece into a bag
+  // (slips are included only when the user turns on the "Include Storage Slips" toggle).
+  porterNear: boolean; slipPull: (id: number | null) => void;
 };
 const ReforgeBuyCtx = createContext<ReforgeBuy | null>(null);
 
@@ -319,8 +322,9 @@ function IngChip({ need, assets, iconSet }: { need: IngredientNeed } & IconProps
   // You already OWN this piece somewhere you can't reach from HERE -- Mog storage (needs a Moogle) or a Monisette
   // chapter while not near her. Flag the chip orange with a lock so a plain red "short" isn't misleading. This is
   // independent of buying: at an AH the Buy button stays enabled alongside it (buy vs. trek to storage yourself).
-  const strandedInStorage = short && !canRetrieve && ((need.mog ?? 0) > 0 || remStoredHere);
-  const strandedTip = remStoredHere ? 'Stored in Monisette but not near enough to retrieve!' : 'Item exists but is in unreachable bags.';
+  const onSlipMat = short && (need.slip ?? 0) > 0;
+  const strandedInStorage = short && !canRetrieve && ((need.mog ?? 0) > 0 || onSlipMat || remStoredHere);
+  const strandedTip = remStoredHere ? 'Stored in Monisette but not near enough to retrieve!' : onSlipMat ? 'On a Storage Slip. Retrieve it at the Porter Moogle first.' : 'Item exists but is in unreachable bags.';
   // Gallimaufry (currency) can't be pulled, so it only reads as have/short (amber), never yellow.
   const color = need.currency ? (av === 'short' ? BAD : '#e0b24a') : strandedInStorage ? STORE : availColor(av);
   return (
@@ -391,6 +395,23 @@ function AddButton({ o, path, queued, inProgress, accent, ink, onAdd, qAvail }: 
       </button>
     );
   }
+  // Input is only on a Porter Storage Slip (not in a bag yet, and not produced by an earlier queued step):
+  // the reforge executor can't fetch from a slip, and the Porter is a different NPC than the reforge NPC,
+  // so offer a Pull button to retrieve it into your bags first. Gated on standing at the Porter.
+  const onSlipOnly = path.onSlip && !path.hasInput && qAvail(path.input.id) < 1;
+  if (onSlipOnly) {
+    const canPull = path.inputSlipPull > 0 && !!buy?.porterNear;
+    const pblock = !buy?.porterNear ? 'Stand next to the Porter Moogle to pull this piece off its slip'
+      : path.inputSlipPull < 1 ? 'The slip holding this is in your Mog House; open it there first'
+      : null;
+    return (
+      <button onClick={() => canPull && buy?.slipPull(path.input.id)} aria-disabled={!canPull} aria-label="Pull from slip"
+        title={canPull ? 'Pull this piece off its Storage Slip into your bags, then reforge it at the NPC' : pblock ?? ''}
+        className={`shrink-0 grid place-items-center w-10 h-10 rounded-lg border-2 transition-colors ${canPull ? 'border-sky-400 text-sky-400 hover:bg-sky-400/15' : 'border-[#f0766f] text-[#f0766f] cursor-not-allowed'}`}>
+        <svg viewBox="0 0 24 24" className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth={2.2} strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v10m0 0 4-4m-4 4-4-4" /><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" /></svg>
+      </button>
+    );
+  }
   // Green outline = addable; red outline = blocked (the reason rides on the tooltip, not inline text, to
   // keep the row uncramped). aria-disabled (not `disabled`) so the browser still shows the title on hover.
   return (
@@ -404,13 +425,14 @@ function AddButton({ o, path, queued, inProgress, accent, ink, onAdd, qAvail }: 
 
 // ---- Concept 2: expandable list row (Ready view) ----
 function ListRow({ o, accent, ink, queued, inProgress, onAdd, qAvail, open, onToggle, ...ic }: { o: Opportunity; accent: string; ink: string; queued: boolean; inProgress?: boolean; onAdd: (o: Opportunity, p: PathStatus) => void; qAvail: (id: number | null) => number; open: boolean; onToggle: () => void } & IconProps) {
-  const owned = o.paths.filter((p) => p.hasInput);
+  const owned = o.paths.filter((p) => p.hasInput || p.onSlip);
   const [label, setLabel] = useState<string>(() => pickBest(o.paths)?.label ?? owned[0]?.label ?? '');
   const path = owned.find((p) => p.label === label) ?? pickBest(o.paths);
   if (!path) return null;
   const st = statusOf(o, path);
   const chained = !path.hasInput && qAvail(path.input.id) >= 1;
-  const inputCol = chained ? CHAIN : availColor(needAvail(path.inputInInv, path.inputCount, 1));
+  const slipOnly = !path.hasInput && !chained && path.onSlip; // owned on a Porter slip, not in a bag yet
+  const inputCol = chained ? CHAIN : slipOnly ? PULL : availColor(needAvail(path.inputInInv, path.inputCount, 1));
   return (
     <div className="rounded-xl border border-line bg-surface overflow-hidden" style={queued || inProgress ? { borderColor: accent } : undefined}>
       <div className="flex items-center gap-2.5 px-3 py-2.5">
@@ -437,7 +459,7 @@ function ListRow({ o, accent, ink, queued, inProgress, onAdd, qAvail, open, onTo
             <span className="text-[9px] font-extrabold uppercase tracking-wider text-fg-4">from</span>
             <ItemIcon id={path.input.id} name={path.input.name} size={28} ring={inputCol} hover={hoverOf(path.input)} {...ic} />
             <span className="text-[12.5px] text-fg-2 font-medium">{path.input.name}</span>
-            <span className="text-[11px] font-medium" style={{ color: inputCol }}>{chained ? 'from an earlier queued step' : path.inputBag ? `Acquired · ${path.inputBag}` : `have ${path.inputCount}`}</span>
+            <span className="text-[11px] font-medium" style={{ color: inputCol }}>{chained ? 'from an earlier queued step' : path.inputBag ? `Acquired · ${path.inputBag}` : slipOnly ? (path.inputSlipPull > 0 ? 'On a Storage Slip' : 'On a slip in your Mog House') : `have ${path.inputCount}`}</span>
             {owned.length > 1 && (
               <div className="ml-auto flex rounded-lg border border-line overflow-hidden">
                 {owned.map((p) => (
@@ -571,7 +593,11 @@ function PendingAddButton({ o, path, queued, inProgress, onAddPending }: { o: Op
   );
 }
 function BoardRow({ o, accent, ink, queued, inProgress, onAdd, onAddPending, qAvail, ...ic }: { o: Opportunity; accent: string; ink: string; queued: boolean; inProgress?: boolean; onAdd: (o: Opportunity, p: PathStatus) => void; onAddPending: (o: Opportunity, p: PathStatus, resumeAfter?: number, waiting?: boolean) => void; qAvail: (id: number | null) => number } & IconProps) {
-  const path = pickBest(o.paths);
+  // A step can accept more than one input tier (e.g. an Empyrean base->ilvl109 reforge takes the OLD
+  // +1 OR +2 piece). pickBest shows the highest tier, but the user may want to feed the other one, so a
+  // step with multiple inputs gets a selector to switch which source piece is shown + queued.
+  const [label, setLabel] = useState<string>(() => pickBest(o.paths)?.label ?? o.paths[0]?.label ?? '');
+  const path = o.paths.find((p) => p.label === label) ?? pickBest(o.paths);
   if (!path) return null;
   const st = statusOf(o, path);
   const chained = !path.hasInput && qAvail(path.input.id) >= 1;
@@ -582,6 +608,15 @@ function BoardRow({ o, accent, ink, queued, inProgress, onAdd, onAddPending, qAv
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2 min-w-0">
           <span className="min-w-0 truncate text-[15px] font-semibold leading-tight" style={{ color: o.owned ? accent : 'var(--color-fg-2)' }}>{o.step.output.name}</span>
+          {o.paths.length > 1 && (
+            <span className="shrink-0 inline-flex rounded-md border border-line overflow-hidden" title="Choose which source piece to upgrade from">
+              {o.paths.map((p) => (
+                <button key={p.label} onClick={() => setLabel(p.label)} title={`Upgrade from ${p.input.name}`}
+                  className={`px-2 py-0.5 text-[10px] font-bold transition-colors ${p.label === label ? '' : 'text-fg-3 hover:text-fg-2 bg-field'} ${p.hasInput ? '' : 'opacity-60'}`}
+                  style={p.label === label ? { background: accent, color: ink } : undefined}>{p.label}</button>
+              ))}
+            </span>
+          )}
           {o.step.npc && <span className="shrink-0 flex items-center gap-1 text-[10px] font-semibold" style={{ color: npcColor(o.step.npc) }}><span className="w-1.5 h-1.5 rounded-full" style={{ background: npcColor(o.step.npc) }} />{npcName(o.step.npc)}</span>}
           {path.multiPart && <span title="Two-day reforge: two trades on two Vana'diel days" className="shrink-0 text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300">2-Day</span>}
         </div>
@@ -729,6 +764,7 @@ export default function ReforgeView() {
 
   const [tab, setTab] = useStickyPersisted<ArmorType>('reforge.tab', 'artifact');
   const [mode, setMode] = useStickyPersisted<'ready' | 'all'>('reforge.mode', 'ready');
+  const [inclSlips, setInclSlips] = useStickyPersisted('reforge.includeSlips', false); // also treat Porter-slip gear as reforge candidates
   const [qExpanded, setQExpanded] = useStickyPersisted('reforge.queue.expanded', false);
   const [jobFilter, setJobFilter] = useState('');
   const [slotFilter, setSlotFilter] = useState('');
@@ -738,7 +774,7 @@ export default function ReforgeView() {
   const [open, setOpen] = useState<Set<string>>(new Set());
   const accent = TYPE_COLOR[tab], ink = TYPE_INK[tab];
 
-  const opps = useMemo(() => buildOpportunities(db, inv, active?.cur), [db, inv, active?.cur]);
+  const opps = useMemo(() => buildOpportunities(db, inv, active?.cur, inclSlips ? active?.slips : undefined), [db, inv, active?.cur, inclSlips, active?.slips]);
   const activeReforges = useActiveReforges();
   const names = useMemo(() => reforgeNameMap(db), [db]);
   const running = active?.reforge?.active ?? false;
@@ -802,7 +838,8 @@ export default function ReforgeView() {
     canAh: !!active?.inTown,
     remNear, remStored, remGet: (ch: number, count: number) => { if (conn != null) reforgeRemGet(conn, ch, count); },
     nearNpc: (npc: string) => nearSet.has(npc) || storeNearSet.has(NPC_LABEL[npc] ?? npc),
-  }), [world, buyer, values, ahable, remNear, remStored, conn, nearSet, storeNearSet, active?.inTown]);
+    porterNear: !!active?.porterNear, slipPull: (id) => { if (conn != null && id != null) slipRetrieve(conn, [id]); },
+  }), [world, buyer, values, ahable, remNear, remStored, conn, nearSet, storeNearSet, active?.inTown, active?.porterNear]);
 
   const queuedKeys = useMemo(() => new Set(queue.map((q) => q.key)), [queue]);
   // Outputs the RUNNING reforge is already making: its current step plus every later one (anything not yet
@@ -887,6 +924,12 @@ export default function ReforgeView() {
           <div className="flex-1 min-w-0"><Select value={jobFilter || 'All Jobs'} onChange={(v) => setJobFilter(v === 'All Jobs' ? '' : v)} options={['All Jobs', ...jobs]} full searchable /></div>
           <div className="flex-1 min-w-0"><Select value={slotFilter ? SLOT_LABEL[slotFilter] : 'All Slots'} onChange={(v) => setSlotFilter(v === 'All Slots' ? '' : v.toLowerCase())} options={['All Slots', ...SLOT_ORDER.map((s) => SLOT_LABEL[s])]} full /></div>
           <SearchInput value={search} onChange={setSearch} wrap="flex-[1.4] min-w-0" placeholder="Search pieces…" className="bg-field border border-line rounded-md px-3 py-1.5 text-xs text-fg-2 placeholder-fg-4 outline-none focus:border-accent/50 transition-colors" />
+          <button onClick={() => setInclSlips(!inclSlips)}
+            title={inclSlips ? 'Including Porter Storage Slip gear as reforge candidates (pull a piece in before reforging it)' : 'Also check your Porter Storage Slips for reforgeable gear'}
+            className={`shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[11.5px] font-bold border transition-colors ${inclSlips ? 'border-sky-400 bg-sky-400/15 text-sky-300' : 'border-line bg-field text-fg-4 hover:text-fg-2'}`}>
+            <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v10m0 0 4-4m-4 4-4-4" /><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" /></svg>
+            Slips
+          </button>
         </div>
       </div>
 

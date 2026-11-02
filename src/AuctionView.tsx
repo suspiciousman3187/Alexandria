@@ -3,7 +3,7 @@ import {
   useKnownCharacters, useAvailableIcons, useAhMessages, useAhCatalog, requestAhCatalog, requestIcons, useItemDescription,
   ahMenu, ahSlots, ahBuy, ahSell, addPendingListing, ahClearSlot, ahCancel, ffxiahSid, FFXIAH_SID, openExternal,
   nomadReachable, NOMAD_BAGS, washCap,
-  type KnownChar, type AhCatItem, type InvItem,
+  type KnownChar, type AhCatItem, type InvItem, type AhSlot,
 } from './bridge';
 import { useSettings, setSettings } from './settings';
 import { ALWAYS_BAGS } from './bagConstants';
@@ -119,8 +119,11 @@ export default function AuctionView() {
   const effTab = !hasChar && tab === 'slots' ? 'browse' : tab;
 
   const doRefresh = () => {
-    if (effTab === 'slots') { if (conn != null) ahMenu(conn); }
-    else refreshVisibleRows();
+    if (effTab === 'slots') {
+      const atAh = online.filter((k) => k.conn != null && (k.atah ?? k.ah?.atah));
+      if (atAh.length) for (const k of atAh) ahMenu(k.conn!);
+      else if (conn != null) ahMenu(conn);
+    } else refreshVisibleRows();
     setSpin(true);
     window.setTimeout(() => setSpin(false), 700);
   };
@@ -164,13 +167,15 @@ export default function AuctionView() {
             />
           </div>
           {ah && ah.qn > 0 && <span className="shrink-0 text-[10px] text-fg-4 tabular-nums">{ah.qn} queued</span>}
-          <button
-            onClick={doRefresh}
-            title={effTab === 'slots' ? 'Refresh listings' : 'Refresh prices'}
-            className="shrink-0 grid place-items-center w-9 h-9 rounded-md border border-line bg-field text-fg-3 hover:text-fg-2 transition-colors"
-          >
-            <svg viewBox="0 0 24 24" className={`w-4 h-4 ${spin ? 'animate-spin' : ''}`} fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36" /><path d="M21 3v6h-6" /></svg>
-          </button>
+          {effTab !== 'slots' && (
+            <button
+              onClick={doRefresh}
+              title="Refresh prices"
+              className="shrink-0 grid place-items-center w-9 h-9 rounded-md border border-line bg-field text-fg-3 hover:text-fg-2 transition-colors"
+            >
+              <svg viewBox="0 0 24 24" className={`w-4 h-4 ${spin ? 'animate-spin' : ''}`} fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36" /><path d="M21 3v6h-6" /></svg>
+            </button>
+          )}
         </div>
 
         {!target && <SectionTabs value={effTab} onChange={setTab} tabs={hasChar ? [{ id: 'browse', label: 'Browse' }, { id: 'slots', label: 'Listings' }, { id: 'wishlist', label: 'Wishlist' }] : [{ id: 'browse', label: 'Browse' }, { id: 'wishlist', label: 'Wishlist' }]} />}
@@ -427,11 +432,109 @@ function ListItemsModal({ char, freeSlots, conn, server, assets, iconSet, onClos
   );
 }
 
+// Consolidated, read-only view of every character's active auction listings, with a grand total of the
+// gil on sale ("what you have incoming"). Sourced from each box's live ah.slots, so it covers every
+// character that has loaded its auction slots this session. (FFXI's request.)
+function AllListings({ now, iconSet }: { now: number; iconSet: Set<number> }) {
+  const known = useKnownCharacters();
+  const anon = useAnon();
+  const [spin, setSpin] = useState(false);
+  // Every connected character currently standing at an auction house: the ones we can ask for fresh slots.
+  const fetchable = known.filter((c) => c.conn != null && (c.atah ?? c.ah?.atah));
+  const doFetch = () => {
+    for (const c of fetchable) ahMenu(c.conn!);
+    setSpin(true);
+    window.setTimeout(() => setSpin(false), 700);
+  };
+  const groups = useMemo(() => {
+    const out: { name: string; assets?: string; onSale: AhSlot[]; subtotal: number; ahAt?: number }[] = [];
+    for (const c of known) {
+      if (!c.ah?.init) continue;
+      const onSale = (c.ah.slots ?? []).filter((s) => s.st === 'On auction');
+      if (onSale.length === 0) continue;
+      out.push({ name: c.name, assets: c.assets, onSale, subtotal: onSale.reduce((s, x) => s + (x.p || 0), 0), ahAt: c.ahAt });
+    }
+    return out.sort((a, b) => b.subtotal - a.subtotal);
+  }, [known]);
+  const ageLabel = (ms?: number) => {
+    if (!ms) return '';
+    const s = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+    if (s < 90) return 'just now';
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h ago`;
+    return `${Math.floor(h / 24)}d ago`;
+  };
+  const sold = useMemo(() => {
+    let t = 0, n = 0;
+    for (const c of known) if (c.ah?.init) for (const s of c.ah.slots ?? []) if (s.st === 'Sold') { t += s.p || 0; n++; }
+    return { t, n };
+  }, [known]);
+  const anyAh = known.some((c) => c.ah?.init);
+  const total = groups.reduce((s, g) => s + g.subtotal, 0);
+  const count = groups.reduce((s, g) => s + g.onSale.length, 0);
+
+  if (!anyAh) {
+    return <div className="text-center text-[12px] text-fg-4 py-12 px-6 leading-relaxed">No auction data yet. Visit an auction house on a character to load its listings, then they total up here.</div>;
+  }
+  return (
+    <div className="flex flex-col gap-2.5">
+      <div className="rounded-lg border border-accent/30 bg-accent/[0.06] p-3 flex items-center gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="text-[10px] font-bold uppercase tracking-wide text-fg-4">On Sale · Incoming</div>
+          <div className="text-[22px] font-extrabold text-fg tabular-nums leading-tight">{fmtGil(total)}<span className="text-[13px] font-semibold text-fg-3"> gil</span></div>
+          <div className="text-[11px] text-fg-4 mt-0.5">{count} listing{count === 1 ? '' : 's'} across {groups.length} character{groups.length === 1 ? '' : 's'}</div>
+          {sold.n > 0 && <div className="text-[11px] text-emerald-300 mt-1 tabular-nums">+ {fmtGil(sold.t)} gil sold, awaiting pickup ({sold.n})</div>}
+        </div>
+        <button
+          onClick={doFetch}
+          disabled={fetchable.length === 0}
+          title={fetchable.length === 0 ? 'Stand at an auction house on a connected character to fetch listings.' : `Fetch live listings from ${fetchable.length} character${fetchable.length === 1 ? '' : 's'} at an auction house.`}
+          className="le-tap shrink-0 flex items-center gap-2 px-3 py-2 text-[12px] font-semibold rounded-md bg-accent text-on-accent hover:bg-accent-hover disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+        >
+          <svg viewBox="0 0 24 24" className={`w-4 h-4 ${spin ? 'animate-spin' : ''}`} fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36" /><path d="M21 3v6h-6" /></svg>
+          Fetch Listings
+        </button>
+      </div>
+      {groups.length === 0 ? (
+        <div className="text-center text-[12px] text-fg-4 py-8">Nothing on sale right now.</div>
+      ) : groups.map((g) => (
+        <div key={g.name} className="rounded-lg border border-line bg-surface overflow-hidden">
+          <div className="flex items-center gap-2 px-3 py-2 border-b border-line bg-field/40">
+            <span className="text-[12px] font-bold text-fg truncate">{anon(g.name)}</span>
+            {g.ahAt && <span className="text-[10px] text-fg-4 shrink-0">updated {ageLabel(g.ahAt)}</span>}
+            <span className="ml-auto text-[11px] text-fg-4 tabular-nums shrink-0">{g.onSale.length}</span>
+            <span className="text-[12px] font-bold text-fg tabular-nums shrink-0">{fmtGil(g.subtotal)}<span className="text-[10px] text-fg-3"> gil</span></span>
+          </div>
+          <div className="divide-y divide-line">
+            {g.onSale.map((s) => {
+              const remaining = (s.ts + AUCTION_SECS) - now;
+              return (
+                <div key={s.s} className="flex items-center gap-2.5 px-2.5 py-2">
+                  <Icon id={s.id} n={s.n} assets={g.assets} iconSet={iconSet} />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-1.5 min-w-0"><span className="text-[11px] text-fg-3 truncate">{s.n}</span>{s.c > 1 && <span className="shrink-0 text-[10px] font-bold text-fg-2 tabular-nums px-1.5 py-px rounded bg-field border border-line">×{s.c}</span>}</div>
+                    <div className="text-[13px] font-bold text-fg tabular-nums leading-tight">{fmtGil(s.p)}<span className="text-[10px] font-semibold text-fg-3"> gil</span></div>
+                  </div>
+                  <span className={`shrink-0 text-[11px] font-semibold tabular-nums ${timeColor(remaining)}`}>{remaining > 0 ? `${relTime(remaining)} left` : 'ending'}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function ListingsTab({ char, ah, atah, now, assets, iconSet, conn, server }: {
   char?: KnownChar; ah?: KnownChar['ah']; atah: boolean; now: number; assets?: string; iconSet: Set<number>; conn?: number; server?: string;
 }) {
   const [listing, setListing] = useState(false);
   const [confirmUnlist, setConfirmUnlist] = useState(false);
+  const [scope, setScope] = useSticky<'me' | 'all'>('ah.listings.scope', 'me');
+  const settings = useSettings();
   // The slots array can include Empty placeholders, so count actual listings, not length.
   const used = (ah?.slots ?? []).filter((s) => s.st && s.st !== 'Empty').length;
   const free = Math.max(0, 7 - used);
@@ -441,6 +544,11 @@ function ListingsTab({ char, ah, atah, now, assets, iconSet, conn, server }: {
   const unlistAll = () => { if (conn != null) for (const s of onAuction) ahCancel(conn, s.s); setConfirmUnlist(false); };
   return (
     <div className="flex flex-col gap-2.5">
+      <Segmented full value={scope} onChange={(v) => setScope(v as 'me' | 'all')} options={[{ v: 'me', label: 'This Character' }, { v: 'all', label: 'All Characters' }]} />
+      {scope === 'all' ? (
+        <AllListings now={now} iconSet={iconSet} />
+      ) : (
+      <>
       {(canList || canUnlist) && (
         <div className="flex items-center gap-2 [&>*]:flex-1">
           {canList && (
@@ -478,6 +586,8 @@ function ListingsTab({ char, ah, atah, now, assets, iconSet, conn, server }: {
         </div>
       )}
       <SlotsPanel ah={ah} atah={atah} now={now} assets={assets} iconSet={iconSet} conn={conn} />
+      </>
+      )}
       {listing && char && conn != null && (
         <ListItemsModal char={char} freeSlots={free} conn={conn} server={server} assets={assets} iconSet={iconSet} onClose={() => setListing(false)} />
       )}

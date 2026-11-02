@@ -2,6 +2,7 @@ import { MotionConfig, motion } from 'motion/react';
 import { createPortal } from 'react-dom';
 import { useEffect, useMemo, useState, type CSSProperties, type PointerEvent as RPointerEvent } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { invoke } from '@tauri-apps/api/core';
 import { ItemHoverProvider } from './ItemTooltip';
 import { inTauri, broadcastSync, useBoxes } from './bridge';
 import { useStickyPersisted } from './sticky';
@@ -19,7 +20,10 @@ export default function PoolOverlay() {
   // a separate window's in-memory store starts empty every time, which reset these each reopen.
   const [dense, setDense] = useStickyPersisted('pool.overlay.dense', false);
   const [opacity, setOpacity] = useStickyPersisted('pool.overlay.opacity', 1);
+  const [focusFollow, setFocusFollow] = useStickyPersisted('pool.overlay.focusfollow', false);
   const [hovered, setHovered] = useState(false);
+  // Push "Show Only Over FFXI" to the host watcher (runs on mount too, applying the persisted value).
+  useEffect(() => { if (inTauri) void invoke('set_pool_focus_follow', { enabled: focusFollow }).catch(() => {}); }, [focusFollow]);
   const [opRect, setOpRect] = useState<DOMRect | null>(null);
   useEffect(() => {
     win?.setAlwaysOnTop(ontop).catch(() => {});
@@ -83,7 +87,7 @@ export default function PoolOverlay() {
             <div onPointerDown={startResize('SouthWest')} className="absolute bottom-0 left-0 w-3 h-3 cursor-sw-resize z-30" />
             <div onPointerDown={startResize('SouthEast')} className="absolute bottom-0 right-0 w-3 h-3 cursor-se-resize z-30" />
           </>}
-          <div style={{ opacity: hovered && !opRect ? 1 : opacity, transition: 'opacity 0.12s ease', '--panel-opacity': 1.2 } as CSSProperties} className="h-full flex flex-col border border-line rounded-xl overflow-hidden bg-surface-raised shadow-lg shadow-black/40">
+          <div style={{ opacity: opacity === 0 && hovered && !opRect ? 1 : opacity, transition: 'opacity 0.12s ease', '--panel-opacity': 1.2 } as CSSProperties} className="h-full flex flex-col border border-line rounded-xl overflow-hidden bg-surface-raised shadow-lg shadow-black/40">
             <div data-tauri-drag-region className="shrink-0 flex items-center gap-2 pl-2.5 pr-1 py-1 border-b border-line select-none">
               <span data-tauri-drag-region className="w-[3px] h-3 rounded bg-accent shrink-0" />
               <span data-tauri-drag-region className="flex-1 h-full flex items-center text-[10px] font-extrabold tracking-[0.16em] text-accent cursor-move">TREASURE POOL</span>
@@ -95,6 +99,9 @@ export default function PoolOverlay() {
               </button>
               <button onClick={() => setOntop((v) => !v)} aria-label="Always on top" title={ontop ? 'Always on top: on' : 'Always on top: off'} className={`${CTRL} ${ontop ? 'text-accent' : 'text-fg-4'}`}>
                 <svg width="13" height="13" viewBox="0 0 24 24" fill={ontop ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 17v5" /><path d="M9 10.76V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v6.76a2 2 0 0 0 .59 1.41l1.7 1.7A1 1 0 0 1 17.59 16H6.41a1 1 0 0 1-.7-1.71l1.7-1.7A2 2 0 0 0 8 11.16" /></svg>
+              </button>
+              <button onClick={() => setFocusFollow((v) => !v)} aria-label="Show only over FFXI" title={focusFollow ? 'Show only over FFXI: on' : 'Show only over FFXI: off'} className={`${CTRL} ${focusFollow ? 'text-accent' : 'text-fg-4'}`}>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="4" width="20" height="14" rx="2" /><path d="M8 21h8M12 18v3" /></svg>
               </button>
               <button onClick={() => void minimize()} aria-label="Minimize" title="Minimize" className={`${CTRL} text-fg-4 hover:text-fg-2`}>
                 <svg width="13" height="13" viewBox="0 0 12 12" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><path d="M2.5 9.5h7" /></svg>
@@ -113,8 +120,8 @@ export default function PoolOverlay() {
             <>
               <div className="fixed inset-0 z-[80]" onMouseDown={() => setOpRect(null)} />
               <motion.div className="fixed z-[81] rounded-lg border border-line bg-popover shadow-2xl px-2.5 py-2 flex items-center gap-2" style={{ top: opRect.bottom + 4, right: Math.max(4, Math.round(window.innerWidth - opRect.right)), transformOrigin: 'top right' }} initial={{ opacity: 0, scale: 0.97, y: -4 }} animate={{ opacity: 1, scale: 1, y: 0 }} transition={{ duration: 0.14, ease: [0.22, 1, 0.36, 1] }}>
-                <input type="range" min={20} max={100} value={Math.round(opacity * 100)} onChange={(e) => setOpacity(Number(e.target.value) / 100)} className="w-28 accent-[var(--color-accent)] cursor-pointer" />
-                <span className="text-[10px] tabular-nums text-fg-4 w-8 text-right">{Math.round(opacity * 100)}%</span>
+                <input type="range" min={0} max={100} value={Math.round(opacity * 100)} onChange={(e) => setOpacity(Number(e.target.value) / 100)} className="w-28 accent-[var(--color-accent)] cursor-pointer" />
+                <button onClick={() => setOpacity(1)} title="Click to reset to 100%" className="text-[10px] tabular-nums text-fg-4 w-8 text-right hover:text-accent transition-colors">{Math.round(opacity * 100)}%</button>
               </motion.div>
             </>,
             document.body,

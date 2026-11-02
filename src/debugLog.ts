@@ -119,9 +119,31 @@ export function startDebugLog() {
 
   // Frame pacing: count frames and track the worst frame gap each heartbeat window. rAF pauses when the
   // window is hidden/minimized, so fps:0 is itself a signal.
+  //
+  // CRITICAL: this rAF must NOT run perpetually. A rAF pending every vsync keeps Chromium's rendering
+  // pipeline awake, so the frosted `backdrop-filter` surfaces re-rasterize their blur ~115x/sec for the
+  // WHOLE session. Over a long idle (9-10h) that sustained GPU compositing is what exhausts the WebView2
+  // renderer ("Out of memory" crash after idling) -- the JS heap stays flat the entire time. So we only
+  // run the pacer while the user is actively interacting and the window is visible; after a short idle we
+  // stop scheduling frames entirely and let the compositor sleep. Any input (or the window becoming
+  // visible) wakes it back up. Jank during real use is still captured; idle no longer drives the GPU.
+  const IDLE_MS = 8000;
   let frames = 0; let worst = 0; let lastRaf = performance.now();
-  const raf = () => { const t = performance.now(); const dt = t - lastRaf; lastRaf = t; frames++; if (dt > worst) worst = dt; requestAnimationFrame(raf); };
-  requestAnimationFrame(raf);
+  let lastActivity = performance.now();
+  let rafRunning = false;
+  const raf = () => {
+    const t = performance.now(); const dt = t - lastRaf; lastRaf = t; frames++; if (dt > worst) worst = dt;
+    if (document.visibilityState !== 'visible' || t - lastActivity > IDLE_MS) { rafRunning = false; return; }
+    requestAnimationFrame(raf);
+  };
+  const wakePacer = () => {
+    lastActivity = performance.now();
+    if (!rafRunning && document.visibilityState === 'visible') { rafRunning = true; lastRaf = performance.now(); requestAnimationFrame(raf); }
+  };
+  for (const ev of ['pointerdown', 'pointermove', 'keydown', 'wheel'] as const) {
+    window.addEventListener(ev, wakePacer, { passive: true });
+  }
+  wakePacer();
 
   window.setInterval(() => {
     const domNodes = document.getElementsByTagName('*').length;
@@ -139,7 +161,7 @@ export function startDebugLog() {
 
   document.addEventListener('freeze', () => dlog('page-freeze', undefined, true));
   document.addEventListener('resume', () => dlog('page-resume', undefined, true));
-  document.addEventListener('visibilitychange', () => dlog('visibility', document.visibilityState, document.visibilityState === 'hidden'));
+  document.addEventListener('visibilitychange', () => { dlog('visibility', document.visibilityState, document.visibilityState === 'hidden'); if (document.visibilityState === 'visible') wakePacer(); });
   window.addEventListener('error', (e) => dlog('window-error', { msg: String(e.message), src: e.filename, line: e.lineno }, true));
   window.addEventListener('unhandledrejection', (e) => dlog('unhandled-rejection', String((e as PromiseRejectionEvent).reason), true));
   window.addEventListener('pagehide', () => { void flush(); });

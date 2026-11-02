@@ -96,3 +96,18 @@ export async function installAddonUpdate(addonDir: string, manifest: ManifestAdd
     expectedSha256: manifest.sha256 ?? null,
   });
 }
+
+// One seamless update that does BOTH the addon and the app, so the user clicks once.
+// Order matters: the addon install only writes files to disk (no restart), so it runs FIRST and
+// survives the app's relaunch. The app install then downloads, stashes the release notes, and
+// relaunches -- which kills this process, so nothing after it runs. onPhase reports progress.
+export async function installAll(
+  app: Update | null,
+  addon: { dir: string; manifest: ManifestAddon } | null,
+  onPhase?: (phase: 'addon' | 'app', pct: number) => void,
+): Promise<{ addon?: AddonInstallResult; relaunched: boolean }> {
+  let addonRes: AddonInstallResult | undefined;
+  if (addon) { onPhase?.('addon', 0); addonRes = await installAddonUpdate(addon.dir, addon.manifest); }
+  if (app) { await installUpdate(app, (p) => onPhase?.('app', p)); return { addon: addonRes, relaunched: true }; }
+  return { addon: addonRes, relaunched: false };
+}

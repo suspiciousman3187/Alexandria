@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { checkForUpdate, installUpdate, checkAddonUpdate, installAddonUpdate, type Update, type ManifestAddon } from './updater';
+import { checkForUpdate, checkAddonUpdate, installAll, type Update, type ManifestAddon } from './updater';
 import { useAddonInfo } from './bridge';
 import { Button } from './ui';
 
@@ -22,8 +22,8 @@ export default function UpdateBanner() {
   const addon = useAddonInfo();
   const [app, setApp] = useState<Update | null>(null);
   const [addonManifest, setAddonManifest] = useState<ManifestAddon | null>(null);
-  const [installing, setInstalling] = useState<'app' | 'addon' | null>(null);
-  const [appPct, setAppPct] = useState<number | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [label, setLabel] = useState('');
   const [addonDone, setAddonDone] = useState(false);
   const [err, setErr] = useState('');
 
@@ -34,7 +34,7 @@ export default function UpdateBanner() {
       try {
         const u = await checkForUpdate();
         if (!cancelled && u && localStorage.getItem(SKIP_APP_KEY) !== u.version) setApp(u);
-      } catch { /* offline / no manifest — stay quiet on startup */ }
+      } catch { /* offline / no manifest: stay quiet on startup */ }
     })();
     return () => { cancelled = true; };
   }, []);
@@ -51,22 +51,27 @@ export default function UpdateBanner() {
     return () => { cancelled = true; };
   }, [addon?.dir, addon?.version]);
 
-  const installApp = async () => {
-    if (!app) return;
-    setInstalling('app'); setErr(''); setAppPct(0);
-    try { await installUpdate(app, setAppPct); } catch (e) { setErr(String(e)); setInstalling(null); }
+  // One click does both: the addon writes first (survives the relaunch), then the app downloads and
+  // relaunches. If only the addon has an update there is no relaunch, so we show the reload hint.
+  const update = async () => {
+    setBusy(true); setErr('');
+    const addonArg = addon?.dir && addonManifest ? { dir: addon.dir, manifest: addonManifest } : null;
+    try {
+      const res = await installAll(app, addonArg, (phase, pct) => {
+        setLabel(phase === 'addon' ? 'Updating addon…' : pct === 0 ? 'Starting…' : `Downloading ${pct}%`);
+      });
+      if (!res.relaunched) { setAddonManifest(null); setApp(null); setAddonDone(true); setBusy(false); }
+      // relaunched: process is being killed, leave the banner as-is.
+    } catch (e) { setErr(String(e)); setBusy(false); }
   };
-  const installAddon = async () => {
-    if (!addon?.dir || !addonManifest) return;
-    setInstalling('addon'); setErr('');
-    try { await installAddonUpdate(addon.dir, addonManifest); setAddonManifest(null); setAddonDone(true); }
-    catch (e) { setErr(String(e)); }
-    finally { setInstalling(null); }
+  const dismiss = () => {
+    if (app) localStorage.setItem(SKIP_APP_KEY, app.version);
+    if (addonManifest) localStorage.setItem(SKIP_ADDON_KEY, addonManifest.version);
+    setApp(null); setAddonManifest(null);
   };
-  const skipApp = () => { if (app) localStorage.setItem(SKIP_APP_KEY, app.version); setApp(null); };
-  const skipAddon = () => { if (addonManifest) localStorage.setItem(SKIP_ADDON_KEY, addonManifest.version); setAddonManifest(null); };
 
-  if (!app && !addonManifest && !addonDone && !err) return null;
+  const pending = !!app || !!addonManifest;
+  if (!pending && !addonDone && !err) return null;
 
   const collapse = {
     initial: { height: 0, opacity: 0 },
@@ -76,6 +81,11 @@ export default function UpdateBanner() {
     className: 'overflow-hidden',
   };
 
+  // Headline version: the app version leads when present (the addon rides along in the same click);
+  // otherwise the addon version.
+  const headVer = app?.version ?? addonManifest?.version ?? '';
+  const both = !!app && !!addonManifest;
+
   return (
     <motion.div
       initial={{ height: 0, opacity: 0 }}
@@ -84,28 +94,25 @@ export default function UpdateBanner() {
       className="shrink-0 border-b border-accent/30 bg-accent/10 overflow-hidden"
     >
       <AnimatePresence initial={false}>
-        {app && (
-          <motion.div key="app" {...collapse}>
-            <Line
-              text={<>Alexandria <b className="text-fg">v{app.version}</b> is available.</>}
-              busy={installing === 'app'}
-              busyLabel={appPct == null ? 'Starting…' : `Downloading ${appPct}%`}
-              onInstall={installApp}
-              onDismiss={skipApp}
-              disabled={installing !== null}
-            />
-          </motion.div>
-        )}
-        {addonManifest && (
-          <motion.div key="addon" {...collapse}>
-            <Line
-              text={<>Addon update <b className="text-fg">v{addonManifest.version}</b> is available.</>}
-              busy={installing === 'addon'}
-              busyLabel="Installing…"
-              onInstall={installAddon}
-              onDismiss={skipAddon}
-              disabled={installing !== null}
-            />
+        {pending && (
+          <motion.div key="pending" {...collapse}>
+            <div className="flex items-center gap-3 px-4 py-2 text-[12px]">
+              <svg viewBox="0 0 24 24" className="w-4 h-4 text-accent shrink-0" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v12" /><path d="M8 11l4 4 4-4" /><path d="M5 21h14" /></svg>
+              <span className="text-fg-2">
+                {app ? <>Alexandria <b className="text-fg">v{headVer}</b> is available{both ? ' (app + addon).' : '.'}</>
+                  : <>Addon update <b className="text-fg">v{headVer}</b> is available.</>}
+              </span>
+              <div className="ml-auto flex items-center gap-2">
+                {busy ? (
+                  <span className="text-fg-3 text-[11px]">{label || 'Updating…'}</span>
+                ) : (
+                  <>
+                    <Button variant="primary" size="sm" onClick={update}>Update</Button>
+                    <Button variant="ghost" size="sm" onClick={dismiss}>Later</Button>
+                  </>
+                )}
+              </div>
+            </div>
           </motion.div>
         )}
         {addonDone && (
@@ -127,26 +134,5 @@ export default function UpdateBanner() {
         )}
       </AnimatePresence>
     </motion.div>
-  );
-}
-
-function Line({ text, busy, busyLabel, onInstall, onDismiss, disabled }: {
-  text: React.ReactNode; busy: boolean; busyLabel: string; onInstall: () => void; onDismiss: () => void; disabled: boolean;
-}) {
-  return (
-    <div className="flex items-center gap-3 px-4 py-2 text-[12px]">
-      <svg viewBox="0 0 24 24" className="w-4 h-4 text-accent shrink-0" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v12" /><path d="M8 11l4 4 4-4" /><path d="M5 21h14" /></svg>
-      <span className="text-fg-2">{text}</span>
-      <div className="ml-auto flex items-center gap-2">
-        {busy ? (
-          <span className="text-fg-3 text-[11px]">{busyLabel}</span>
-        ) : (
-          <>
-            <Button variant="primary" size="sm" onClick={onInstall} disabled={disabled}>Install</Button>
-            <Button variant="ghost" size="sm" onClick={onDismiss} disabled={disabled}>Later</Button>
-          </>
-        )}
-      </div>
-    </div>
   );
 }

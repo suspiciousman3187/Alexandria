@@ -61,6 +61,11 @@ export function itemStack(id: number): number {
   return stackById.get(id) ?? 1;
 }
 
+// Equip level of a piece of gear (the "Lv.NN" requirement), 0 for items with no level (consumables, etc.).
+export function itemLevel(id: number): number {
+  return levelById.get(id) ?? 0;
+}
+
 // Job codes in jobId order (WAR = jobId 1 .. RUN = 22), matching the `jobs` bitmask bit = 1<<jobId.
 const JOB_NAMES = ['WAR', 'MNK', 'WHM', 'BLM', 'RDM', 'THF', 'PLD', 'DRK', 'BST', 'BRD', 'RNG', 'SAM', 'NIN', 'DRG', 'SMN', 'BLU', 'COR', 'PUP', 'DNC', 'SCH', 'GEO', 'RUN'];
 // Decode which jobs can equip an item. Returns null for items with no job data (consumables, key items, etc.).
@@ -138,13 +143,16 @@ export function nameMatches(text: string, query: string): boolean {
   return false;
 }
 
-export function itemNameMatches(id: number, shownName: string, lcQuery: string): boolean {
+// includeDesc=false restricts matching to the item's name (shown + full), skipping the gear-stat description.
+// Used by `//find` under Strict matching so "find skin" returns Skinflayer, not every piece whose stats mention
+// Stoneskin. The Library stat search leaves it true so you can still search by stat text.
+export function itemNameMatches(id: number, shownName: string, lcQuery: string, includeDesc = true): boolean {
   const terms = searchTerms(lcQuery);
   if (terms.length === 0) return false;
-  if (!descStarted) void loadDescs();          // pull the gear-stat index on the first search
+  if (includeDesc && !descStarted) void loadDescs();   // pull the gear-stat index on the first search
   const shown = shownName.toLowerCase();
   const full = fullById.get(id);
-  const desc = descById.get(id);               // lowercased gear stats/description (equippable gear only)
+  const desc = includeDesc ? descById.get(id) : undefined;   // lowercased gear stats/description (equippable gear only)
   for (const t of terms) {
     if (shown.includes(t)) return true;
     if (full != null && full.includes(t)) return true;

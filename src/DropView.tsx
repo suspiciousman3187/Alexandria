@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { useBoxes, useKnownCharacters, useAvailableIcons, useDropIconMap, broadcastDropNow, dropClean, NOMAD_BAGS, nomadReachable, inTauri, type KnownChar } from './bridge';
@@ -8,8 +8,11 @@ import { useSticky } from './sticky';
 import { useSettings } from './settings';
 import { useItemValues, getCachedValue } from './priceStore';
 import { useAnon } from './anonymize';
-import { nameMatches } from './itemNames';
-import { Modal, Collapse } from './overlay';
+import { nameMatches, useItemNames, itemNameMatches, type ItemName } from './itemNames';
+import { Modal, Collapse, Popover } from './overlay';
+
+// Max add-item suggestions shown at once (the dropdown scrolls), with a "+1" sentinel to flag "more".
+const MAX_DROP_SUGGEST = 100;
 import { MOG_ONLY_BAGS } from './bagConstants';
 import TreasuryImportModal from './TreasuryImportModal';
 import DropListImportModal from './DropListImportModal';
@@ -135,11 +138,24 @@ export default function DropView() {
   }, [known]);
   const assetsAny = useMemo(() => known.find((c) => c.assets)?.assets, [known]);
   const [add, setAdd] = useState('');
-  const addItem = () => {
-    const n = add.trim();
+  const addWrap = useRef<HTMLDivElement | null>(null);
+  const allItems = useItemNames();
+  const addItem = (name = add) => {
+    const n = name.trim();
     if (n && !cfg.drop.some((x) => x.toLowerCase() === n.toLowerCase())) setDrop({ ...cfg, drop: [...cfg.drop, n] });
     setAdd('');
   };
+  // Typeahead over the full item-name DB (its `n` are the in-game shown/abbreviated names, which is what the
+  // addon matches inventory against), excluding names already on the list. Matches abbreviated + full names.
+  const suggestions = useMemo<ItemName[]>(() => {
+    const q = add.trim().toLowerCase();
+    if (!q) return [];
+    const out: ItemName[] = [];
+    for (const it of allItems) {
+      if (itemNameMatches(it.id, it.n, q) && !dropSet.has(it.n.toLowerCase())) { out.push(it); if (out.length > MAX_DROP_SUGGEST) break; }
+    }
+    return out;
+  }, [add, allItems, dropSet]);
   const removeItem = (name: string) => setDrop({ ...cfg, drop: cfg.drop.filter((x) => x !== name) });
   const [filter, setFilter] = useSticky('drop.filter', '');
   const [sortMode, setSortMode] = useSticky<'off' | 'name' | 'value'>('drop.sort', 'off');
@@ -218,15 +234,29 @@ export default function DropView() {
           <span className="text-[11px] text-fg-4 tabular-nums">{filter.trim() ? `${shown.length}/${cfg.drop.length}` : cfg.drop.length}</span>
         </div>
       }>
-        <div className="flex items-center gap-2 mb-2.5">
-          <input
-            value={add}
-            onChange={(e) => setAdd(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') addItem(); }}
-            placeholder="Add an item name…"
-            className="flex-1 min-w-0 bg-field border border-line rounded-md px-3 py-1.5 text-xs text-fg-2 placeholder-fg-4 outline-none focus:border-accent/50 transition-colors"
-          />
-          <button onClick={addItem} disabled={!add.trim()} className="shrink-0 px-3 py-1.5 text-[12px] font-semibold rounded-md border border-line bg-surface text-fg-2 hover:text-fg disabled:opacity-40 transition-colors">Add</button>
+        <div ref={addWrap} className="relative mb-2.5">
+          <div className="flex items-center gap-2">
+            <input
+              value={add}
+              onChange={(e) => setAdd(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') addItem(); }}
+              placeholder="Add an item name…"
+              className="flex-1 min-w-0 bg-field border border-line rounded-md px-3 py-1.5 text-xs text-fg-2 placeholder-fg-4 outline-none focus:border-accent/50 transition-colors"
+            />
+            <button onClick={() => addItem()} disabled={!add.trim()} className="shrink-0 px-3 py-1.5 text-[12px] font-semibold rounded-md border border-line bg-surface text-fg-2 hover:text-fg disabled:opacity-40 transition-colors">Add</button>
+          </div>
+          <Popover open={suggestions.length > 0} anchor={addWrap} className="rounded-lg border border-line bg-popover divide-y divide-line overflow-hidden max-h-64 overflow-y-auto shadow-2xl">
+            {suggestions.slice(0, MAX_DROP_SUGGEST).map((it) => (
+              <button key={it.id} onClick={() => addItem(it.n)} className="le-tap w-full flex items-center gap-2 px-3 py-1.5 text-left hover:bg-field transition-colors">
+                <Icon id={it.id} name={it.n} assets={assetsAny} />
+                <span className="flex-1 min-w-0 truncate text-[12px] text-fg-2">{it.n}</span>
+                <span className="shrink-0 text-[11px] font-semibold text-accent">Add</span>
+              </button>
+            ))}
+            {suggestions.length > MAX_DROP_SUGGEST && (
+              <div className="px-3 py-2 text-center text-[11px] text-fg-4">Keep typing to narrow the list.</div>
+            )}
+          </Popover>
         </div>
         {cfg.drop.length > 0 && (
           <button

@@ -1,5 +1,9 @@
 @import "tailwindcss";
 
+/* Self-hosted fonts shared with Sage (Inter body + Space Grotesk display). Variable woff2, latin subset. */
+@font-face { font-family: 'Inter'; font-style: normal; font-weight: 100 900; font-display: swap; src: url('/fonts/inter-latin.woff2') format('woff2'); }
+@font-face { font-family: 'Space Grotesk'; font-style: normal; font-weight: 300 700; font-display: swap; src: url('/fonts/space-grotesk-latin.woff2') format('woff2'); }
+
 /* ── Design tokens (Tailwind utilities: text-accent, bg-accent, …) ──────────
    The one Alexandria theme: Reimu Slate. Tokens below feed every utility. */
 @theme {
@@ -80,7 +84,13 @@ body {
    that the app runs non-elevated and WebView2 can composite on the GPU. */
 .bg-nav            { background-color: var(--glass-nav);            backdrop-filter: blur(18px) saturate(130%); -webkit-backdrop-filter: blur(18px) saturate(130%); }
 .bg-surface        { background-color: var(--glass-surface);        background-color: rgb(from var(--glass-surface) r g b / calc(alpha * var(--panel-opacity, 1)));        backdrop-filter: blur(18px) saturate(125%); -webkit-backdrop-filter: blur(18px) saturate(125%); }
-.bg-surface-raised { background-color: var(--glass-surface-raised); background-color: rgb(from var(--glass-surface-raised) r g b / calc(alpha * var(--panel-opacity, 1))); backdrop-filter: blur(18px) saturate(125%); -webkit-backdrop-filter: blur(18px) saturate(125%); }
+/* NO backdrop-filter here on purpose: `bg-surface-raised` is the per-CARD tier (gear boxes, raised cards,
+   many instances on screen) and it almost always sits INSIDE an already-frosted bg-panel/bg-surface. A
+   nested second blur is visually redundant but each instance allocates its own GPU backing texture, so
+   dozens of them are a large standing GPU-memory cost in WebView2 -- a prime suspect for the long-session
+   "Out of memory" renderer crash. The tint (with --panel-opacity) alone reads as frosted over the blurred
+   parent. Top-level surfaces (nav/surface/panel/popover) keep their blur. */
+.bg-surface-raised { background-color: var(--glass-surface-raised); background-color: rgb(from var(--glass-surface-raised) r g b / calc(alpha * var(--panel-opacity, 1))); }
 .bg-surface-hover  { background-color: var(--glass-surface-hover);  background-color: rgb(from var(--glass-surface-hover) r g b / calc(alpha * var(--panel-opacity, 1))); }
 .bg-panel          { background-color: var(--glass-panel);          background-color: rgb(from var(--glass-panel) r g b / calc(alpha * var(--panel-opacity, 1)));          backdrop-filter: blur(18px) saturate(125%); -webkit-backdrop-filter: blur(18px) saturate(125%); }
 .bg-panel-alt      { background-color: var(--glass-panel-alt);      background-color: rgb(from var(--glass-panel-alt) r g b / calc(alpha * var(--panel-opacity, 1))); }
@@ -243,6 +253,93 @@ body {
     url('/bg-library.jpg') center / cover no-repeat;
   filter: brightness(var(--wallpaper-bright, 1));
 }
+
+/* ── Gearsets window: its own Scarlet Devil Mansion theme ─────────────────────
+   Scoped token override (same vars as the data-theme palettes) so every utility
+   inside the Gearsets window recolors to warm scarlet/gold over the feast art,
+   without touching the rest of the app. --gl-* are gearset-only accents. The data-gearset attribute is
+   stamped on the gearsets webview's <html> so body-level portals (the item tooltip) inherit the theme too. */
+.gearset-scope,
+:root[data-gearset="1"] {
+  --color-bg:           #140d07;
+  --color-accent:       #e2495d;
+  --color-accent-hover: #ef5c70;
+  --color-accent-deep:  #b32639;
+  --color-on-accent:    #2a0608;
+
+  --color-fg:   #f4ead6;
+  --color-fg-2: #e3d4b6;
+  --color-fg-3: #cbb896;
+  --color-fg-4: #9c8968;
+  --color-line:   #3a2a18;
+  --color-line-2: #5a4428;
+  --color-track:  rgba(255, 255, 255, 0.14);
+  --color-field:  rgba(18, 12, 7, 0.52);
+
+  --color-knob:       #ffffff;
+  --color-toggle:     #e2495d;
+  --color-slider:     #e2495d;
+  --color-nav-active: #e2495d;
+  --color-scrollbar:  rgba(232, 179, 92, 0.22);
+
+  /* translucent so the Touhou art shows through the surfaces (Bare treatment); outline text keeps it legible */
+  --glass-nav:            rgba(22, 15, 9, 0.52);
+  --glass-surface:        rgba(30, 21, 13, 0.42);
+  --glass-surface-raised: rgba(44, 31, 19, 0.46);
+  --glass-surface-hover:  rgba(56, 39, 23, 0.62);
+  --glass-panel:          rgba(24, 16, 9, 0.50);
+  --glass-panel-alt:      rgba(40, 28, 17, 0.52);
+
+  --bg-glow: rgba(226, 73, 93, 0.14);
+  --bg-dim:  rgba(14, 9, 5, 0.62);
+
+  /* gearset-only accents */
+  --gl-gold:      #e8b35c;
+  --gl-gold-soft: #f0c983;
+  --gl-ok:    #67cf90;
+  --gl-issue: #eab24c;
+  --gl-miss:  #ef5d69;
+  --gl-dyn:   #79b8dd;
+  --gl-aug:   #c3a2ea;
+  --gl-up:    #8ff0b8;
+  --gl-down:  #ff9aa3;
+
+  /* Fonts shared with Sage: Inter body, Space Grotesk display, JetBrains/Cascadia mono. */
+  --gs-display: 'Space Grotesk', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', 'Cascadia Code', Consolas, ui-monospace, monospace;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+.gearset-scope .gearset-bg {
+  position: absolute; inset: 0; z-index: 0; pointer-events: none;
+  background:
+    linear-gradient(180deg, rgba(14,9,5,0.26) 0%, rgba(14,9,5,0.34) 45%, rgba(10,6,3,0.52) 100%),
+    radial-gradient(120% 90% at 50% 0%, rgba(226,73,93,0.14), transparent 55%),
+    url('/bg-gearset.jpg') 52% 30% / cover no-repeat;
+  filter: saturate(1.02) brightness(var(--gs-bright, 0.6));
+}
+/* Bare treatment: a thin uniform wash over each body column so the art reads clearly through it, with an
+   outline text-shadow for legibility. Blur is user-adjustable (--gs-blur); brightness lives on .gearset-bg. */
+.gearset-scope .gs-wash {
+  background: rgba(13, 8, 4, var(--gs-surf, 0.34));
+  backdrop-filter: blur(var(--gs-blur, 0px)) saturate(112%);
+  -webkit-backdrop-filter: blur(var(--gs-blur, 0px)) saturate(112%);
+}
+/* Outline text shadow so UI text stays sharp over the bright, busy backdrop. */
+.gearset-scope .gs-wash, .gearset-scope .gs-sh {
+  text-shadow: 0 0 2px rgba(0, 0, 0, 0.95), 0 1px 2px rgba(0, 0, 0, 0.92), 0 2px 6px rgba(0, 0, 0, 0.55);
+}
+/* The Bare treatment makes surfaces translucent, but floating overlays (popovers, dropdowns, the item
+   tooltip) must stay solid and readable — keep them opaque regardless of the lowered glass tokens. Their
+   own content should never get the backdrop outline shadow. */
+:root[data-gearset="1"] .bg-popover {
+  background-color: rgba(24, 16, 9, 0.98);
+  backdrop-filter: blur(12px) saturate(130%);
+  -webkit-backdrop-filter: blur(12px) saturate(130%);
+  text-shadow: none;
+}
+/* hatched preview segments on the stat bars */
+.gl-gh-up   { background: repeating-linear-gradient(45deg, var(--gl-up), var(--gl-up) 3px, rgba(143,240,184,0.5) 3px, rgba(143,240,184,0.5) 6px); box-shadow: 0 0 8px rgba(143,240,184,0.55); }
+.gl-gh-down { background: repeating-linear-gradient(45deg, rgba(239,93,105,0.5), rgba(239,93,105,0.5) 3px, rgba(239,93,105,0.2) 3px, rgba(239,93,105,0.2) 6px); }
 
 /* ── Smooth view-in on section switch ────────────────────────────────────── */
 @keyframes le-view-in {

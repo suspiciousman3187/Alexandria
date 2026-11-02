@@ -4,13 +4,18 @@ import { appDataPath, inTauri } from './bridge';
 
 // A saved "Pull" preset: move items carrying any of `tags`, sitting in one of `bags`, into inventory.
 // When `jobOnly` is on, only pieces the active character's current job can equip are pulled.
+// When `jobSpecific` is on, pull is further restricted to JOB-RESTRICTED gear: the piece must be
+// equippable gear, usable by the active job, and NOT equippable by every job -- so all-job "costume"/
+// generic appearance gear is excluded (the JSE-only request).
+// When `gearsetOnly` is on, pull is restricted to the exact items the character's GearSwap sets define
+// for their CURRENT job (parsed from their gear .lua): only gear an actual set references is pulled.
 // slips: pull from Porter slips at all. slipSids: specific slip item-ids to use (empty = all owned slips).
 // autoGetSlips: when a needed slip isn't in your bags, fetch it into inventory first (needs its storage reachable).
 // dest: ordered destination bags to pull INTO (fill the first with room, then fall back). Empty = inventory only.
 // autoOnJobChange: when the character changes job while they can reach BOTH the Porter Moogle and a
 // job-change Moogle (i.e. Mog Garden / a Mog House with the Porter in range), run this pull automatically.
 // jobs: when autoOnJobChange is on, restrict the auto-run to these main jobs (empty/undefined = any job).
-export type PullRule = { id: string; name: string; tags: string[]; bags: number[]; jobOnly: boolean; slips?: boolean; slipSids?: number[]; autoGetSlips?: boolean; dest?: number[]; autoOnJobChange?: boolean; jobs?: string[] };
+export type PullRule = { id: string; name: string; tags: string[]; bags: number[]; jobOnly: boolean; jobSpecific?: boolean; gearsetOnly?: boolean; slips?: boolean; slipSids?: number[]; autoGetSlips?: boolean; dest?: number[]; autoOnJobChange?: boolean; jobs?: string[] };
 
 let rules: PullRule[] = [];
 let started = false;
@@ -29,7 +34,7 @@ async function load() {
         id: String(r.id), name: String(r.name || 'Pull'),
         tags: Array.isArray(r.tags) ? r.tags.map(String) : [],
         bags: Array.isArray(r.bags) ? r.bags.map(Number).filter((n: number) => Number.isFinite(n)) : [],
-        jobOnly: !!r.jobOnly, slips: !!r.slips,
+        jobOnly: !!r.jobOnly, jobSpecific: !!r.jobSpecific, gearsetOnly: !!r.gearsetOnly, slips: !!r.slips,
         slipSids: Array.isArray(r.slipSids) ? r.slipSids.map(Number).filter((n: number) => Number.isFinite(n)) : undefined,
         autoGetSlips: !!r.autoGetSlips,
         dest: Array.isArray(r.dest) ? r.dest.map(Number).filter((n: number) => Number.isFinite(n)) : undefined,

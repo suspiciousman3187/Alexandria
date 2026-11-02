@@ -52,8 +52,10 @@ export default function CurrencyView() {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const toggleExpand = (name: string) => setExpanded((prev) => { const next = new Set(prev); if (next.has(name)) next.delete(name); else next.add(name); return next; });
 
+  // Every registered character, online first. Offline ones show their last-synced currency (or blank until they
+  // first connect); nothing is hidden just because a character is logged out.
   const chars = useMemo<KnownChar[]>(
-    () => known.filter((c) => c.online || c.cur).sort((a, b) => (a.online === b.online ? a.name.localeCompare(b.name) : a.online ? -1 : 1)),
+    () => [...known].sort((a, b) => (a.online === b.online ? a.name.localeCompare(b.name) : a.online ? -1 : 1)),
     [known],
   );
   const { scoped, exSet, toggle, reset, none } = useCharScope('cur.scope', chars);
@@ -244,7 +246,7 @@ export default function CurrencyView() {
                       tabIndex={0}
                       aria-expanded={open}
                       onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleExpand(name); } }}
-                      className="le-tap group flex items-center gap-2 px-3 py-1.5 hover:bg-field/40 transition-colors cursor-pointer"
+                      className="group flex items-center gap-2 px-3 py-1.5 hover:bg-field/40 transition-colors cursor-pointer"
                       style={CURRENCY_ROW_CV}
                     >
                       <Star on={starSet.has(name)} onClick={() => toggleStar(name)} />

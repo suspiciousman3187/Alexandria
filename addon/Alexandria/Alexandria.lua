@@ -1,6 +1,6 @@
 _addon.name = 'Alexandria'
 _addon.author = 'Noirblanc'
-_addon.version = '0.0.28'
+_addon.version = '0.0.33'
 _addon.commands = {'alexandria', 'alex', 'ax'}
 
 local socket = require('socket')
@@ -84,10 +84,11 @@ ah_last4e = nil
 ah_queue = {}
 ah_t = 0
 ah_dirty = false
-AH_DELAY = 4
+AH_DELAY = 1.0   -- minimum spacing between AH actions; the real gate is ah_busy (prior listing confirmed). User-adjustable from the desktop (cmd 'ahdelay'); this is the default before the desktop pushes the setting
 ah_busy = false
 ah_busy_t = 0
 AH_BUSY_TIMEOUT = 15
+ah_status_pending = false -- a queued sale-status request is the in-flight AH action; its 0x4C 0x0A reply releases ah_busy
 ah_err_pending = nil
 AH_ERR_DEFER = 2.0
 ah_last_bid = nil
@@ -101,6 +102,7 @@ shop_sell_list = {}
 shop_autosell = false
 sell_anywhere = false
 shop_session = false
+auto_pending = false   -- an inventory change's auto-actions (sell/sort/drop) were deferred because the world wasn't ready; run them once it settles
 loaded_since = 0    -- os.clock() when the client first became fully in-world (0 while loading); buffer counts from HERE
 AUTO_SETTLE = 15    -- seconds fully-in-world before ANY auto packet action fires, so nothing injects during/just after a load
 shop_sold = {}
@@ -189,6 +191,9 @@ aug_dirty = false
 aug_info = nil
 aug_info_dirty = false
 bz_flags = {}
+-- User-tunable bazaar SCAN pacing (seconds). base + random()*jitter where a jitter exists. Pushed from the
+-- desktop (bzdelays command); defaults mirror the former hardcoded values. Global (not a main-chunk local).
+bz_delays = { open_b = 3, open_j = 2, collect_stocked = 0.6, collect_empty = 2.0, exit_b = 0.8, exit_j = 1.2, seller_b = 0.6, seller_j = 0.8 }
 bz_sellers_dirty = false
 bz_sellers_t = 0
 bz_collect = nil
@@ -197,7 +202,7 @@ bz_items_dirty = false
 bz_my_dirty = false
 bz_sweep = nil
 bz_sweep_dirty = false
-bz_buy = nil
+bz_job = nil
 bz_buy_msg = nil
 bz_buy_dirty = false
 bz_clear_pending = false
@@ -301,6 +306,7 @@ local org_total = 0
 local org_done = 0
 local org_moved = 0
 org_debug = false
+move_debug = false  -- //ax movedbg: log every plain item move (library/storage) attempt + its dest bag state
 org_verify = nil  -- on a real run: { steps, moved, total, done_at }, verified after a settle delay
 
 local slips_ok, slips_lib = pcall(require, 'slips')
@@ -310,6 +316,7 @@ local pool_dirty_at = 0
 local pool_rules = { lot = {}, pass = {}, drop = {} }
 pool_lotqty = {}   -- item id -> target held count; auto-lot stops once resupply_count(id) reaches it
 pool_pass_on_lot = false
+pool_pass_rare_owned = false -- auto-pass a Rare item you already own (can't lot it again); desktop toggle, default OFF
 pool_autolot_on = true -- master switch for acting on the lot list; toggled by desktop or //ax autolot
 my_lotted = {}
 local slips_dirty = false
@@ -355,8 +362,13 @@ AX_BAG_COLOR = {
     ['satchel'] = 259, ['sack'] = 324, ['case'] = 262, ['wardrobe'] = 256, ['wardrobe 2'] = 364, ['wardrobe 3'] = 326,
     ['wardrobe 4'] = 342, ['wardrobe 5'] = 340, ['wardrobe 6'] = 367, ['wardrobe 7'] = 363, ['wardrobe 8'] = 8,
 }
+-- User color overrides for //find output, pushed from the desktop (findcolors command). Held in memory only;
+-- the app re-sends them on every connect, so there's nothing to persist here. nil = use the built-in defaults.
+find_colors = nil
 function ax_bag_color(bag)
-    return AX_BAG_COLOR[bag:lower()] or ALEX_BODY
+    local k = bag:lower()
+    if find_colors and find_colors.bags and find_colors.bags[k] then return find_colors.bags[k] end
+    return AX_BAG_COLOR[k] or ALEX_BODY
 end
 AX_ECHO_COLOR = { price = 200, stock = 210, rate = 213 }
 function ax_colorize(text)
@@ -368,7 +380,10 @@ function ax_colorize(text)
     end
     local nm, bag, item = text:match('^([^/]+)/([^:]+): (.+)$')
     if not nm then return text end
-    return nm .. '/' .. ax_col(bag, ax_bag_color(bag)) .. ': ' .. item
+    -- Color the character name and item name too when the user has set those (0 = leave default/uncolored).
+    local namec = (find_colors and tonumber(find_colors.name)) or 0
+    local itemc = (find_colors and tonumber(find_colors.item)) or 0
+    return ax_col(nm, namec) .. '/' .. ax_col(bag, ax_bag_color(bag)) .. ': ' .. ax_col(item, itemc)
 end
 
 function build_keyitems()
@@ -484,6 +499,31 @@ local function decode_item_augments(it)
     return (#out > 0) and out or nil
 end
 
+-- Unity (Reinforcement Points) augment state, read straight from the raw 24-byte extdata (augment_system 2, the
+-- same layout Windower's extdata.Augmented parses). Returns rank (1..15) and the RP accumulated INTO the current
+-- rank; the desktop derives remaining-to-next from its rank table. nil when the item has no extdata or is not an
+-- RP-augmented piece. We parse the bytes ourselves because Windower's exposed dec.RP has a precedence bug.
+-- Global (not a main-chunk local) to stay under Lua's 200 main-chunk local cap.
+-- Unity reinforcement gear decodes as augment_system 4 (flag_2 byte == 0x83), path A-D + rank. Returns rank
+-- (1..15) and the RP accumulated INTO the current rank. Verified live on one Sailfi Belt +1 across ranks:
+--   R1 fresh  -> bytes 5-6 = 00 00 -> 0,   byte7 0x04 -> rank 1
+--   R5 (NextRP 145, 75/220 into rank) -> bytes 5-6 = 2C 01 = 300,  byte7 0x14 -> rank 5
+--   R15 max   -> bytes 5-6 = 50 0F = 3920, byte7 0x3C -> rank 15
+-- i.e. bytes 5-6 store (accumulated-into-rank RP) * 4; divide by 4 for the real RP. The desktop computes
+-- remaining-to-next = RANK_TOTAL[rank] - accumulated. Windower's rank (byte7) is authoritative; it does not
+-- expose this RP for system 4, so we read bytes 5-6 ourselves (full extdata, 1-indexed).
+function unity_rp(it)
+    if not (extdata_ok and extdata) then return nil end
+    if type(it) ~= 'table' or type(it.extdata) ~= 'string' or #it.extdata ~= 24 then return nil end
+    local ok, dec = pcall(extdata.decode, it)
+    if not (ok and type(dec) == 'table' and dec.augment_system == 4) then return nil end
+    local rank = tonumber(dec.rank)
+    if not rank or rank < 1 then return nil end
+    local ext = it.extdata
+    local acc = math.floor(((ext:byte(5) or 0) + (ext:byte(6) or 0) * 256) / 4)
+    return rank, acc
+end
+
 inv_sig_last = nil
 function inv_signature()
     local h = 5381
@@ -547,8 +587,10 @@ local function build_inventory()
                     end
                     local bzpart = (it.bazaar and it.bazaar > 0) and (',"bz":' .. it.bazaar) or ''  -- a nonzero bazaar price means it's listed on your bazaar
                     local lkpart = (it.status and it.status ~= 0) and ',"lk":1' or ''  -- locked: equipped/bazaar/etc, can't be freely moved
+                    local urank, uacc = unity_rp(it)
+                    local urpart = urank and (',"ur":' .. urank .. ',"ua":' .. uacc) or ''  -- Unity rank + accumulated RP into rank
                     slot_parts[#slot_parts + 1] =
-                        '{"s":' .. s .. ',"id":' .. it.id .. ',"c":' .. (it.count or 1) .. ',"n":"' .. esc(name) .. '"' .. usable .. fpart .. mspart .. augpart .. bzpart .. lkpart .. '}'
+                        '{"s":' .. s .. ',"id":' .. it.id .. ',"c":' .. (it.count or 1) .. ',"n":"' .. esc(name) .. '"' .. usable .. fpart .. mspart .. augpart .. bzpart .. lkpart .. urpart .. '}'
                 end
             end
             local bname = bag.en or bag.english or bag.command or tostring(bag_id)
@@ -1065,7 +1107,13 @@ local function pool_check(index, id)
         enqueue_pool(index, 'pass')
     elseif r.lot[id] then
         if not pool_autolot_on then return end
-        if resupply_is_rare(id) and resupply_count(id) >= 1 then return end
+        if resupply_is_rare(id) and resupply_count(id) >= 1 then
+            -- You already own this Rare item, so the game won't let you lot it again. With the desktop toggle
+            -- on, auto-pass it to clear your pool slot instead of leaving it sitting there un-acted (That one
+            -- guy's request). Default OFF: without the toggle we just stop lotting, as before.
+            if pool_pass_rare_owned then enqueue_pool(index, 'pass') end
+            return
+        end
         if pool_lotqty[id] and resupply_count(id) >= pool_lotqty[id] then return end -- quantity target reached; stop lotting
         local inv = windower.ffxi.get_bag_info(0)
         if inv and (inv.max - inv.count) > 1 then
@@ -1107,6 +1155,29 @@ local function find_in_bag(bag_id, item_id, limit)
     return nil
 end
 
+-- Is `bag` a destination we can move INTO right now? Mirrors the addon's storage-reachability model
+-- (aug/augdbg, slip reach): inventory + carry bags always; mog-house grants Safe/Storage/Locker/Safe2; a
+-- Nomad Moogle (in range, or experimental) grants Safe/Locker/Safe2 (NOT Storage). Used to override a false
+-- `get_bag_info().enabled` at a Nomad Moogle, where an OWNED storage bag is accessible but not "open".
+function dest_bag_reachable(bag)
+    if bag == 0 or bag == 5 or bag == 6 or bag == 7 then return true end
+    local info = windower.ffxi.get_info() or {}
+    if info.mog_house then return bag == 1 or bag == 2 or bag == 4 or bag == 9 end
+    if info.zone and NOMAD_ZONES[info.zone] and (experimental_features or nomad_near) then
+        return bag == 1 or bag == 4 or bag == 9
+    end
+    return false
+end
+
+-- The destination is usable when the game reports it open (di.enabled), OR it is a storage bag the character
+-- OWNS (di.max > 0, so a never-unlocked Safe 2 still can't be targeted) that is reachable from where we stand
+-- (mog house / nomad moogle). The latter covers the Nomad-Moogle case where `enabled` is false until opened.
+function dest_bag_usable(to_bag, di)
+    if not di then return false end
+    if di.enabled then return true end
+    return (di.max or 0) > 0 and dest_bag_reachable(to_bag)
+end
+
 local function enqueue_move(id, from_bag, to_bag, remaining)
     mark_move_dirty(to_bag)
     -- Resolve every source slot from ONE snapshot and queue a distinct move per slot.
@@ -1117,7 +1188,16 @@ local function enqueue_move(id, from_bag, to_bag, remaining)
     local items = windower.ffxi.get_items(from_bag)
     if type(items) ~= 'table' then return end
     local di = windower.ffxi.get_bag_info(to_bag)
-    local free = di and (di.max - di.count) or 999
+    -- Dest bag must be usable right now: open per the game, OR an OWNED storage bag reachable from where we
+    -- stand (incl. a Nomad Moogle, where `enabled` is false until the bag is opened). Firing move_item at a
+    -- bag the character can't actually open strands the item (the "items went to Safe2 I don't have" report);
+    -- a never-unlocked Safe 2 (max 0) still can't be targeted.
+    if not dest_bag_usable(to_bag, di) then
+        if move_debug then alex_chat(207, ('[Alexandria] movedbg: id=%d %d->%d SKIPPED dest not usable (di=%s enabled=%s max=%s)'):format(id, from_bag, to_bag, tostring(di ~= nil), tostring(di and di.enabled), tostring(di and di.max))) end
+        alex_chat(207, '[Alexandria] move skipped: destination bag is not open or not unlocked (stand at your Moogle; Mog Safe 2 must be unlocked first).', 'error')
+        return
+    end
+    local free = di.max - di.count
     local moves = {}
     for s = 1, (items.max or 0) do
         if remaining <= 0 or free <= 0 then break end
@@ -1130,9 +1210,18 @@ local function enqueue_move(id, from_bag, to_bag, remaining)
             free = free - 1 -- worst case each stack claims a fresh dest slot; merges only free more
         end
     end
+    if move_debug then
+        local info = windower.ffxi.get_info() or {}
+        alex_chat(207, ('[Alexandria] movedbg: id=%d %d->%d | dest enabled=%s max/cnt=%s/%s free=%s | mog=%s | queued=%d%s'):format(
+            id, from_bag, to_bag, tostring(di and di.enabled), tostring(di and di.max), tostring(di and di.count),
+            tostring(di and (di.max - di.count)), tostring(info.mog_house), #moves, (#moves == 0 and ' (NOTHING TO MOVE)' or '')))
+    end
     for _, mv in ipairs(moves) do
         local fb, tb, slot, count = from_bag, to_bag, mv.slot, mv.count
-        enqueue_fast(function() windower.ffxi.move_item(fb, tb, slot, count) end)
+        enqueue_fast(function()
+            local ok = pcall(windower.ffxi.move_item, fb, tb, slot, count)
+            if move_debug then alex_chat(207, ('[Alexandria] movedbg: move_item(%d->%d slot=%d x%d) ok=%s'):format(fb, tb, slot, count, tostring(ok))) end
+        end)
     end
 end
 
@@ -1140,7 +1229,16 @@ local function enqueue_move_exact(id, from_bag, to_bag, slot, count)
     mark_move_dirty(to_bag)
     enqueue_fast(function()
         local di = windower.ffxi.get_bag_info(to_bag)
-        if di and (di.max - di.count) <= 0 then return end
+        if move_debug then
+            local info = windower.ffxi.get_info() or {}
+            alex_chat(207, ('[Alexandria] movedbg: exact id=%d %d->%d slot=%d | dest enabled=%s free=%s | mog=%s'):format(
+                id, from_bag, to_bag, slot, tostring(di and di.enabled), tostring(di and (di.max - di.count)), tostring(info.mog_house)))
+        end
+        if not dest_bag_usable(to_bag, di) then
+            alex_chat(207, '[Alexandria] move skipped: destination bag is not open or not unlocked (stand at your Moogle; Mog Safe 2 must be unlocked first).', 'error')
+            return
+        end
+        if (di.max - di.count) <= 0 then return end
         local items = windower.ffxi.get_items(from_bag)
         local it = items and type(items) == 'table' and items[slot]
         if not (type(it) == 'table' and it.id == id and it.id ~= 0) then
@@ -1327,13 +1425,14 @@ local function fire_drop(inv, d)
     drop_queued[d.slot] = nil
     local it = inv and inv[d.slot]
     if type(it) == 'table' and it.id == d.id and (it.count or 0) > 0 then
+        local cnt = it.count or 1   -- a stack drops in ONE packet; tally the actual quantity, not "1 drop"
         if packets_ok then
-            packets.inject(packets.new('outgoing', 0x028, { ['Count'] = it.count, ['Bag'] = 0, ['Inventory Index'] = d.slot }))
+            packets.inject(packets.new('outgoing', 0x028, { ['Count'] = cnt, ['Bag'] = 0, ['Inventory Index'] = d.slot }))
         else
-            windower.ffxi.drop_item(d.slot, it.count)
+            windower.ffxi.drop_item(d.slot, cnt)
         end
-        drop_done = drop_done + 1
-        drop_report[d.id] = (drop_report[d.id] or 0) + 1
+        drop_done = drop_done + cnt
+        drop_report[d.id] = (drop_report[d.id] or 0) + cnt
         return true
     end
     return false
@@ -1820,23 +1919,13 @@ local function le2(v) v = math.floor(v); return string.char(v % 256, math.floor(
 
 function ah_request_status()
     if not packets_ok then return false end
+    -- Ask only for the sale-status of all 7 slots (0x4E cmd 0x0A, slot 0xFF). The server answers with the
+    -- 0x4C cmd 0x0A updates ah_handle_incoming reads. We DELIBERATELY do NOT send cmd 0x05 ("open AH menu")
+    -- here: that asks the server to open the counter and pops the in-game auction window. AuctionHelper never
+    -- opens the window to read status or to sell; it just listens to 0x4C. Match that.
     local work = string.char(0x4E, 0x1E, 0, 0, 0x0A, 0xFF, 0, 0) .. string.rep('\0', 52)
+    ah_status_pending = true
     pcall(windower.packets.inject_outgoing, 0x4E, work)
-    coroutine.schedule(function()
-        if packets_ok then
-            local info = string.char(0x4E, 0x1E, 0, 0, 0x05, 0, 0, 0) .. string.rep('\0', 52)
-            pcall(windower.packets.inject_outgoing, 0x4E, info)
-        end
-    end, 0.5)
-    return true
-end
-
--- Pop the in-game auction house window by injecting the server's menu-open response
--- (incoming 0x4C, option 0x02), the same client-side trick used to open the delivery box.
-function ah_open_menu()
-    if not packets_ok then return false end
-    local p = string.char(0x4C, 0x1E, 0, 0, 0x02, 0, 0x01) .. string.rep('\0', 53)
-    pcall(windower.packets.inject_incoming, 0x4C, p)
     return true
 end
 
@@ -2690,6 +2779,7 @@ STORE_DEFAULTS = {
     ['Isakoth']    = { zone = 235, id = 17739953, index = 177, items = { 8711 } },
     ['Aurix']      = { zone = 243, id = 17772865, index = 321, items = { 9538, 9540, 9542 }, batch = 100 },  -- Rusted I. Card, Black. I. Card, Old I. Card (Ru'Lude Gardens; NPC also appears as "???")
     ['Greyson']    = { zone = 245, id = 17781000, index = 264, items = { 9277 } },
+    ['Geosuke']    = { zone = 257, id = 17830144, index = 256, items = { 8798 } },  -- H-P Bayld
     ['Haggleblix'] = { zone = 147, id = 17379846, index = 518, items = { 1455 }, batch = 100 },
     ['Divainy-Gamainy'] = { zone = 256, id = 17826144, index = 352, items = { 3951, 3952, 3953, 3954, 3955, 3956, 4033, 4034, 4035, 8930, 8931, 8932, 8939, 8940, 8941, 8948, 8949, 8950, 8957, 8958, 8959, 8933, 8934, 8935, 8942, 8943, 8944, 8951, 8952, 8953, 8960, 8961, 8962, 8936, 8937, 8938, 8945, 8946, 8947, 8954, 8955, 8956, 8963, 8964, 8965 } },  -- Skirmish stones: Ghastly/Wailing/Verdigris + Snow/Leaf/Dusk (slit/tip/dim/orb), each base/+1/+2
     ['Eternal Flame']   = { zone = 256, id = 17826104, index = 312, items = { 8711 } },  -- Copper Voucher
@@ -3134,6 +3224,7 @@ end
 
 function store_enqueue(npc, id, want, drop)
     if id == SPKEY_ID then gobbie_enqueue(npc, want) return end
+    if is_cipher(id) then cipher_begin() return end  -- a cipher run does ALL held ciphers, ignoring id/want
     if store_run and store_run.npc == npc and store_run.id == id then return end
     for _, q in ipairs(store_q) do
         if q.npc == npc and q.id == id then q.want = math.max(q.want, want); q.drop = q.drop or drop; return end
@@ -3255,6 +3346,35 @@ function build_storezone()
     end
     for name, d in pairs(store_discovered) do
         if type(d) == 'table' and type(d.items) == 'table' then emit(name, d.items) end
+    end
+    -- Trust cipher NPC: only when standing at a known cipher NPC (live) and holding >=1 cipher. Keyed by
+    -- the live mob name, so no NPC name has to be known ahead of time. kind=cipher tells the UI to show a
+    -- single "Turn In All" action instead of per-item store steppers.
+    local cnid, _, cnname = cipher_find_npc()
+    if cnid and cnname and not seen[cnname] then
+        -- Bag 0 (main inventory) ONLY: a trade can only come from inventory, so this is exactly the set the
+        -- engine will turn in. Scanning the wider store_bags() would show satchel/sack copies the engine
+        -- can't trade and double the count.
+        local held, agg = {}, {}
+        local inv = windower.ffxi.get_items(0)
+        if type(inv) == 'table' then
+            for s = 1, (inv.max or 80) do
+                local it = inv[s]
+                if type(it) == 'table' and is_cipher(it.id) and it.status == 0 and (it.count or 0) > 0 and res.items[it.id] then
+                    agg[it.id] = (agg[it.id] or 0) + it.count
+                end
+            end
+        end
+        local order = {}
+        for iid in pairs(agg) do order[#order + 1] = iid end
+        table.sort(order)
+        for _, iid in ipairs(order) do
+            held[#held + 1] = '{"id":' .. iid .. ',"n":"' .. esc(res.items[iid].en) .. '","c":' .. agg[iid] .. '}'
+        end
+        if #held > 0 then
+            seen[cnname] = true
+            parts[#parts + 1] = '{"npc":"' .. esc(cnname) .. '","batch":0,"kind":"cipher","items":[' .. table.concat(held, ',') .. ']}'
+        end
     end
     if store_debug then store_dbg(('build_storezone zone=%s npcs=%d'):format(tostring((windower.ffxi.get_info() or {}).zone), #parts)) end
     return '{"t":"storezone","npcs":[' .. table.concat(parts, ',') .. ']}\n'
@@ -3445,6 +3565,280 @@ function gobbie_tick(now)
     end
 end
 
+-- ===== Trust Ciphers (turn-in to learn trusts) ======================================
+-- Ciphers are trust scrolls (item ids CIPHER_ID_MIN..MAX) traded to a trust NPC to learn the trust.
+-- Captured turn-in sequence, consistent across every trust: trade 1 cipher (0x036) -> the NPC opens an
+-- event menu (0x034) whose offset 0x0C carries a PARAM the server pre-selected for that trust -> the
+-- client echoes that param back (0x05B) to confirm. The param is NOT per-item data we store; we read it
+-- live from the 0x034 and echo it, so ONE code path handles all 82 ciphers at any trust NPC on any
+-- server. Mirrors the SP Gobbie Key menu flow (gobbie_*), simplified to a single echo + consume-detect.
+CIPHER_ID_MIN = 10112
+CIPHER_ID_MAX = 10193
+function is_cipher(id) return id ~= nil and id >= CIPHER_ID_MIN and id <= CIPHER_ID_MAX end
+-- Mob (server) ids of known trust-cipher NPCs. A cipher NPC is any nearby mob whose id is in this set;
+-- its real name + index come from the live entity, so no per-NPC name is needed. Extend as more are
+-- captured (one NPC confirmed so far, from the packet logs).
+CIPHER_NPC_IDS = { [17719985] = true, [17744189] = true, [17764794] = true }  -- Gondebaud (z230 idx689) + Clarion Star (z236 idx317) + Wetata (z241 idx442)
+cipher_run = nil
+
+-- Nearest in-range (<=6y) live mob that is a known cipher NPC. Returns id, index, name.
+function cipher_find_npc()
+    local arr = windower.ffxi.get_mob_array()
+    if not arr then return nil end
+    local bid, bidx, bname, bd
+    for _, v in pairs(arr) do
+        if type(v) == 'table' and v.id and CIPHER_NPC_IDS[v.id] and v.index and v.distance then
+            local d = math.sqrt(v.distance)
+            if d <= 6 and (not bd or d < bd) then bid, bidx, bname, bd = v.id, v.index, v.name, d end
+        end
+    end
+    return bid, bidx, bname
+end
+
+-- Count of a given item id in the main inventory (bag 0), status 0 only.
+function cipher_count(id)
+    local inv = windower.ffxi.get_items(0)
+    if type(inv) ~= 'table' then return 0 end
+    local n = 0
+    for s = 1, (inv.max or 80) do
+        local it = inv[s]
+        if type(it) == 'table' and it.id == id and it.status == 0 then n = n + (it.count or 0) end
+    end
+    return n
+end
+
+-- First bag-0 slot holding any cipher, plus the total cipher count and that slot's item id.
+-- `skip` (optional id->true set) excludes ciphers we've decided not to trade this run (already-learned
+-- trusts, or ones a trade attempt didn't consume), so the run advances past them instead of re-picking.
+function cipher_next_slot(skip)
+    local inv = windower.ffxi.get_items(0)
+    if type(inv) ~= 'table' then return nil, 0, nil end
+    local slot, total, sid = nil, 0, nil
+    for s = 1, (inv.max or 80) do
+        local it = inv[s]
+        if type(it) == 'table' and is_cipher(it.id) and it.status == 0 and (it.count or 0) > 0 and not (skip and skip[it.id]) then
+            if not slot then slot, sid = s, it.id end
+            total = total + (it.count or 0)
+        end
+    end
+    return slot, total, sid
+end
+
+-- Map a cipher item id to the Trust spell it teaches, by matching the item name ("Cipher: Zeid") to the
+-- Trust spell of the same name ("Zeid"). Built once from resources (covers every current + future cipher
+-- without a hand-maintained table); a cipher whose name doesn't match a Trust spell stays unmapped and is
+-- simply trade-attempted (the reactive skip still protects against a hang).
+cipher_spell_cache = nil
+function cipher_spell_id(cipher_id)
+    if not cipher_spell_cache then
+        cipher_spell_cache = {}
+        local byname = {}
+        for sid, sp in pairs(res.spells) do
+            if type(sp) == 'table' and sp.type == 'Trust' and sp.en then byname[sp.en:lower()] = sid end
+        end
+        for iid = CIPHER_ID_MIN, CIPHER_ID_MAX do
+            local it = res.items[iid]
+            local nm = it and it.en
+            if nm then
+                local tn = nm:gsub('^[Cc]ipher:%s*', ''):lower()
+                if byname[tn] then cipher_spell_cache[iid] = byname[tn] end
+            end
+        end
+    end
+    return cipher_spell_cache[cipher_id]
+end
+
+-- True when the Trust this cipher teaches is already learned (so trading it would just hang the turn-in).
+function cipher_known(cipher_id)
+    local sid = cipher_spell_id(cipher_id)
+    if not sid then return false end
+    local sp = windower.ffxi.get_spells()
+    return type(sp) == 'table' and sp[sid] == true
+end
+
+-- Verbose turn-in trace, gated behind store debug (//ax storedebug) so normal runs stay quiet.
+function cipher_log(msg) if store_debug then alex_chat(160, '[cipher] ' .. msg, 'action') end end
+
+function cipher_finish()
+    local r = cipher_run
+    cipher_run = nil
+    if r then
+        cipher_log(('finish: phase=%s done=%d/%d cur_id=%d timedout=%s'):format(tostring(r.phase), r.done or 0, r.want or 0, r.cur_id or 0, tostring(r.timedout)))
+        local skipped = r.skipped or 0
+        if r.timedout then
+            -- The NPC never opened the turn-in event (no 0x034): it is locked behind unlocking that Trust NPC.
+            local extra = (r.done or 0) > 0 and (' (' .. r.done .. ' done)') or ''
+            alex_chat(207, '[Alexandria] Cipher trade failed' .. extra .. '. Did you unlock the Trust NPC?', 'error')
+        else
+            local msg = ('[Alexandria] Turned in %d cipher%s'):format(r.done or 0, (r.done == 1) and '' or 's')
+            if skipped > 0 then msg = msg .. (', skipped %d already learned'):format(skipped) end
+            alex_chat(207, msg, 'action')
+        end
+        emit_store(false, r.cur_id or CIPHER_ID_MIN, r.done or 0, r.want or 0, 'done')
+    end
+    store_dirty = true
+end
+
+function cipher_begin()
+    if store_run or gobbie_run or cipher_run then return end
+    if not packets_ok then alex_chat(207, '[Alexandria] packets unavailable', 'error') return end
+    local nid, nidx, nname = cipher_find_npc()
+    if not nid then alex_chat(207, '[Alexandria] no trust cipher NPC in range', 'error') return end
+    local slot, total = cipher_next_slot()
+    if not slot or total <= 0 then alex_chat(207, '[Alexandria] no ciphers held', 'error') return end
+    local zinfo = windower.ffxi.get_info()
+    cipher_run = { npc_id = nid, npc_index = nidx, npc = nname or 'Cipher NPC',
+        zone = (zinfo and zinfo.zone) or store_last_zone, want = total, done = 0, skipped = 0, skip = {},
+        phase = 'trade', menu = nil, cur_id = nil, cur_count = nil, t = os.clock(), start = os.clock() }
+    cipher_log(('begin npc=%s id=%d idx=%d zone=%d total=%d firstslot=%d'):format(nname or '?', nid, nidx or -1, cipher_run.zone or -1, total, slot))
+    alex_chat(207, ('[Alexandria] Turning in %d cipher%s at %s...'):format(total, (total == 1) and '' or 's', nname or 'the NPC'), 'action')
+    emit_store(true, CIPHER_ID_MIN, 0, total, 'using')
+end
+-- A cipher run always does ALL held ciphers; a second request while one runs is a no-op.
+cipher_enqueue = cipher_begin
+
+function cipher_trade()
+    local r = cipher_run
+    if not r then return end
+    -- Pick the next cipher we haven't skipped, proactively skipping any whose Trust is already learned
+    -- (trading those just hangs the turn-in). Loop so a run of already-known ciphers is skipped at once.
+    local slot, sid
+    while true do
+        slot, _, sid = cipher_next_slot(r.skip)
+        if not slot then cipher_log('trade: no cipher slot -> finish'); cipher_finish() return end
+        if cipher_known(sid) then
+            r.skip[sid] = true; r.skipped = (r.skipped or 0) + 1
+            cipher_log(('trade: id=%d Trust already learned -> skip'):format(sid))
+            emit_store(true, sid, r.done, r.want, 'using')
+        else
+            break
+        end
+    end
+    r.cur_id = sid
+    r.cur_count = cipher_count(sid)
+    local ok, err = pcall(function() packets.inject(packets.new('outgoing', 0x036, {
+        ['Target'] = r.npc_id, ['Target Index'] = r.npc_index,
+        ['Item Count 1'] = 1, ['Item Index 1'] = slot, ['Number of Items'] = 1,
+    })) end)
+    cipher_log(('trade item=%d slot=%d cnt=%d npc=%d idx=%d inject=%s'):format(sid or -1, slot, r.cur_count or -1, r.npc_id, r.npc_index or -1, ok and 'ok' or ('ERR ' .. tostring(err))))
+    r.phase = 'menu'
+    r.t = os.clock()
+end
+
+-- Runs before the generic NPC-menu handler so we drive (and hide) the cipher event ourselves. On the
+-- 0x034 the trade opens, read the server's pre-selected PARAM (offset 0x0C) plus the event id/index/
+-- zone/menu, then echo the param in a 0x05B to confirm the turn-in. Swallow the event chunks so the
+-- client never pops the dialog. 0x05B byte layout matches the captures exactly:
+--   5B 0A ss ss | npc_id(4) | param(4) | index(2) | 00 00 | zone(2) | menu(2)
+function cipher_incoming(id, data)
+    local r = cipher_run
+    if not r then return nil end
+    if id == 0x032 or id == 0x034 then
+        local pnpc  = data:unpack('I', 0x04 + 1)
+        local param = data:unpack('I', 0x0C + 1)
+        local nidx  = data:unpack('H', 0x28 + 1)
+        local zone  = data:unpack('H', 0x2A + 1)
+        local menu  = data:unpack('H', 0x2C + 1)
+        cipher_log(('in 0x%03X ph=%s pnpc=%d mine=%d param=%d idx=%d zone=%d menu=%d'):format(id, tostring(r.phase), pnpc, r.npc_id, param, nidx, zone, menu))
+        if r.phase == 'menu' and pnpc == r.npc_id then
+            r.menu = menu
+            local p = string.char(0x5B, 0x0A, 0, 0) .. le4(r.npc_id) .. le4(param)
+                .. le2(nidx) .. le2(0) .. le2(zone) .. le2(menu)
+            local ok, err = pcall(windower.packets.inject_outgoing, 0x5B, p)
+            cipher_log(('echo 0x5B param=%d menu=%d zone=%d idx=%d send=%s'):format(param, menu, zone, nidx, ok and 'ok' or ('ERR ' .. tostring(err))))
+            r.phase = 'confirm'
+            r.t = os.clock()
+        end
+        return true  -- hide the event dialog
+    elseif id == 0x05C or id == 0x052 then
+        if r.phase == 'confirm' or r.phase == 'menu' then cipher_log(('in 0x%03X ph=%s (swallowed)'):format(id, tostring(r.phase))) end
+        return true  -- swallow any sub-menu / ack chunks during our event
+    end
+    return nil
+end
+
+function cipher_tick(now)
+    local r = cipher_run
+    if not r then return end
+    if now - r.start > 600 then store_dbg('cipher: global timeout'); cipher_finish() return end
+    if r.phase == 'trade' then
+        local slot, total = cipher_next_slot(r.skip)
+        if not slot or total <= 0 then cipher_log('tick trade: no ciphers -> finish'); cipher_finish() return end
+        if not (select(1, cipher_find_npc())) then cipher_log('tick trade: NPC left range -> finish'); cipher_finish() return end
+        cipher_trade()
+    elseif r.phase == 'menu' then
+        if now - r.t > 10 then cipher_log(('menu timeout (no 0x034 in %.0fs) -> finish'):format(now - r.t)); r.timedout = true; cipher_finish() return end
+    elseif r.phase == 'confirm' then
+        -- The turn-in completes when the traded cipher's count drops (item consumed after the cutscene).
+        if r.cur_id and cipher_count(r.cur_id) < (r.cur_count or 0) then
+            r.done = r.done + 1
+            cipher_log(('consumed item=%d (%d->%d) done=%d/%d -> next'):format(r.cur_id, r.cur_count or -1, cipher_count(r.cur_id), r.done, r.want))
+            emit_store(true, r.cur_id, r.done, r.want, 'using')
+            r.phase = 'trade'
+            r.t = os.clock()
+        elseif now - r.t > 12 then
+            -- The menu opened but the cipher was never consumed (almost always a Trust already learned, or an
+            -- otherwise-rejected cipher). Skip THIS cipher and continue with the rest instead of hanging the
+            -- whole run -- the reactive backstop for anything the proactive cipher_known() check missed.
+            cipher_log(('confirm timeout: item=%d not consumed in %.0fs -> skip & continue'):format(r.cur_id or -1, now - r.t))
+            if r.cur_id then r.skip[r.cur_id] = true; r.skipped = (r.skipped or 0) + 1 end
+            r.phase = 'trade'
+            r.t = os.clock()
+        end
+    end
+end
+
+-- ==================== Generic event skipper (//ax skip) ====================
+-- A "forward" for NPC dialogue/cutscenes: when an event opens (incoming 0x032 = event, 0x034 = event w/ params,
+-- 0x033 = event update), echo the server's OWN event params back as an EVENTEND (outgoing 0x05B) so the client
+-- advances/closes the event with its default option -- the same menu-agnostic echo the cipher/reforge paths use,
+-- generalized. Reflecting the server's param (not a blind 0) keeps multi-stage story cutscenes in sync as each
+-- chunk streams in. HARD LIMIT: never touches 0x05C (list/selection menus) -- those need a real choice, so a
+-- blind forward would pick the wrong option. Prototype: armed by //ax skip; outgoing injection on the player's
+-- own connection only, same as every other feature. Globals (not locals) to respect the main-chunk local cap.
+skip_run = nil            -- { mode='once'|'on', start, last, count, lastkey, lastkey_t }
+SKIP_IDLE = 1.5           -- 'once' mode: disarm this many seconds after the last advanced event (chain ended)
+SKIP_TIMEOUT = 20         -- 'once' mode: hard cap so a never-arriving event doesn't leave it armed forever
+SKIP_DEDUP = 0.3          -- ignore a repeat EVENTEND for the same (zone,menu) within this window (0x033 spam)
+
+function skip_incoming(id, data)
+    local r = skip_run
+    if not r then return nil end
+    if id == 0x05C then return nil end                       -- selection list: leave it for the user, never forward
+    if id ~= 0x032 and id ~= 0x034 then return nil end       -- event START only (0x033 updates are short/partial)
+    -- Parse by field name instead of raw offsets: 0x032 (plain event) is shorter than 0x034 (event w/ params),
+    -- so fixed offsets read past the end and come back nil. Zone/Menu ID are required to form a valid EVENTEND.
+    local ok, pk = pcall(packets.parse, 'incoming', data)
+    if not ok or type(pk) ~= 'table' then return nil end
+    local zone = pk['Zone']
+    local menu = pk['Menu ID']
+    if not zone or not menu then return nil end              -- can't address the event -> leave it alone
+    local npc  = pk['NPC'] or pk['Actor'] or pk['Target'] or 0
+    local nidx = pk['NPC Index'] or pk['Target Index'] or 0
+    local key = zone * 65536 + menu
+    if r.lastkey == key and (os.clock() - (r.lastkey_t or 0)) < SKIP_DEDUP then return nil end
+    r.lastkey, r.lastkey_t = key, os.clock()
+    -- EVENTEND (0x05B) option 0, echoing the event's own Zone + Menu ID -> advance/close this event.
+    local out = packets.new('outgoing', 0x05B, {
+        ['Target'] = npc, ['Target Index'] = nidx, ['Option Index'] = 0,
+        ['Zone'] = zone, ['Menu ID'] = menu, ['_unknown1'] = 0, ['Automated Message'] = false,
+    })
+    pcall(packets.inject, out)
+    r.last = os.clock()
+    r.count = r.count + 1
+    return nil                                               -- let the event through; the EVENTEND ends it. don't swallow.
+end
+
+function skip_tick(now)
+    local r = skip_run
+    if not r or r.mode ~= 'once' then return end             -- 'on' mode persists until //ax skip off
+    if (now - r.start) > SKIP_TIMEOUT or (r.count > 0 and (now - r.last) > SKIP_IDLE) then
+        local n = r.count
+        skip_run = nil
+        alex_chat(207, ('[Alexandria] skip: advanced %d event%s, off.'):format(n, n == 1 and '' or 's'))
+    end
+end
+
 function build_store()
     local p = store_progress
     if not p then return '{"t":"store","active":false}\n' end
@@ -3452,7 +3846,9 @@ function build_store()
         p.active and 'true' or 'false', p.item, p.done, p.total, esc(p.phase))
 end
 
-function shop_autosell_run()
+-- force: an explicit user flush (//ax sellall) that must sell even with Auto-Sell In Towns off and no shop open.
+-- The caller has already confirmed the player is in a town or at a shop, so it's safe to bypass shop_do_sell's gate.
+function shop_autosell_run(force)
     if not packets_ok then return end
     -- Stand down while the player is hands-on the sell menu. FFXI's 0x085 confirm carries no
     -- item; it sells whatever the last 0x084 appraise selected, and that slot is shared with
@@ -3467,7 +3863,7 @@ function shop_autosell_run()
             -- Guard against re-sending a sell for a slot whose previous sell the
             -- server hasn't confirmed yet (inventory still shows the item).
             if not shop_sold[s] or (now - shop_sold[s]) > 3 then
-                shop_do_sell(it.id, s, it.count or 1)
+                shop_do_sell(it.id, s, it.count or 1, force)
                 shop_sold[s] = now
             end
         end
@@ -4576,6 +4972,7 @@ function ah_sell(id, single, price)
     end
     local p = string.char(0x4E, 0x1E, 0, 0, 0x04, 0, 0, 0) .. le4(price) .. le2(index) .. le2(id)
         .. string.char(single) .. string.rep('\0', 43)
+    ah_status_pending = false -- a sell is now the in-flight action; only its 0x0B confirm may release the queue
     ah_last4e = p
     pcall(windower.packets.inject_outgoing, 0x4E, p)
     return true
@@ -4670,7 +5067,7 @@ function ah_handle_incoming(data)
                 local last = ah_last4e
                 local confirm = string.char(0x4E, 0x1E, 0, 0, 0x0B, slot, 0, 0) .. last:sub(9, 12) .. data:sub(13, 14) .. string.char(0, 0) .. last:sub(17)
                 ah_last4e = nil
-                coroutine.schedule(function() if packets_ok and ah_usable() then pcall(windower.packets.inject_outgoing, 0x4E, confirm) end end, 1)
+                coroutine.schedule(function() if packets_ok and ah_usable() then pcall(windower.packets.inject_outgoing, 0x4E, confirm) end end, 0.5)
             elseif ah_last4e then
                 ah_last4e = nil
                 ah_busy = false
@@ -4683,6 +5080,11 @@ function ah_handle_incoming(data)
         end
     elseif t == 0x0A then
         if r == 1 then ah_update_slot(p, data) end
+        -- Our status request was the in-flight queue action: its reply means the server answered, so release
+        -- the queue now instead of stalling on AH_BUSY_TIMEOUT. Only when WE asked (a passive 0x0A arriving
+        -- mid-sell must not release a listing still waiting on its 0x0B confirm). AH_DELAY still spaces the
+        -- next action, which gives the remaining slot replies time to land before the first sell reads ah_box.
+        if ah_status_pending then ah_status_pending = false; ah_busy = false end
     elseif t == 0x0B then
         if r == 0x01 then
             ah_busy = false
@@ -5708,6 +6110,7 @@ local function dispatch(line)
         pool_rules.drop = ids_for_names(msg.drop)
         pool_lotqty = idqty_for_names(msg.lotqty)
         pool_pass_on_lot = msg.passOnLot and true or false
+        pool_pass_rare_owned = msg.passRareOwned and true or false
         pool_autolot_on = msg.autoLot ~= false
         for idx, it in pairs(pool) do if it and it.id then pool_check(idx, it.id) end end
     elseif msg.cmd == 'tradenpc' then
@@ -5728,6 +6131,13 @@ local function dispatch(line)
         aug_cape_start(msg.job, msg.material, msg.path, msg.repeats, msg.bag, msg.slot, msg.confirm_mode, msg.bulk)
     elseif msg.cmd == 'augcapeseq' then
         aug_cape_seq_start(msg.job, msg.bag, msg.slot, msg.steps, msg.confirm_mode, msg.bulk)
+    elseif msg.cmd == 'unityreinforce' then
+        unity_start(msg)
+    elseif msg.cmd == 'unityopen' then
+        msg.mode = 'open'
+        unity_start(msg)
+    elseif msg.cmd == 'unitystop' then
+        unity_stop()
     elseif msg.cmd == 'auggear' then
         aug_gear_start(msg)
     elseif msg.cmd == 'auginfo' then
@@ -5770,8 +6180,16 @@ local function dispatch(line)
         bz_deepscan()
     elseif msg.cmd == 'bzscanstop' then
         bz_sweep_stop()
-    elseif msg.cmd == 'bzbuy' and msg.sellerid and msg.sellerindex ~= nil and msg.bidx ~= nil then
-        bz_open(tonumber(msg.sellerid), tonumber(msg.sellerindex), { bidx = tonumber(msg.bidx), expect_id = tonumber(msg.id), expect_price = tonumber(msg.price), num = tonumber(msg.qty) or 1 })
+    elseif msg.cmd == 'bzbuy' and msg.sellerid and msg.sellerindex ~= nil and type(msg.items) == 'table' then
+        -- Confirm-driven batched buy (bz_job_tick): examine -> browse -> WAIT list -> buy EVERY queued item from
+        -- this seller (each WAITs for its 0x106 result) -> leave once. The desktop sends one command per seller.
+        local sid, sidx = tonumber(msg.sellerid), tonumber(msg.sellerindex)
+        local items = {}
+        for _, it in ipairs(msg.items) do
+            if it.bidx ~= nil then items[#items + 1] = { bidx = tonumber(it.bidx), id = tonumber(it.id), price = tonumber(it.price), qty = tonumber(it.qty) or 1 } end
+        end
+        if bz_sweep and bz_sweep.active then bz_sweep_stop() end   -- a live scan shares the wire; stop it so it can't clobber the buy
+        if not bz_job and #items > 0 then bz_job_start(sid, sidx, items) end
     elseif msg.cmd == 'bzapply' and type(msg.items) == 'table' then
         bz_apply(msg.items)
     elseif msg.cmd == 'bzmessage' then
@@ -5799,6 +6217,8 @@ local function dispatch(line)
         use_id = nil; use_left = 0; use_pending = nil
     elseif msg.cmd == 'store' and msg.npc and msg.id then
         store_enqueue(tostring(msg.npc), tonumber(msg.id), math.max(1, tonumber(msg.want) or 1), msg.drop and true or false)
+    elseif msg.cmd == 'ciphers' then
+        cipher_begin()
     elseif msg.cmd == 'storeadd' and msg.npc and type(msg.zone) == 'number' and msg.id and msg.index ~= nil then
         -- A store NPC learned on another character; register it here too (fleet sync).
         local items = {}
@@ -5813,6 +6233,11 @@ local function dispatch(line)
     elseif msg.cmd == 'experimental' then
         experimental_features = msg.on and true or false
         store_dirty = true
+    elseif msg.cmd == 'ahdelay' then
+        -- User-adjustable spacing between auction listings (the real gate is still ah_busy = prior listing
+        -- confirmed, so this is just a server-safety floor). Clamp to a sane range.
+        local s = tonumber(msg.sec)
+        if s then AH_DELAY = math.max(0.3, math.min(5, s)) end
     elseif msg.cmd == 'silence' then
         silent_cat.action = msg.action and true or false
         silent_cat.progress = msg.progress and true or false
@@ -5869,6 +6294,17 @@ local function dispatch(line)
     elseif msg.cmd == 'tradearm' and msg.from then
         trade_armed = { name = tostring(msg.from), id = tonumber(msg.fromId), t = os.clock() }
         if trade_debug then trade_log(('RX tradearm from=%s id=%s'):format(tostring(msg.from), tostring(msg.fromId))) end
+    elseif msg.cmd == 'findcolors' then
+        local fc = { name = tonumber(msg.name) or 0, item = tonumber(msg.item) or 0, bags = {} }
+        if type(msg.bags) == 'table' then
+            for k, v in pairs(msg.bags) do local n = tonumber(v); if n and n > 0 then fc.bags[tostring(k):lower()] = n end end
+        end
+        find_colors = fc
+    elseif msg.cmd == 'bzdelays' then
+        -- Customize the bazaar scan pacing. Only overwrite keys that arrive as valid non-negative numbers.
+        for _, k in ipairs({ 'open_b', 'open_j', 'collect_stocked', 'collect_empty', 'exit_b', 'exit_j', 'seller_b', 'seller_j' }) do
+            local n = tonumber(msg[k]); if n and n >= 0 then bz_delays[k] = n end
+        end
     elseif msg.cmd == 'axecho' and msg.text then
         alex_chat(207, '[Alexandria] ' .. ax_colorize(tostring(msg.text)))
     elseif msg.cmd == 'memlog' then
@@ -5920,7 +6356,7 @@ local function dispatch(line)
         -- "auction house is temporarily closed for trading", which spams anyone standing in a normal zone
         -- with the Market view open. Just report we are not at an AH so the UI stops asking.
         if ah_usable() then
-            ah_open_menu()
+            -- Status only, no window pop (was ah_open_menu(), which faked the server's open-counter reply).
             ah_enqueue(function() return ah_request_status() end)
         else
             queue_send(build_ah())
@@ -5943,6 +6379,10 @@ local function dispatch(line)
         if not ah_usable() then
             queue_send('{"t":"ahmsg","ok":false,"text":"Not at an auction house"}\n')
         else
+            -- Prime the slot table before selling: ah_find_empty() needs ah_box to know the free slots. A silent
+            -- sale-status request (no window) is enqueued BEFORE the sells; the queue is sequential, so ah_box is
+            -- filled by the time the first ah_sell runs.
+            ah_enqueue(function() return ah_request_status() end)
             local id, single, price = tonumber(msg.id), (msg.single == 1 and 1 or 0), tonumber(msg.price) or 0
             local qty = math.max(1, math.min(7, tonumber(msg.qty) or 1))
             local bag = tonumber(msg.bag) or 0
@@ -6034,6 +6474,17 @@ local function finish_connect(s)
     ki_dirty_at = os.clock() - 1.0
     ah_dirty = true
     store_dirty = true
+    -- Resend proximity state too. Without this, a client that (re)connects while already standing at a fixed
+    -- NPC never receives fixednear/vendornear/porternear (the dedup keys are unchanged), so the augment Start
+    -- button stays greyed "as if not near the NPC" until the player walks out of range and back. Nulling the
+    -- dedup makes the next npc_scan (<=0.5s) recompute and resend the true current proximity. (GF/Oseem report.)
+    fixed_near_key = nil
+    store_wp_near_key = nil
+    porter_near = nil
+    sparks_near = nil
+    unity_near = nil
+    curio_near = nil
+    npc_near = nil
     party_key = nil
     party_check_t = 0
 end
@@ -7638,27 +8089,122 @@ do
         pcall(windower.packets.inject_outgoing, 0x0DD, string.char(0xDD, 0x08, 0, 0) .. le4(id) .. le4(index) .. string.char(0, 0, 0, 0))
     end
 
-    function bz_buy_result(ok, name, reason)
-        local b = bz_buy
-        bz_buy = nil
-        bz_buy_msg = { ok = ok, name = name or '', reason = reason or '', sellerid = (b and b.sellerid) or 0, bidx = (b and b.bidx) or -1, qty = (b and b.num) or 0 }
+    -- Leave the bazaar we're currently browsing: GP_CLI_COMMAND_BAZAAR_EXIT (0x0104, header-only). A real player
+    -- examines, browses, then exits; without this the seller sees us stuck "browsing" forever. Fired after each
+    -- seller's items are collected in a sweep, and after a buy. Harmless if no bazaar is open (server ignores it).
+    function bz_exit()
+        if packets_ok then pcall(windower.packets.inject_outgoing, 0x104, string.char(0x04, 0x03, 0, 0)) end
+    end
+
+    -- Buy = a confirm-driven state machine, ONE seller at a time, that BATCHES every item wanted from that seller
+    -- into a single visit. Each step waits for the SERVER's own reply before the next, so packets never interleave:
+    --   examine -> (pause) -> browse -> WAIT for the 0x105 list -> for each wanted item: (pause) -> buy 0x106 ->
+    --   WAIT for the 0x106 result -> report that item -> ... -> leave 0x104 once, after the last item.
+    -- The desktop expects exactly one result frame per queued item (bought / declined / skipped), then the leave.
+    function bz_job_start(sid, sidx, items)
+        local m = windower.ffxi.get_mob_by_index(sidx)
+        bz_job = { sid = sid, sidx = sidx, name = (m and m.name) or '', queue = items, listing = {}, state = 'examine', at = os.clock() }
+    end
+
+    -- Incoming 0x105 while a buy job waits on the listing: accumulate the seller's items (confirms the browse).
+    function bz_job_list(data)
+        local j = bz_job
+        if not j then return end
+        local price = data:byte(0x04 + 1) + data:byte(0x05 + 1) * 256 + data:byte(0x06 + 1) * 65536 + data:byte(0x07 + 1) * 16777216
+        local qty = data:byte(0x08 + 1) + data:byte(0x09 + 1) * 256 + data:byte(0x0A + 1) * 65536 + data:byte(0x0B + 1) * 16777216
+        local itemno = data:byte(0x0E + 1) + data:byte(0x0F + 1) * 256
+        local bidx = data:byte(0x10 + 1)
+        if itemno and itemno > 0 then j.listing[#j.listing + 1] = { id = itemno, price = price, qty = qty, bidx = bidx } end
+        j.got_list = true
+        j.last_item = os.clock()
+    end
+
+    -- One result frame to the desktop per queued item. The desktop counts exactly these to know the seller is done.
+    function bz_emit_buy(ok, bidx, qty, reason)
+        bz_buy_msg = { ok = ok and true or false, name = (bz_job and bz_job.name) or '', reason = reason or '', sellerid = (bz_job and bz_job.sid) or 0, bidx = bidx or -1, qty = qty or 0 }
         bz_buy_dirty = true
     end
 
-    function bz_finish_buy(c)
-        bz_items_dirty = true
+    -- Incoming 0x106 (buy result) for the item currently in flight: byte 0x04 == 0 means bought. Report it, then
+    -- pace into the next queued item for THIS seller (no re-examine / re-browse / re-leave in between).
+    function bz_job_buy_reply(ok)
+        local j = bz_job
+        if not j or j.state ~= 'wait_buy' or not j.cur then return end
+        -- Desktop decrements its own listing off this result frame; do NOT flag bz_items_dirty -- build_bzitems
+        -- would re-emit the stale pre-buy scan listing (bz_collect) and clobber that decrement back to full qty.
+        bz_emit_buy(ok, j.cur.bidx, ok and j.cur.num or 0, ok and 'bought' or 'declined')
+        j.cur = nil
+        j.state = 'buydelay'
+        j.at = os.clock() + 0.5 + math.random() * 0.6   -- small gap between purchases
+    end
+
+    -- Pull the next queued item, validate it against the live listing, and either fire its buy or report a skip.
+    -- Exactly ONE desktop frame is emitted per visit (skip) or per 0x106 reply (buy) so none collapse within a tick.
+    function bz_job_next(now)
+        local j = bz_job
+        if #j.queue == 0 then j.state = 'leave'; j.at = now + 0.6 + math.random() * 0.8; return end
+        local t = table.remove(j.queue, 1)
         local target = nil
-        for _, it in ipairs(c.items) do
-            if it.bidx == c.buy.bidx then target = it break end
-        end
-        if not target then bz_buy_result(false, c.name, 'item no longer there') return end
-        if target.id ~= c.buy.expect_id then bz_buy_result(false, c.name, 'listing changed') return end
-        if c.buy.expect_price and target.price > c.buy.expect_price then bz_buy_result(false, c.name, 'price changed') return end
-        local num = c.buy.num or 1
+        for _, it in ipairs(j.listing) do if it.bidx == t.bidx then target = it break end end
+        if not target then bz_emit_buy(false, t.bidx, 0, 'item no longer there'); j.state = 'buydelay'; j.at = now + 0.3; return end
+        if t.id and target.id ~= t.id then bz_emit_buy(false, t.bidx, 0, 'listing changed'); j.state = 'buydelay'; j.at = now + 0.3; return end
+        if t.price and target.price > t.price then bz_emit_buy(false, t.bidx, 0, 'price changed'); j.state = 'buydelay'; j.at = now + 0.3; return end
+        local num = t.qty or 1
         if target.qty and num > target.qty then num = target.qty end
         if num < 1 then num = 1 end
-        pcall(windower.packets.inject_outgoing, 0x106, string.char(0x06, 0x07, 0, 0) .. string.char(c.buy.bidx % 256, 0, 0, 0) .. le4(num))
-        bz_buy = { name = c.name, sellerid = c.id, bidx = c.buy.bidx, num = num, t = os.clock() }
+        j.cur = { bidx = t.bidx, num = num }
+        j.state = 'buy'
+        j.at = now + 0.6 + math.random() * 0.8   -- pause before this purchase
+    end
+
+    function bz_job_tick(now)
+        local j = bz_job
+        if not j then return end
+        local s = j.state
+        if s == 'examine' then
+            if now >= j.at then
+                bz_check(j.sid, j.sidx)
+                j.state = 'browse'
+                j.at = now + 0.5 + math.random() * 0.5   -- examine -> look a beat -> open the bazaar
+            end
+        elseif s == 'browse' then
+            if now >= j.at then
+                if packets_ok then pcall(windower.packets.inject_outgoing, 0x105, string.char(0x05, 0x07, 0, 0) .. le4(j.sid) .. le2(j.sidx) .. le2(0)) end
+                j.state = 'wait_list'
+                j.got_list = false
+                j.last_item = now
+                j.at = now + 3.0   -- hard timeout if no listing ever comes back
+            end
+        elseif s == 'wait_list' then
+            -- Advance ONLY once the list has arrived and gone quiet (confirm). On timeout, fall through to the buy
+            -- loop with an empty listing so every queued item is reported 'item no longer there', one per tick.
+            if (j.got_list and (now - j.last_item) > 0.6) or (not j.got_list and now >= j.at) then
+                j.state = 'nextbuy'; j.at = now
+            end
+        elseif s == 'nextbuy' then
+            if now >= j.at then bz_job_next(now) end
+        elseif s == 'buy' then
+            if now >= j.at and j.cur then
+                if packets_ok then pcall(windower.packets.inject_outgoing, 0x106, string.char(0x06, 0x07, 0, 0) .. string.char(j.cur.bidx % 256, 0, 0, 0) .. le4(j.cur.num)) end
+                j.state = 'wait_buy'
+                j.at = now + 6.0   -- timeout waiting for the 0x106 result
+            end
+        elseif s == 'wait_buy' then
+            if now >= j.at then   -- reply drives the transition; this is only its timeout
+                if j.cur then bz_emit_buy(false, j.cur.bidx, 0, 'no response'); j.cur = nil end
+                j.state = 'buydelay'; j.at = now + 0.4
+            end
+        elseif s == 'buydelay' then
+            if now >= j.at then j.state = 'nextbuy'; j.at = now end
+        elseif s == 'leave' then
+            if now >= j.at then
+                bz_exit()
+                j.state = 'done'
+                j.at = now + 0.3
+            end
+        elseif s == 'done' then
+            if now >= j.at then bz_job = nil end
+        end
     end
 
     function bz_sweep_step(now)
@@ -7680,7 +8226,7 @@ do
         -- both carries the target and blocks the next step until this open has fired + collected.
         bz_check(nx.id, nx.index)
         s.pending = { id = nx.id, index = nx.index }
-        s.open_at = now + 3 + math.random() * 2
+        s.open_at = now + bz_delays.open_b + math.random() * bz_delays.open_j
     end
 
     local function bz_start_sweep(list, emptymsg)
@@ -7751,12 +8297,13 @@ do
     function bz_tick(now)
         local p = windower.ffxi.get_player()
         bz_self_index = p and p.index or nil
-        if bz_collecting and bz_collect and (now - bz_collect.t) > 0.5 then
+        -- Collect is "done" two ways: a stocked bazaar streams 0x105 items, so wait out a short QUIET gap after
+        -- the last one (bz_collect.t is bumped per item); an empty bazaar streams nothing, so only conclude empty
+        -- after a longer grace -- never slam the 0.5s window shut on a list that is still arriving over the wire.
+        if bz_collecting and bz_collect and ((#bz_collect.items > 0 and (now - bz_collect.t) > bz_delays.collect_stocked) or (#bz_collect.items == 0 and (now - bz_collect.t) > bz_delays.collect_empty)) then
             bz_collecting = false
             local c = bz_collect
-            if c and c.buy then
-                bz_finish_buy(c)
-            else
+            do
                 local has_items = #c.items > 0
                 local known = bz_flags[c.index] ~= nil
                 if has_items then
@@ -7769,8 +8316,12 @@ do
                 end
                 if bz_sweep and bz_sweep.active then
                     bz_sweep.done = bz_sweep.done + 1
-                    bz_sweep.next_at = now + 0.4
+                    -- Browse a beat, THEN leave (examine -> delay -> browse -> delay -> exit). The exit fires in the
+                    -- exit_at phase below so it can never bleed into the next seller's bazaar.
+                    bz_sweep.exit_at = now + bz_delays.exit_b + math.random() * bz_delays.exit_j
                     bz_sweep_dirty = true
+                else
+                    coroutine.schedule(bz_exit, bz_delays.exit_b + math.random() * bz_delays.exit_j)   -- single browse: leave after a pause
                 end
             end
         end
@@ -7780,13 +8331,17 @@ do
             bz_sweep.pending = nil
             bz_open(pd.id, pd.index)
         end
-        -- Advance to the next player only once nothing is pending/collecting (so /check -> delay -> open completes).
-        if bz_sweep and bz_sweep.active and not bz_collecting and not bz_sweep.pending and now >= (bz_sweep.next_at or 0) then
+        -- Leave the bazaar after the post-browse dwell, then schedule the small gap before the next examine.
+        if bz_sweep and bz_sweep.active and bz_sweep.exit_at and not bz_collecting and now >= bz_sweep.exit_at then
+            bz_sweep.exit_at = nil
+            bz_exit()
+            bz_sweep.next_at = now + bz_delays.seller_b + math.random() * bz_delays.seller_j
+        end
+        -- Advance to the next player only once nothing is pending / collecting / mid-exit-dwell.
+        if bz_sweep and bz_sweep.active and not bz_collecting and not bz_sweep.pending and not bz_sweep.exit_at and now >= (bz_sweep.next_at or 0) then
             bz_sweep_step(now)
         end
-        if bz_buy and (now - bz_buy.t) > 6 then
-            bz_buy_result(false, bz_buy.name, 'no response')
-        end
+        bz_job_tick(now)
         if bz_watching and (now - bz_sellers_t) > 1.0 then
             bz_sellers_t = now
             bz_sellers_dirty = true
@@ -7935,11 +8490,26 @@ REM_ITEM_BASE = 4063  -- Rem's Tale Ch.N item id = REM_ITEM_BASE + N (Ch.1 = 406
 
 function rf_active() return rf ~= nil and rf.active end
 
+-- Fan-out window (seconds). Multiple characters whose reforges finish on the SAME Vana'diel day would otherwise
+-- all Talk to the NPC on the exact same tick, which can glitch the shared pipeline. Each character takes a fixed
+-- offset in [0, RF_FANOUT_WINDOW) derived from its own id, so the boxes spread out deterministically (same offset
+-- every run) instead of colliding. Sparks/Unity solves the same collision with a desktop start-stagger; reforge
+-- collects converge later across independent addon instances, so the stagger has to be self-computed here.
+RF_FANOUT_WINDOW = 60
+
+function rf_fanout_offset()
+    local p = windower.ffxi.get_player()
+    local seed = (p and tonumber(p.id)) or 0
+    if seed == 0 and p and p.name then for i = 1, #p.name do seed = seed + p.name:byte(i) * i end end
+    return seed % RF_FANOUT_WINDOW
+end
+
 function rf_ready_at(trade_time, timing)
+    local off = rf_fanout_offset()
     local hard = trade_time + 3600                          -- fixed 1h fallback / conservative mode
-    if timing == 'fixed' then return hard end
+    if timing == 'fixed' then return hard + off end
     local into_day = (trade_time - 1009810800) % 3456       -- real sec into the current Vana'diel day
-    return math.min(trade_time + (3456 - into_day) + 20, hard)  -- next Vana midnight + 20s buffer
+    return math.min(trade_time + (3456 - into_day) + 20 + off, hard + off)  -- next Vana midnight + 20s buffer + fan-out
 end
 
 function rf_inv_slot(item_id)
@@ -8217,8 +8787,23 @@ function rf_do_trade()
     if rf.step_index == 1 and not st.pending and not rf.collect_only
        and st.input_id and st.input_id > 0 and rf_carry_count(st.input_id) < 1
        and (os.clock() - (rf.prep_since or os.clock())) > 2 then
-        rf_log(('ABORT step 1: input %s not in any bag -- already traded (in flight) or missing; refusing to re-trade'):format(rf_item_name(st.input_id)))
-        rf_fail(('%s is not in your bags -- looks already traded (in flight at %s). Collect it there when ready; nothing was re-traded.'):format(rf_item_name(st.input_id), st.npc))
+        -- rf_carry_count scans inventory + satchel/sack/case + wardrobes, NOT Mog storage. If the piece is
+        -- sitting in Mog Safe/Storage/Locker/Safe 2 it reads 0 here even though Library (all bags) shows it --
+        -- that is the "inventory/library see it but reforge won't trade" report. Detect that and say so, instead
+        -- of the misleading "already traded". rf_where dumps every bag + status so the log is unambiguous.
+        local in_mog = {}
+        for _, bag in ipairs({ 1, 2, 4, 9 }) do
+            local items = windower.ffxi.get_items(bag)
+            if type(items) == 'table' then for s = 1, (items.max or 80) do
+                local it = items[s]; if type(it) == 'table' and it.id == st.input_id and it.id ~= 0 then in_mog[#in_mog + 1] = RF_BAG_NAMES[bag] end
+            end end
+        end
+        rf_log(('ABORT step 1: input %s not in a reachable bag | where: %s'):format(rf_item_name(st.input_id), rf_where(st.input_id)))
+        if #in_mog > 0 then
+            rf_fail(('%s is in your Mog %s -- reforge can only pull from inventory, satchel, sack, case or wardrobe. Move it out of Mog storage, then reforge.'):format(rf_item_name(st.input_id), table.concat(in_mog, '/')))
+        else
+            rf_fail(('%s is not in your bags -- looks already traded (in flight at %s). Collect it there when ready; nothing was re-traded.'):format(rf_item_name(st.input_id), st.npc))
+        end
         return
     end
     -- Day 2 of a multi-day reforge trades materials only -- the piece is already held by the NPC, so an
@@ -8574,6 +9159,326 @@ function rf_incoming(id, data)
     return nil
 end
 
+-- ==================== Unity reinforcement executor ====================
+-- Trade a Unity (+1) piece + Lustreless Scale/Hide/Wing to a Unity concierge to raise its rank. Sequence captured
+-- live (concierge menu 599/0x257): OUT 0x036 (piece slot 1 + up to 7 lustreless stacks of <=99) -> IN 0x034
+-- menu=599 -> OUT 0x05B option 7 (commit) -> IN 0x05C/0x052 -> OUT 0x05B option 6 (close) -> IN 0x020 (new rank).
+-- One trade carries up to 7*99 = 693 lustreless = 3465 RP (several ranks). Loops until the target rank. Globals to
+-- respect the 200 main-chunk local cap; self-contained helpers so it does not depend on the aug block's locals.
+unity = nil
+unity_dirty = false
+UNITY_MENU = 0x257           -- 599, the concierge reinforce menu
+UNITY_MOG_BAGS = { 1, 2, 4, 9 }  -- Safe/Storage/Locker/Safe2: lustreless may be stored here, pulled before trading
+
+function unity_active() return unity ~= nil and unity.active end
+
+function unity_inv_count(item_id, bag)
+    local items = windower.ffxi.get_items(bag or 0)
+    local n = 0
+    if type(items) == 'table' then
+        for s = 1, (items.max or 80) do
+            local it = items[s]
+            if type(it) == 'table' and it.id == item_id and it.id ~= 0 then n = n + (it.count or 1) end
+        end
+    end
+    return n
+end
+
+-- The piece in inventory (bag 0) by id. Returns slot, item-table, matchCount. Money guard: caller stops on count>1.
+function unity_piece_find(item_id)
+    local items = windower.ffxi.get_items(0)
+    local slot, obj, n = nil, nil, 0
+    if type(items) == 'table' then
+        for s = 1, (items.max or 80) do
+            local it = items[s]
+            if type(it) == 'table' and it.id == item_id and it.id ~= 0 then slot = it.slot or s; obj = it; n = n + 1 end
+        end
+    end
+    return slot, obj, n
+end
+
+-- Locate the target piece in a SPECIFIC bag (for the auto-fetch from a wardrobe/storage). Prefer the exact
+-- slot the desktop sent; if that slot no longer holds the piece, fall back to id but ONLY when exactly one
+-- copy sits in that bag (money guard: never guess which of several identical pieces to augment). Returns the
+-- slot, or nil (0 found, or >1 and no valid slot = ambiguous).
+function unity_piece_at(bag, item_id, slot)
+    local items = windower.ffxi.get_items(bag)
+    if type(items) ~= 'table' then return nil end
+    if slot and type(items[slot]) == 'table' and items[slot].id == item_id and item_id ~= 0 then return items[slot].slot or slot end
+    local found, n = nil, 0
+    for s = 1, (items.max or 80) do
+        local it = items[s]
+        if type(it) == 'table' and it.id == item_id and it.id ~= 0 then found = it.slot or s; n = n + 1 end
+    end
+    return (n == 1) and found or nil
+end
+
+function unity_find_npc()
+    for nm in pairs(UNITY_NPCS) do
+        local mob = windower.ffxi.get_mob_by_name(nm)
+        if mob and mob.id and mob.distance and math.sqrt(mob.distance) <= 6 then return mob.id, mob.index end
+    end
+    return nil
+end
+
+function unity_fail(msg)
+    if unity then unity.active = false; unity.phase = 'fail'; unity.status = msg end
+    alex_chat(207, '[Alexandria] unity augment stopped: ' .. tostring(msg), 'error')
+    unity_dirty = true
+end
+
+function unity_stop()
+    if unity then unity.active = false; unity.phase = 'done'; unity.status = 'stopped'; unity_dirty = true end
+end
+
+function unity_start(msg)
+    if not packets_ok then return end
+    local pid = tonumber(msg.id)
+    local lid = tonumber(msg.lus)
+    local mode = (msg.mode == 'open') and 'open' or 'augment'
+    -- Open = a single trade of the piece + exactly ONE lustreless (plus 30,000 Unity Accolades the NPC takes);
+    -- it ranks the fresh piece to R1. Augment = loop lustreless up to the target rank.
+    local want = (mode == 'open') and 1 or math.max(1, math.min(tonumber(msg.count) or 1, 693 * 40))
+    local target = (mode == 'open') and 1 or math.max(2, math.min(tonumber(msg.target) or 15, 15))
+    if not pid or not lid then unity_fail('bad request') return end
+    if mode == 'open' then
+        -- Soft pre-check (the server also enforces it): only block when we positively know the balance is short,
+        -- so a stale/absent currency page never wrongly stops a legitimate open.
+        local acc = currency_cur1 and currency_cur1_id == (windower.ffxi.get_player() or {}).id and currency_cur1['Unity Accolades']
+        if type(acc) == 'number' and acc < 30000 then unity_fail('need 30,000 Unity Accolades to open this piece') return end
+    end
+    local obag = tonumber(msg.bag)      -- the piece's home bag (wardrobe/storage) per the desktop
+    local oslot = tonumber(msg.slot)    -- its slot there, for a slot-precise fetch
+    local _, _, pcount = unity_piece_find(pid)
+    if pcount > 1 then unity_fail('you have more than one of that piece in inventory; store the duplicate(s) first') return end
+    -- When the piece isn't already in inventory, auto-fetch it from its home bag, augment, then return it
+    -- there. Only set origin_bag when we actually fetch, so a piece already in inventory is left in place.
+    local need_fetch = (pcount == 0)
+    if need_fetch then
+        if not (obag and obag ~= 0) then unity_fail('that piece is not in your inventory') return end
+        if not unity_piece_at(obag, pid, oslot) then unity_fail('could not find that piece in its bag to pull it') return end
+    end
+    unity = {
+        active = true, mode = mode, piece_id = pid, lus_id = lid, want = want, done_lust = 0, target = target,
+        phase = need_fetch and 'fetch' or 'prep', status = need_fetch and 'fetching piece' or 'preparing', batch = 0, pre_rank = 0, pre_acc = 0,
+        origin_bag = need_fetch and obag or nil, fetch_slot = oslot, fetch_sent = false, return_sent = false, fin_rank = 0,
+        npc_id = nil, npc_index = nil, menu = UNITY_MENU,
+        last_progress = os.clock(), prep_since = os.clock(), next_at = 0, apply_at = 0,
+        zone = (windower.ffxi.get_info() or {}).zone or 0,
+    }
+    unity_dirty = true
+    alex_chat(207, (mode == 'open') and '[Alexandria] unity open started' or '[Alexandria] unity augment started', 'progress')
+end
+
+-- Pull one stack of lustreless from a reachable mog bag into inventory. Returns true if a move was issued.
+function unity_pull_lustreless()
+    local inv = windower.ffxi.get_bag_info(0)
+    if inv and (inv.max - inv.count) <= 0 then return false end
+    for _, bag in ipairs(UNITY_MOG_BAGS) do
+        local bi = windower.ffxi.get_bag_info(bag)
+        if bi and bi.enabled then
+            local items = windower.ffxi.get_items(bag)
+            if type(items) == 'table' then
+                for s = 1, (items.max or 80) do
+                    local it = items[s]
+                    if type(it) == 'table' and it.id == unity.lus_id and it.id ~= 0 then
+                        pcall(windower.ffxi.move_item, bag, 0, it.slot or s, it.count or 1)
+                        return true
+                    end
+                end
+            end
+        end
+    end
+    return false
+end
+
+function unity_send_option(opt, automated)
+    packets.inject(packets.new('outgoing', 0x05B, {
+        ['Target'] = unity.npc_id, ['Option Index'] = opt, ['Target Index'] = unity.npc_index,
+        ['Automated Message'] = automated and true or false, ['Zone'] = unity.zone, ['Menu ID'] = unity.menu,
+    }))
+end
+
+function unity_do_trade()
+    local ci = unity_piece_find(unity.piece_id)
+    if not ci then unity.status = 'waiting for piece'; return end
+    -- Snapshot rank/RP so we can prove the trade advanced the piece (never keep feeding a stuck item).
+    local inv = windower.ffxi.get_items(0)
+    local pit = inv and type(inv) == 'table' and inv[ci]
+    unity.pre_rank, unity.pre_acc = unity_rp(pit)
+    unity.pre_rank = unity.pre_rank or 0; unity.pre_acc = unity.pre_acc or 0
+    local remaining = math.min(unity.want - unity.done_lust, 693)
+    local fields = { ['Target'] = unity.npc_id, ['Target Index'] = unity.npc_index }
+    fields['Item Count 1'] = 1; fields['Item Index 1'] = ci
+    local n, packed = 1, 0
+    if type(inv) == 'table' then
+        for s = 1, (inv.max or 80) do
+            if n >= 8 or packed >= remaining then break end
+            local it = inv[s]
+            if type(it) == 'table' and it.id == unity.lus_id and it.id ~= 0 and (it.status == nil or it.status == 0) then
+                local take = math.min(it.count or 1, remaining - packed)
+                if take > 0 then n = n + 1; fields['Item Count ' .. n] = take; fields['Item Index ' .. n] = it.slot or s; packed = packed + take end
+            end
+        end
+    end
+    if packed <= 0 then unity.status = 'no lustreless in inventory'; return end
+    fields['Number of Items'] = n
+    unity.batch = packed
+    amb_log(('UNITY TRADE piece=%d lus=%d x%d (done %d/%d) preRank=%d'):format(unity.piece_id, unity.lus_id, packed, unity.done_lust, unity.want, unity.pre_rank))
+    packets.inject(packets.new('outgoing', 0x036, fields))
+    unity.phase = 'await_menu'; unity.status = 'trading'; unity.last_progress = os.clock(); unity_dirty = true
+end
+
+-- Move the augmented piece back to the bag it came from, then finish. Only runs when we auto-fetched it.
+function unity_finish_return(ok, failmsg)
+    unity.active = false; unity.phase = 'done'
+    if ok then
+        unity.status = ('done (R%d, returned)'):format(unity.fin_rank or 0)
+        alex_chat(207, ('[Alexandria] unity %s complete: R%d, piece returned to its bag'):format(unity.mode == 'open' and 'open' or 'augment', unity.fin_rank or 0), 'progress')
+    else
+        unity.status = failmsg or 'piece left in inventory'
+        alex_chat(207, '[Alexandria] unity done (R' .. (unity.fin_rank or 0) .. ') but could not return the piece: ' .. tostring(failmsg) .. '. It is safe in your inventory.', 'error')
+    end
+    unity_dirty = true
+end
+
+function unity_return_piece(now)
+    local slot = (unity_piece_find(unity.piece_id))
+    if not slot then unity_finish_return(true) return end  -- already back in its bag
+    local obag = unity.origin_bag
+    local bi = windower.ffxi.get_bag_info(obag)
+    if not (bi and bi.enabled) then
+        if (now - (unity.return_at or now)) > 15 then unity_finish_return(false, 'could not reach the original bag') end
+        unity.status = 'waiting to reach the original bag'; return
+    end
+    if (bi.max - bi.count) <= 0 then unity_finish_return(false, 'original bag is full') return end
+    if not unity.return_sent then
+        pcall(windower.ffxi.move_item, 0, obag, slot, 1)
+        unity.return_sent = true; unity.return_at = now; unity.status = 'returning piece'; unity_dirty = true
+        return
+    end
+    if (now - (unity.return_at or now)) > 10 then unity_finish_return(false, 'the move back did not go through') end
+end
+
+function unity_tick(now)
+    if not unity or not unity.active then return end
+    if unity.phase == 'fetch' then
+        local _, _, pc = unity_piece_find(unity.piece_id)
+        if pc >= 1 then unity.phase = 'prep'; unity.prep_since = os.clock(); unity.status = 'piece ready'; return end
+        local inv = windower.ffxi.get_bag_info(0)
+        if inv and (inv.max - inv.count) <= 0 then unity_fail('inventory is full; make room to pull the piece') return end
+        local bi = windower.ffxi.get_bag_info(unity.origin_bag)
+        if not (bi and bi.enabled) then
+            if (now - (unity.prep_since or now)) > 15 then unity_fail('could not reach the piece to pull it') end
+            unity.status = "cannot reach the piece's bag"; return
+        end
+        if not unity.fetch_sent then
+            local fslot = unity_piece_at(unity.origin_bag, unity.piece_id, unity.fetch_slot)
+            if not fslot then if (now - (unity.prep_since or now)) > 15 then unity_fail('piece not found in its bag') end return end
+            pcall(windower.ffxi.move_item, unity.origin_bag, 0, fslot, 1)
+            unity.fetch_sent = true; unity.status = 'pulling piece to inventory'; unity_dirty = true; return
+        end
+        if (now - (unity.prep_since or now)) > 15 then unity_fail('piece did not move to inventory (is it equipped?)') end
+        return
+    elseif unity.phase == 'return' then
+        unity_return_piece(now)
+    elseif unity.phase == 'prep' then
+        local nid, nidx = unity_find_npc()
+        if not nid then unity.status = 'go to a Unity concierge'; return end
+        unity.npc_id, unity.npc_index = nid, nidx
+        local _, _, pc = unity_piece_find(unity.piece_id)
+        if pc == 0 then
+            if (now - (unity.prep_since or now)) > 15 then unity_fail('piece left inventory') end
+            unity.status = 'waiting for piece'; return
+        elseif pc > 1 then unity_fail('duplicate piece in inventory; store the extras') return end
+        local need = math.min(unity.want - unity.done_lust, 693)
+        local have = unity_inv_count(unity.lus_id, 0)
+        if have < need then
+            if unity_pull_lustreless() then unity.status = 'gathering lustreless'; return end
+            if have <= 0 then unity_fail('out of lustreless') return end
+        end
+        unity.prep_since = nil; unity.phase = 'trade'; unity.next_at = 0
+    elseif unity.phase == 'trade' then
+        unity_do_trade()
+    elseif unity.phase == 'await_menu' then
+        if (now - (unity.last_progress or now)) > 15 then unity_fail('concierge did not open the reinforce menu') end
+    elseif unity.phase == 'await_result' then
+        if (now - (unity.last_progress or now)) > 15 then unity_fail('no reinforce result') end
+    elseif unity.phase == 'await_apply' then
+        if now < (unity.apply_at or 0) then return end
+        -- Re-read the piece and prove it advanced.
+        local ci = unity_piece_find(unity.piece_id)
+        local inv = windower.ffxi.get_items(0)
+        local pit = ci and inv and type(inv) == 'table' and inv[ci]
+        local rank, acc = unity_rp(pit)
+        if not rank then
+            if (now - (unity.apply_at or now)) > 12 then unity_fail('lost track of the piece after reinforcing') end
+            return
+        end
+        local advanced = rank > (unity.pre_rank or 0) or (rank == (unity.pre_rank or 0) and (acc or 0) > (unity.pre_acc or 0))
+        if not advanced then unity_fail((unity.mode == 'open') and 'open did not apply (piece unchanged); stopped to protect your lustreless and accolades' or 'reinforce did not apply (rank/RP unchanged); stopped to protect lustreless') return end
+        unity.done_lust = unity.done_lust + (unity.batch or 0)
+        amb_log(('UNITY %s rank %d->%d (done %d/%d)'):format((unity.mode == 'open') and 'OPENED' or 'APPLIED', unity.pre_rank or 0, rank, unity.done_lust, unity.want))
+        -- The open/augment updates the piece in place (new extdata) but the result packet was consumed by
+        -- unity_incoming, so the normal 0x01E/0x020 inv-dirty trigger can miss it and the desktop shows stale
+        -- inventory until a zone change forces a resync. We already re-read get_items above, so force a one-time
+        -- re-stream now: drop the cached signature so the changed piece can't be short-circuited as "unchanged".
+        inv_sig_last = ''
+        if not inv_dirty then inv_first_dirty = now end
+        inv_dirty = true
+        inv_dirty_at = now - INV_DEBOUNCE
+        if unity.mode == 'open' or rank >= unity.target or unity.done_lust >= unity.want then
+            unity.fin_rank = rank
+            if unity.origin_bag and unity.origin_bag ~= 0 then
+                -- Stay active to drive the move-back; unity_return_piece finishes (active=false) once it lands.
+                unity.phase = 'return'; unity.return_at = now; unity.status = 'returning piece to its bag'
+                alex_chat(207, (unity.mode == 'open') and ('[Alexandria] unity piece opened: now R%d; returning it'):format(rank) or ('[Alexandria] unity augment complete: R%d; returning it'):format(rank), 'progress')
+            else
+                unity.active = false; unity.phase = 'done'; unity.status = 'done'
+                alex_chat(207, (unity.mode == 'open') and ('[Alexandria] unity piece opened: now R%d'):format(rank) or ('[Alexandria] unity augment complete: R%d'):format(rank), 'progress')
+            end
+        else
+            unity.phase = 'prep'; unity.prep_since = os.clock(); unity.status = ('R%d, continuing'):format(rank)
+        end
+        unity_dirty = true
+    end
+end
+
+function unity_incoming(id, data)
+    if not unity or not unity.active then return nil end
+    local ok, p = pcall(packets.parse, 'incoming', data)
+    if not (ok and p) then return nil end
+    if p['NPC Index'] ~= nil and unity.npc_index and p['NPC Index'] ~= unity.npc_index then return nil end
+    if unity.phase == 'await_menu' and id == 0x034 and p['Menu ID'] then
+        -- The concierge menu id DIFFERS per NPC (Igsli 599 / 0x257, Urbiolaine 3530 / 0xDCA, ...). The NPC Index
+        -- match above already proves it is our concierge, so adopt whatever menu it opened and confirm against
+        -- that, rather than gating on a hardcoded id. The option chosen is what splits open from augment: OPTION 5
+        -- opens (unlocks) a fresh piece, OPTION 7 commits a reinforcement. Captured from both NPC families.
+        unity.menu = p['Menu ID']
+        -- Automated Message flag MUST match what the real client sends or the NPC never dismisses the menu
+        -- (softlock): the captures show open option 5 with the flag FALSE (00 00), augment option 7 with it TRUE (01 00).
+        unity_send_option((unity.mode == 'open') and 5 or 7, unity.mode ~= 'open')
+        unity.phase = 'await_result'; unity.last_progress = os.clock(); unity.status = (unity.mode == 'open') and 'opening' or 'reinforcing'; unity_dirty = true
+        return true
+    elseif unity.phase == 'await_result' and ((unity.mode == 'open' and (id == 0x020 or id == 0x052)) or (unity.mode ~= 'open' and (id == 0x05C or id == 0x034))) then
+        -- Open auto-closes after option 5 (the capture shows a 0x020 item update then a 0x052 menu end, no option 6);
+        -- augment needs an explicit option 6 to close its menu. Either way release the event target so the next
+        -- trade starts clean. The real guard is await_apply, which re-reads the piece and proves it actually changed.
+        if unity.mode ~= 'open' then unity_send_option(6, false) end
+        local me = windower.ffxi.get_mob_by_target('me')
+        if me then pcall(function() packets.inject(packets.new('outgoing', 0x016, { ['Target Index'] = me.index })) end) end
+        unity.phase = 'await_apply'; unity.apply_at = os.clock() + 1.5; unity.last_progress = os.clock(); unity_dirty = true
+        return true
+    end
+    return nil
+end
+
+function build_unity()
+    if not unity then return '{"t":"unity","active":false}\n' end
+    return string.format('{"t":"unity","active":%s,"phase":"%s","status":"%s","done":%d,"want":%d,"target":%d,"pieceId":%d,"mode":"%s"}\n',
+        unity.active and 'true' or 'false', unity.phase or '', esc(unity.status or ''), unity.done_lust or 0, unity.want or 0, unity.target or 15, unity.piece_id or 0, esc(unity.mode or 'augment'))
+end
+
 function build_reforge()
     if not rf then
         if rf_paused and rf_paused.steps and #rf_paused.steps > 0 then
@@ -8711,12 +9616,24 @@ windower.register_event('incoming chunk', function(id, data, modified, injected)
         local r = rf_incoming(id, data)
         if r ~= nil then return r end
     end
+    if unity_active() and packets_ok then
+        local r = unity_incoming(id, data)
+        if r ~= nil then return r end
+    end
     if rem_active() and packets_ok then
         local r = rem_incoming(id, data)
         if r ~= nil then return r end
     end
     if gobbie_run and packets_ok then
         local r = gobbie_incoming(id, data)
+        if r ~= nil then return r end
+    end
+    if cipher_run and packets_ok then
+        local r = cipher_incoming(id, data)
+        if r ~= nil then return r end
+    end
+    if skip_run and packets_ok then
+        local r = skip_incoming(id, data)
         if r ~= nil then return r end
     end
     if cbuy and packets_ok then
@@ -8787,7 +9704,7 @@ windower.register_event('incoming chunk', function(id, data, modified, injected)
         bz_collecting = false
         bz_collect = nil
         bz_sweep = nil
-        bz_buy = nil
+        bz_job = nil
         bz_clear_pending = true
         bz_sweep_dirty = true
         bz_sellers_dirty = true
@@ -8820,9 +9737,10 @@ windower.register_event('incoming chunk', function(id, data, modified, injected)
     elseif id == 0x04B then
         dbox_handle_incoming(data)
     elseif id == 0x105 then
+        if bz_job and bz_job.state == 'wait_list' then bz_job_list(data) return end
         if bz_collecting then return bz_incoming_list(data) end
     elseif id == 0x106 then
-        if bz_buy then bz_buy_result(data:byte(0x04 + 1) == 0, bz_buy.name, (data:byte(0x04 + 1) == 0) and 'bought' or 'declined') end
+        if bz_job then bz_job_buy_reply(data:byte(0x04 + 1) == 0) end
     elseif id == 0x03C then
         shop_handle_incoming(data)
         npc_driving = nil
@@ -9174,6 +10092,7 @@ function alex_prerender()
     -- spacing has elapsed. A timeout unsticks us if the server never replies.
     if ah_busy and (now - ah_busy_t) >= AH_BUSY_TIMEOUT then
         ah_busy = false
+        ah_status_pending = false
     end
     if #ah_queue > 0 and not ah_busy and now >= ah_t then
         -- Hard gate at the single point every AH packet leaves the client: if we are no longer at an auction
@@ -9232,6 +10151,8 @@ function alex_prerender()
     PF('store_tick', store_tick, now)
     PF('store_drop_tick', store_drop_tick, now)
     PF('gobbie_tick', gobbie_tick, now)
+    PF('cipher_tick', cipher_tick, now)
+    PF('skip_tick', skip_tick, now)
     local store_zid = (windower.ffxi.get_info() or {}).zone or 0
     if store_zid ~= 0 then
         if store_zid ~= store_last_zone then store_last_zone = store_zid; store_npc_cache = {}; store_dirty = true end
@@ -9367,6 +10288,15 @@ function alex_prerender()
         org_log_write(dbg)
     end
 
+    -- Auto-actions were deferred while the world wasn't ready (zoning, or mid NPC event like a Conquest-point
+    -- exchange where items land while status != idle). Re-arm the inventory pass now that it's safe so the
+    -- deferred sell/sort/drop actually fire, instead of being lost until the next inventory change or a manual toggle.
+    if auto_pending and world_ready(now) then
+        auto_pending = false
+        if not inv_dirty then inv_first_dirty = now end
+        inv_dirty = true
+        inv_dirty_at = now - INV_DEBOUNCE
+    end
     if inv_dirty and (now - inv_dirty_at >= INV_DEBOUNCE or now - inv_first_dirty >= 1.5) then
         inv_dirty = false
         store_dirty = true
@@ -9383,13 +10313,16 @@ function alex_prerender()
         -- Auto packet actions must NEVER fire mid-zone / on the loading screen: inventory reloads on zone-in
         -- and would burst-inject sort/drop/sell before the player is in-world, which can crash the client.
         if world_ready(now) then
+            auto_pending = false
             if next(autosort_bags) then autosort_check() end
             if auto_drop then scan_drops() end
             if clean_set then if now < clean_until then scan_drops(clean_set) else clean_set = nil end end
             if (sell_anywhere and in_town()) or (shop_session and shop_autosell) then shop_autosell_run() end
             if cfarm then cfarm_sell(cfarm.item) end
-        elseif clean_set and now >= clean_until then
-            clean_set = nil   -- let a timed clean expire even while auto actions are held
+        else
+            -- Not safe yet (zoning / mid-event): DEFER, don't drop. The re-arm above fires these once it settles.
+            auto_pending = true
+            if clean_set and now >= clean_until then clean_set = nil end   -- let a timed clean expire even while held
         end
     end
 
@@ -9507,6 +10440,7 @@ function alex_prerender()
         queue_send(build_auginfo())
     end
     PF('rf_tick', rf_tick, now)
+    PF('unity_tick', unity_tick, now)
     if rem then PF('rem_tick', rem_tick, now) end
     -- Once the player is known (post-login), load any paused reforge saved for this character so the
     -- desktop can offer to resume it. Cheap one-shot; reset on login for a character swap.
@@ -9525,6 +10459,11 @@ function alex_prerender()
             rf_dirty = false; rf_last_frame = rframe
             queue_send(rframe)
         end
+    end
+
+    if unity or unity_dirty then
+        unity_dirty = false
+        queue_send(build_unity())
     end
 
     PF('bz_tick', bz_tick, now)
@@ -9586,7 +10525,7 @@ end)
 
 function ax_forward(a)
     if not connected then
-        alex_chat(207, '[Alexandria] app not running; cannot run commands', 'error')
+        alex_chat(207, '[Alexandria] not connected to the app on 127.0.0.1:' .. PORT .. ' (retrying). Is the app open? If a window IS open, another copy may still be running (check the system tray) and holding the port; quit all copies and reopen.', 'error')
         return false
     end
     local parts = {}
@@ -9601,6 +10540,8 @@ end
 COMPAT = {
     find    = { group = 'find' },
     findall = { group = 'find' },
+    findone    = { group = 'find' },
+    findallone = { group = 'find' },
     get     = { group = 'item' },
     gets    = { group = 'item' },
     put     = { group = 'item' },
@@ -9608,6 +10549,7 @@ COMPAT = {
     move    = { group = 'item' },
     moves   = { group = 'item' },
     stack   = { group = 'item' },
+    keep    = { group = 'item' },
     ah      = { group = 'ah' },
     bazaar  = { group = 'ah' },
     org     = { group = 'native', as = 'organize' },
@@ -9650,11 +10592,53 @@ windower.register_event('addon command', function(...)
         else
             alex_chat(207, '[Alexandria] usage: //ax compat <find|item|ah|native> <on|off>')
         end
+    elseif cmd == 'skip' then
+        -- Generic NPC event/cutscene forward. //ax skip = arm for the next event chain (auto-disarms when it
+        -- ends); //ax skip on = stay on for every event until off; //ax skip off = stop. Selection menus (0x05C)
+        -- are never auto-advanced -- a blind forward would pick the wrong option.
+        local sub = (a[2] or ''):lower()
+        if sub == 'off' then
+            skip_run = nil
+            alex_chat(207, '[Alexandria] skip: off.')
+        elseif sub == 'on' then
+            skip_run = { mode = 'on', start = os.clock(), last = os.clock(), count = 0 }
+            alex_chat(207, '[Alexandria] skip: ON -- auto-advancing every NPC event until //ax skip off. Choice menus are left alone.')
+        else
+            skip_run = { mode = 'once', start = os.clock(), last = os.clock(), count = 0 }
+            alex_chat(207, '[Alexandria] skip: armed for the next NPC event. Talk to the NPC; it auto-advances, then turns off.')
+        end
     elseif cmd == 'status' or cmd == '' then
         alex_chat(207, '[Alexandria] ' .. (connected and 'connected to app' or 'app not running'))
     elseif cmd == 'sync' then
         inv_dirty = true
         inv_dirty_at = os.clock() - INV_DEBOUNCE
+    elseif cmd == 'unitydbg' then
+        -- Dump every augmented item's raw extdata + what windower's decoder reports, so we can see why Unity
+        -- pieces aren't reading rank. Writes unitydbg.txt in the addon folder.
+        local lines = {}
+        for _, bag in ipairs({ 0, 1, 2, 4, 8, 10, 11, 12, 13, 14, 15, 16 }) do
+            local items = windower.ffxi.get_items(bag)
+            if type(items) == 'table' then
+                for s = 1, (items.max or 80) do
+                    local it = items[s]
+                    if it and it.id and it.id ~= 0 and type(it.extdata) == 'string' and #it.extdata == 24 then
+                        local r = res.items[it.id]
+                        local nm = (r and r.en) or ('Item ' .. it.id)
+                        local b = {}
+                        for i = 1, 12 do b[i] = string.format('%02X', it.extdata:byte(i)) end
+                        local okd, dec = pcall(extdata.decode, it)
+                        local sys = (okd and type(dec) == 'table') and dec.augment_system or 'nil'
+                        local rnk = (okd and type(dec) == 'table') and dec.rank or 'nil'
+                        local pth = (okd and type(dec) == 'table') and dec.path or 'nil'
+                        lines[#lines + 1] = ('bag%d slot%d id=%d %-22s ext=[%s] sys=%s rank=%s path=%s'):format(
+                            bag, s, it.id, nm, table.concat(b, ' '), tostring(sys), tostring(rnk), tostring(pth))
+                    end
+                end
+            end
+        end
+        local f = io.open(windower.addon_path .. 'unitydbg.txt', 'w')
+        if f then f:write(table.concat(lines, '\n') .. '\n'); f:close() end
+        alex_chat(207, ('[Alexandria] unitydbg: %d extdata items -> addons/Alexandria/unitydbg.txt'):format(#lines))
     elseif cmd == 'orglog' then
         local sub = (a[2] or ''):lower()
         if sub == 'off' then
@@ -9971,10 +10955,63 @@ windower.register_event('addon command', function(...)
                 alex_chat(207, '[Alexandria] sellall: no auto-sell items in your inventory.', 'progress')
             else
                 shop_sold = {}
-                shop_autosell_run()
+                shop_autosell_run(true)   -- explicit flush: sell even with Auto-Sell In Towns off / no shop open
                 alex_chat(207, '[Alexandria] sellall: selling ' .. n .. ' auto-sell item(s).', 'action')
             end
         end
+    elseif cmd == 'autoselldbg' then
+        -- Dump every gate on the AUTOMATIC (new-item) autosell path so we can see which one is blocking.
+        -- Run this while standing in town with unsold auto-sell items present but nothing selling.
+        local p = windower.ffxi.get_player()
+        local inv = windower.ffxi.get_items(0)
+        local matchN, listN = 0, 0
+        for _ in pairs(shop_sell_list) do listN = listN + 1 end
+        if inv then for s = 1, (inv.max or 80) do local it = inv[s]; if type(it) == 'table' and it.id and it.id ~= 0 and shop_sell_list[it.id] and it.status == 0 and not shop_no_sale(it.id) then matchN = matchN + 1 end end end
+        local nowc = os.clock()
+        alex_chat(207, ('[Alexandria] autosell gates: world_ready=%s | is_loaded=%s settled=%.1f/%ds status=%s | sell_anywhere=%s in_town=%s | shop_session=%s shop_autosell=%s | manual_block=%.1fs inv_dirty=%s auto_pending=%s | listN=%d matchN=%d'):format(
+            tostring(world_ready(nowc)), tostring(is_loaded()), (loaded_since > 0 and (nowc - loaded_since) or 0), AUTO_SETTLE, tostring(p and p.status),
+            tostring(sell_anywhere), tostring(in_town()), tostring(shop_session), tostring(shop_autosell),
+            math.max(0, shop_manual_until - nowc), tostring(inv_dirty), tostring(auto_pending), listN, matchN), 'progress')
+    elseif cmd == 'augdbg' then
+        -- Dump everything the Dark Matter / Geas Fete augment path cares about, so a "it won't trade my Dark
+        -- Matter" report can be settled with facts: where the Dark Matter actually is, what's reachable from
+        -- the current spot, the resolved item id, and any live augment run's budget. Run it standing where you
+        -- augment, with the gear in inventory.
+        local DM_ID = 9062
+        local rname = (res and res.items and res.items[DM_ID] and res.items[DM_ID].en) or '?'
+        local bagnames = { [0]='Inv', [5]='Satchel', [6]='Sack', [7]='Case', [1]='Safe', [2]='Storage', [4]='Locker', [9]='Safe2' }
+        local order = { 0, 5, 6, 7, 1, 2, 4, 9 }
+        local total, parts = 0, {}
+        for _, bg in ipairs(order) do
+            local items = windower.ffxi.get_items(bg)
+            local c = 0
+            local en = (type(items) == 'table' and items.enabled) and '' or '!'  -- ! = bag not currently readable/open
+            if type(items) == 'table' then for s = 1, (items.max or 80) do local it = items[s]; if type(it) == 'table' and it.id == DM_ID then c = c + (it.count or 0) end end end
+            total = total + c
+            parts[#parts + 1] = string.format('%s%s=%d', bagnames[bg], en, c)
+        end
+        local info = windower.ffxi.get_info() or {}
+        -- Mirror aug_src_bags(): what the augment can actually pull Dark Matter FROM right now.
+        local reach = { [0]=true, [5]=true, [6]=true, [7]=true }
+        if info.mog_house then reach[1]=true; reach[2]=true; reach[4]=true; reach[9]=true
+        elseif info.zone and NOMAD_ZONES[info.zone] and (experimental_features or nomad_near) then reach[1]=true; reach[4]=true; reach[9]=true end
+        local reachable = 0
+        for _, bg in ipairs(order) do if reach[bg] then local items = windower.ffxi.get_items(bg); if type(items)=='table' then for s=1,(items.max or 80) do local it=items[s]; if type(it)=='table' and it.id==DM_ID then reachable = reachable + (it.count or 0) end end end end end
+        alex_chat(207, ('[Alexandria] augdbg: "%s" id=%d  total=%d  reachable-here=%d  [%s]'):format(rname, DM_ID, total, reachable, table.concat(parts, ' ')), 'progress')
+        alex_chat(207, ('[Alexandria] augdbg: zone=%s mog_house=%s nomad_zone=%s nomad_near=%s experimental=%s  (bag ! = not open/readable)'):format(
+            tostring(info.zone), tostring(info.mog_house), tostring(info.zone and NOMAD_ZONES[info.zone] or false), tostring(nomad_near), tostring(experimental_features)), 'progress')
+        if aug and aug.active then
+            alex_chat(207, ('[Alexandria] augdbg: RUNNING mode=%s stone=%s dm_id=%s budget=%s used=%s paid=%s status=%s'):format(
+                tostring(aug.mode), tostring(aug.stone), tostring(aug.dm_id), tostring(aug.dm_budget), tostring(aug.dm_used), tostring(aug.paid), tostring(aug.status)), 'progress')
+        else
+            alex_chat(207, '[Alexandria] augdbg: no augment running', 'progress')
+        end
+    elseif cmd == 'movedbg' then
+        -- Auto-log every plain item move (Library moves, move-to-storage) and its destination bag state, so a
+        -- "moving to Safe/Storage does nothing until I talk to the moogle" report can be read from facts: is the
+        -- dest bag enabled, is it full, are we in a mog house. Run it, do the move, read the lines, run it again to stop.
+        move_debug = not move_debug
+        alex_chat(207, '[Alexandria] move debug log ' .. (move_debug and 'ON (each move attempt + dest bag state prints to chat)' or 'OFF'))
     elseif cmd == 'autolot' then
         -- Toggle acting on the lot list. Per-character by default; add "all" to flip
         -- every character (the desktop relays and persists it across the fleet).

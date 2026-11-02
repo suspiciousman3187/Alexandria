@@ -63,6 +63,22 @@ export function getStickyPersisted<T>(key: string, fallback: T): T {
   return persisted.has(key) ? (persisted.get(key) as T) : fallback;
 }
 
+// Imperative write (outside a component), e.g. tracking whether the pool
+// overlay is open from window lifecycle callbacks.
+export function setStickyPersisted<T>(key: string, val: T): void {
+  touched.add(key);
+  persisted.set(key, val);
+  schedulePersistSave();
+}
+
+// Resolves once the on-disk sticky store has loaded, so a one-shot startup
+// read (e.g. auto-open) sees persisted values instead of the fallback.
+export function whenStickyLoaded(cb: () => void): void {
+  if (persistLoaded) { cb(); return; }
+  const once = () => { loadSubs.delete(once); cb(); };
+  loadSubs.add(once);
+}
+
 export function useStickyPersisted<T>(key: string, initial: T): [T, Dispatch<SetStateAction<T>>] {
   const [v, setV] = useState<T>(() => (persisted.has(key) ? (persisted.get(key) as T) : initial));
   useEffect(() => {

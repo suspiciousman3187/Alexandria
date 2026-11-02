@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { useKnownCharacters, useAvailableIcons, localConsolidate, useAhCatalog, type KnownChar } from './bridge';
 import { IconInner } from './atlasIcon';
@@ -11,7 +11,8 @@ import { useSettings } from './settings';
 import { bagConsolidatable, recipientSpace } from './consolidate';
 import { FLAG_NOTRADE } from './bagConstants';
 import ConsolidateToModal from './ConsolidateToModal';
-import { Modal, Collapse } from './overlay';
+import { Modal, Collapse, Popover } from './overlay';
+import { useItemTags } from './itemTags';
 import { useConsoQueue, addConsoJob, runConsoQueue, runConsoQueueFast, stopConsoQueue, clearConsoQueue, removeConsoJob } from './consoQueue';
 import ConsoProgress from './ConsoProgress';
 import ConsolidatePrefsPanel from './ConsolidatePrefsPanel';
@@ -175,6 +176,26 @@ export default function DuplicateView() {
 
   const keepFlags = (f: number) => (incRare || !(f & 1)) && (incEx || !(f & 2)) && (incUnstack || !(f & 4));
 
+  // Tag filter: pick one or more tags to show only items carrying any of them (OR). Empty = no tag filtering.
+  const tagStore = useItemTags();
+  const [tagFilter, setTagFilter] = useSticky<string[]>('dupe.tags', []);
+  const tagFilterSet = useMemo(() => new Set(tagFilter), [tagFilter]);
+  const [tagOpen, setTagOpen] = useState(false);
+  const tagBtnRef = useRef<HTMLDivElement | null>(null);
+  const passTag = (id: number) => tagFilter.length === 0 || (tagStore.assign[id] ?? []).some((t) => tagFilterSet.has(t));
+  // Close the tag dropdown on an outside click (the popover portals to <body>, so allow clicks on the button
+  // wrapper and the popover content itself).
+  useEffect(() => {
+    if (!tagOpen) return;
+    const onDown = (e: PointerEvent) => {
+      const t = e.target as Element | null;
+      if (tagBtnRef.current?.contains(t as Node) || t?.closest?.('[data-tagpop]')) return;
+      setTagOpen(false);
+    };
+    window.addEventListener('pointerdown', onDown, true);
+    return () => window.removeEventListener('pointerdown', onDown, true);
+  }, [tagOpen]);
+
   const groups = useMemo<Group[]>(() => {
     const chars = withInv;
     const search = q.trim().toLowerCase();
@@ -194,6 +215,7 @@ export default function DuplicateView() {
         const ac = acById.get(id);
         if (!showMeds && (ac === MED_AC || (ac != null && FOOD_ACS.has(ac)))) continue;
         if (ignoreSet.has(g.n.toLowerCase())) continue;
+        if (!passTag(id)) continue;
         if (search && !itemNameMatches(id, g.n, search)) continue;
         const bags = [...g.bags.entries()].map(([bag, v]) => ({ bag, id: v.id, count: v.count, acc: bagConsolidatable(c, v.id, exp) })).sort((a, b) => b.count - a.count);
         items.push({ id, n: g.n, total: bags.reduce((s, l) => s + l.count, 0), bags, noTrade: (g.f & FLAG_NOTRADE) !== 0 });
@@ -204,7 +226,7 @@ export default function DuplicateView() {
     }
     out.sort((a, b) => b.items.length - a.items.length || a.name.localeCompare(b.name));
     return out;
-  }, [withInv, q, incRare, incEx, incUnstack, exp, showMeds, acById, ignoreSet]);
+  }, [withInv, q, incRare, incEx, incUnstack, exp, showMeds, acById, ignoreSet, tagFilter, tagStore]);
 
   const itemGroups = useMemo<ItemGroup[]>(() => {
     const search = q.trim().toLowerCase();
@@ -228,19 +250,25 @@ export default function DuplicateView() {
       const ac = acById.get(id);
       if (!showMeds && (ac === MED_AC || (ac != null && FOOD_ACS.has(ac)))) continue;
       if (ignoreSet.has(g.n.toLowerCase())) continue;
+      if (!passTag(id)) continue;
       if (search && !itemNameMatches(id, g.n, search)) continue;
       const holders = [...g.holders.entries()].map(([name, v]) => ({ name, conn: v.conn, count: v.count })).sort((a, b) => b.count - a.count);
       out.push({ id, n: g.n, total: holders.reduce((s, h) => s + h.count, 0), holders, assets: g.assets, noTrade: (g.f & FLAG_NOTRADE) !== 0 });
     }
     out.sort((a, b) => b.holders.length - a.holders.length || b.total - a.total || a.n.localeCompare(b.n));
     return out;
-  }, [withInv, q, incRare, incEx, incUnstack, showMeds, acById, ignoreSet]);
+  }, [withInv, q, incRare, incEx, incUnstack, showMeds, acById, ignoreSet, tagFilter, tagStore]);
 
   const toggleExpand = (name: string) => setExpanded(expanded.includes(name) ? expanded.filter((n) => n !== name) : [...expanded, name]);
   const toggleSel = (id: number) => setSel((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
   // Visible + selected + tradeable: the exact set the bulk add operates on, so the
   // count and the action always match what's on screen.
   const selVisible = useMemo(() => itemGroups.filter((d) => sel.has(d.id) && !d.noTrade), [itemGroups, sel]);
+  // Select All operates on every tradeable item currently SHOWN (so the search/type filters narrow it), so
+  // a 100-item consolidation is one click instead of 100 checkboxes (aryl's request).
+  const tradeableItems = useMemo(() => itemGroups.filter((d) => !d.noTrade), [itemGroups]);
+  const allTradeableSelected = tradeableItems.length > 0 && tradeableItems.every((d) => sel.has(d.id));
+  const selectAllItems = () => setSel(new Set(tradeableItems.map((d) => d.id)));
   // Bulk enqueue: each selected item goes to its biggest reachable holder at the full
   // fitting amount -- the same defaults a single Add to Queue picks in the modal.
   const addSelectedToQueue = () => {
@@ -298,6 +326,48 @@ export default function DuplicateView() {
               placeholder="Filter items…"
               className="w-full bg-field border border-line rounded-md px-3 py-1.5 text-xs text-fg-2 placeholder-fg-4 outline-none focus:border-accent/50 transition-colors"
             />
+            {tagStore.tags.length > 0 && (
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <div ref={tagBtnRef} className="relative">
+                  <button
+                    onClick={() => setTagOpen((o) => !o)}
+                    className={`le-tap inline-flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] font-semibold rounded-md border transition-colors ${tagFilter.length > 0 ? 'border-accent/50 bg-accent/10 text-accent' : 'border-line bg-field text-fg-3 hover:text-fg-2'}`}
+                  >
+                    <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><path d="M20.59 13.41 13.42 20.6a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z" /><path d="M7 7h.01" /></svg>
+                    Tags{tagFilter.length > 0 ? ` (${tagFilter.length})` : ''}
+                    <svg viewBox="0 0 24 24" className="w-3 h-3 opacity-70" fill="none" stroke="currentColor" strokeWidth={2.4} strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6" /></svg>
+                  </button>
+                  <Popover open={tagOpen} anchor={tagBtnRef} className="rounded-lg border border-line bg-popover shadow-2xl max-h-64 overflow-y-auto min-w-[10rem] py-1">
+                    <div data-tagpop>
+                      {tagStore.tags.map((t) => {
+                        const on = tagFilterSet.has(t.id);
+                        return (
+                          <button key={t.id} onClick={() => setTagFilter(on ? tagFilter.filter((x) => x !== t.id) : [...tagFilter, t.id])} className="w-full flex items-center gap-2 px-2.5 py-1.5 text-left hover:bg-field transition-colors">
+                            <span className="shrink-0 w-2.5 h-2.5 rounded-full" style={{ background: t.color }} />
+                            <span className="min-w-0 flex-1 truncate text-[12px] text-fg-2">{t.name}</span>
+                            {on && <svg viewBox="0 0 24 24" className="w-3.5 h-3.5 shrink-0 text-accent" fill="none" stroke="currentColor" strokeWidth={3} strokeLinecap="round" strokeLinejoin="round"><path d="M5 12l5 5L20 7" /></svg>}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </Popover>
+                </div>
+                {tagFilter.map((id) => {
+                  const t = tagStore.tags.find((x) => x.id === id);
+                  if (!t) return null;
+                  return (
+                    <span key={id} className="inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[11px]" style={{ borderColor: `${t.color}66`, background: `${t.color}1a`, color: t.color }}>
+                      <span className="shrink-0 w-2 h-2 rounded-full" style={{ background: t.color }} />
+                      <span className="truncate max-w-[120px]">{t.name}</span>
+                      <button onClick={() => setTagFilter(tagFilter.filter((x) => x !== id))} aria-label="Remove tag" className="shrink-0 grid place-items-center w-4 h-4 rounded hover:bg-black/20 transition-colors">×</button>
+                    </span>
+                  );
+                })}
+                {tagFilter.length > 0 && (
+                  <button onClick={() => setTagFilter([])} className="le-tap px-2 py-0.5 text-[11px] font-semibold rounded-md border border-line bg-field text-fg-4 hover:text-fg-2 transition-colors">Clear</button>
+                )}
+              </div>
+            )}
           </>
         )}
       </div>
@@ -435,6 +505,19 @@ export default function DuplicateView() {
           </div>
         ) : (
           <div className="flex flex-col gap-1.5">
+            {tradeableItems.length > 0 && (
+              <div className="flex items-center gap-2 px-1">
+                <button onClick={selectAllItems} disabled={allTradeableSelected}
+                  className="le-tap px-3 py-1.5 text-[11px] font-bold rounded-md bg-accent text-on-accent enabled:hover:bg-accent-hover disabled:opacity-40 transition-colors">
+                  Select All{tradeableItems.length ? ` (${tradeableItems.length})` : ''}
+                </button>
+                <button onClick={() => setSel(new Set())} disabled={sel.size === 0}
+                  className="le-tap px-3 py-1.5 text-[11px] font-bold rounded-md border border-line bg-field text-fg-2 enabled:hover:text-fg enabled:hover:border-accent/50 disabled:opacity-40 transition-colors">
+                  None
+                </button>
+                <span className="ml-auto text-[11px] text-fg-4 tabular-nums">{selVisible.length} selected</span>
+              </div>
+            )}
             {selVisible.length > 0 && (
               <div className="sticky top-0 z-20 flex items-center gap-2 rounded-lg border border-accent/40 bg-[var(--color-bg)] px-3 py-2 shadow-[0_4px_12px_-4px_rgba(0,0,0,0.55)]">
                 <span className="text-[11px] font-semibold text-fg-2 tabular-nums">{selVisible.length} item{selVisible.length === 1 ? '' : 's'} selected</span>

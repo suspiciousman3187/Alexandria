@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.0.32"
+version = "0.0.37"
 description = "Alexandria"
 authors = ["Noirblanc"]
 license = "MIT"
@@ -29,6 +29,10 @@ ureq = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
 md5 = "0.7"
+
+# Foreground-window detection for "Show Only Over FFXI" (overlay focus-follow).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading"] }
 
 [profile.release]
 opt-level     = 1

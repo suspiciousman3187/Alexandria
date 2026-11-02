@@ -8,6 +8,7 @@ import { useItemHover } from './ItemTooltip';
 import { useCart, addToCart, setCartQty, removeFromCart, clearCart, getCart, cartKey, type CartEntry } from './bzCart';
 import { useSticky, useStickyChar } from './sticky';
 import { useSettings } from './settings';
+import { useBazaarDelays, setBazaarDelays, BZ_DELAY_DEFAULTS, BZ_DELAY_FIELDS, type BazaarDelays, type Pace } from './bazaarDelays';
 import { OpCard } from './OpCard';
 import { useBzBlacklist, addBzBlacklist, removeBzBlacklist } from './bzBlacklist';
 import { itemNameMatches, itemStack } from './itemNames';
@@ -319,7 +320,7 @@ function BuyModal({ conn, row, gil, assets, iconSet, onClose }: { conn: number; 
               {inCart ? 'Update List' : 'Add to List'}
             </button>
             <button
-              onClick={() => { bzBuy(conn, { sellerid: row.sellerId, sellerindex: row.sellerIndex, bidx: row.bidx, id: row.id, price: row.price, qty }); close(); }}
+              onClick={() => { bzBuy(conn, { sellerid: row.sellerId, sellerindex: row.sellerIndex, items: [{ bidx: row.bidx, id: row.id, price: row.price, qty }] }); close(); }}
               disabled={!afford}
               className="le-tap ml-auto px-4 py-2 text-[12px] font-bold rounded-md bg-accent text-on-accent enabled:hover:bg-accent-hover disabled:opacity-40 transition-colors"
             >
@@ -353,11 +354,26 @@ function CartModal({ conn, gil, assets, iconSet, onClose }: { conn: number; gil:
     const st: Record<string, ProcStatus> = {};
     entries.forEach((e) => { st[e.key] = 'pending'; });
     setStatus({ ...st });
+    // Group the cart by seller so every item wanted from one bazaar is bought in a single visit (one
+    // examine -> browse -> buy each item -> leave), instead of cycling the full sequence per item.
+    const groups = new Map<string, typeof entries>();
     for (const e of entries) {
-      st[e.key] = 'buying'; setStatus({ ...st });
-      bzBuy(conn, { sellerid: e.sellerId, sellerindex: e.sellerIndex, bidx: e.bidx, id: e.id, price: e.price, qty: e.qty });
-      const res = await nextBzBuy();
-      st[e.key] = res?.ok ? 'done' : 'failed'; setStatus({ ...st });
+      const k = `${e.sellerId}:${e.sellerIndex}`;
+      const g = groups.get(k); if (g) g.push(e); else groups.set(k, [e]);
+    }
+    for (const group of groups.values()) {
+      group.forEach((e) => { st[e.key] = 'buying'; }); setStatus({ ...st });
+      bzBuy(conn, { sellerid: group[0].sellerId, sellerindex: group[0].sellerIndex, items: group.map((e) => ({ bidx: e.bidx, id: e.id, price: e.price, qty: e.qty })) });
+      // The addon emits exactly one result frame per queued item (matched by bidx); collect them all.
+      let remaining = group.length;
+      while (remaining > 0) {
+        const res = await nextBzBuy();
+        if (!res) { group.forEach((e) => { if (st[e.key] === 'buying') st[e.key] = 'failed'; }); break; }
+        const e = group.find((g) => g.bidx === res.bidx);
+        if (e) { st[e.key] = res.ok ? 'done' : 'failed'; setStatus({ ...st }); }
+        remaining -= 1;
+      }
+      setStatus({ ...st });
       await new Promise((r) => setTimeout(r, 450));
     }
     for (const e of entries) if (st[e.key] === 'done') removeFromCart(e.key);
@@ -434,6 +450,51 @@ function CartModal({ conn, gil, assets, iconSet, onClose }: { conn: number; gil:
           </div>
         </div>
       )}
+    </Modal>
+  );
+}
+
+function DelaysModal({ onClose }: { onClose: () => void }) {
+  const current = useBazaarDelays();
+  const [d, setD] = useState<BazaarDelays>(current);
+  const setPace = (key: keyof BazaarDelays, part: 'base' | 'jitter', v: number) => setD((p) => ({ ...p, [key]: { ...(p[key] as Pace), [part]: v } }));
+  const Num = ({ v, on }: { v: number; on: (n: number) => void }) => (
+    <input type="number" min="0" step="0.1" value={v} onChange={(e) => on(Math.max(0, Number(e.target.value) || 0))}
+      className="w-16 bg-field border border-line rounded-md px-2 py-1 text-xs text-fg-2 outline-none focus:border-accent/50 tabular-nums" />
+  );
+  return (
+    <Modal onClose={onClose} panelClass="w-[min(94vw,460px)] max-h-[85vh]">
+      <div className="p-4 flex flex-col gap-3 min-h-0">
+        <div className="flex items-center gap-2">
+          <div className="text-[14px] font-bold text-fg">Bazaar Scan Delays</div>
+          <button onClick={() => setD({ ...BZ_DELAY_DEFAULTS })} className="ml-auto text-[11px] font-semibold text-accent hover:underline">Reset to defaults</button>
+        </div>
+        <div className="text-[11px] text-fg-4 leading-relaxed">Delays are all in seconds.</div>
+        <div className="flex flex-col gap-3 overflow-y-auto">
+          {BZ_DELAY_FIELDS.map((f) => {
+            const val = d[f.key];
+            return (
+              <div key={f.key} className="flex items-start gap-3">
+                <div className="min-w-0 flex-1">
+                  <div className="text-[12px] font-semibold text-fg-2">{f.label}</div>
+                  <div className="text-[10.5px] text-fg-4 leading-snug">{f.help}</div>
+                </div>
+                {f.pace ? (
+                  <div className="flex items-center gap-1 shrink-0">
+                    <Num v={(val as Pace).base} on={(n) => setPace(f.key, 'base', n)} />
+                    <span className="text-[10px] text-fg-4">+ up to</span>
+                    <Num v={(val as Pace).jitter} on={(n) => setPace(f.key, 'jitter', n)} />
+                  </div>
+                ) : <div className="shrink-0"><Num v={val as number} on={(n) => setD((p) => ({ ...p, [f.key]: n }))} /></div>}
+              </div>
+            );
+          })}
+        </div>
+        <div className="flex items-center gap-2 pt-1">
+          <button onClick={onClose} className="px-3 py-1.5 text-[12px] font-semibold rounded-md border border-line text-fg-3 hover:text-fg transition-colors">Cancel</button>
+          <button onClick={() => { setBazaarDelays(d); onClose(); }} className="ml-auto px-4 py-1.5 text-[12px] font-bold rounded-md bg-accent text-on-accent hover:bg-accent-hover transition-colors">Save</button>
+        </div>
+      </div>
     </Modal>
   );
 }
@@ -523,6 +584,7 @@ function BrowsePanel({ conn, sellers, listings, scan, mem, gil, assets, iconSet 
   const nearby = useMemo(() => sellers.filter((s) => !blocked.has(s.name.toLowerCase())), [sellers, blocked]);
   const sellerNames = useMemo(() => sellers.map((s) => s.name), [sellers]);
   const [blOpen, setBlOpen] = useState(false);
+  const [dlOpen, setDlOpen] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   useEffect(() => { if (!notice) return; const t = setTimeout(() => setNotice(null), 3500); return () => clearTimeout(t); }, [notice]);
 
@@ -594,6 +656,10 @@ function BrowsePanel({ conn, sellers, listings, scan, mem, gil, assets, iconSet 
             <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2.2} strokeLinecap="round"><circle cx="12" cy="12" r="9" /><path d="M5.6 5.6l12.8 12.8" /></svg>
             Blacklist
             {blacklist.length > 0 && <span className="grid place-items-center min-w-[16px] h-4 px-1 rounded-full bg-red-400 text-[10px] font-extrabold tabular-nums text-[#2a0000]">{blacklist.length}</span>}
+          </button>
+          <button onClick={() => setDlOpen(true)} title="Scan pacing delays" className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] font-bold rounded-md border border-line-2 bg-field text-fg-2 hover:text-fg hover:border-accent/50 transition-colors">
+            <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="9" /><path d="M12 7.5V12l3 2" /></svg>
+            Delays
           </button>
           <button onClick={() => bzScan(conn)} disabled={scanning || nearby.length === 0} title={nearby.length === 0 ? 'No bazaars nearby' : undefined} className="px-3 py-1.5 text-[12px] font-bold rounded-md bg-accent text-on-accent enabled:hover:bg-accent-hover disabled:opacity-40 transition-colors">Scan Nearby</button>
           {!mem && <button onClick={() => bzDeepScan(conn)} disabled={scanning} title="Check every nearby player for a bazaar" className="px-2.5 py-1.5 text-[11px] font-semibold rounded-md border border-line bg-field text-fg-3 hover:text-fg disabled:opacity-40 transition-colors">Deep Scan</button>}
@@ -683,6 +749,7 @@ function BrowsePanel({ conn, sellers, listings, scan, mem, gil, assets, iconSet 
       {buying && <BuyModal conn={conn} row={buying} gil={gil} assets={assets} iconSet={iconSet} onClose={() => setBuying(null)} />}
       {cartOpen && <CartModal conn={conn} gil={gil} assets={assets} iconSet={iconSet} onClose={() => setCartOpen(false)} />}
       {blOpen && <BlacklistModal sellerNames={sellerNames} onClose={() => setBlOpen(false)} />}
+      {dlOpen && <DelaysModal onClose={() => setDlOpen(false)} />}
     </>
   );
 }

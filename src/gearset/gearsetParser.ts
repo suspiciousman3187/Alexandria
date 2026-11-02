@@ -13,6 +13,10 @@ export type ParsedSet = {
   valueSpan: [number, number];
   // Byte range of each slot's whole `key = value` entry in the source, for surgical in-place edits.
   slotSpans: Partial<Record<SlotKey, [number, number]>>;
+  // A job-file-local gear table surfaced as a browsable set (e.g. BRD `Instrument.Savage = {...}`), not a
+  // real `sets.*`. Its one slot's span covers the whole `Name = {...}` statement, so an edit rewrites the
+  // table value in place and keeps the file's format. Unassigning clears it to `{}` instead of deleting it.
+  local?: boolean;
 };
 
 export type ParsedGearsets = { sets: ParsedSet[]; byKey: Map<string, ParsedSet> };
@@ -207,9 +211,17 @@ function parseTable(src: string, open: number, close: number): Node {
   return { kind: 'table', entries };
 }
 
-function toGear(node: Node): GearEntry | null {
+// `refs` resolves a gearswap reference (Rahvin's `gear.<key>` library entries, or job-file-local tables
+// like `Instrument.TP`) to the real item. A dynamic value whose raw is exactly a known ref becomes a
+// concrete item; anything unknown stays dynamic, so literal-only (Mirdain) files are unaffected.
+function toGear(node: Node, refs?: Map<string, GearEntry>): GearEntry | null {
   if (node.kind === 'string') return { kind: 'item', name: node.value };
-  if (node.kind === 'dynamic') return { kind: 'dynamic', raw: node.raw };
+  if (node.kind === 'dynamic') {
+    const hit = refs?.get(node.raw);
+    if (hit) return hit.kind === 'item' ? { ...hit, augments: hit.augments ? [...hit.augments] : undefined } : hit;
+    if (/^empty$/i.test(node.raw)) return null; // GearSwap `empty` = unequip; treat as an empty slot
+    return { kind: 'dynamic', raw: node.raw };
+  }
   if (node.kind === 'combine') return { kind: 'dynamic', raw: `set_combine(${node.base}, ...)` };
   if (node.kind === 'scalar') return { kind: 'dynamic', raw: node.raw };
   if (node.kind === 'table') {
@@ -227,7 +239,7 @@ function toGear(node: Node): GearEntry | null {
   }
   return null;
 }
-function tableToSlots(node: Node): { slots: Partial<Record<SlotKey, GearEntry>>; nonSlotKeys: number; slotSpans: Partial<Record<SlotKey, [number, number]>> } {
+function tableToSlots(node: Node, refs?: Map<string, GearEntry>): { slots: Partial<Record<SlotKey, GearEntry>>; nonSlotKeys: number; slotSpans: Partial<Record<SlotKey, [number, number]>> } {
   const slots: Partial<Record<SlotKey, GearEntry>> = {};
   const slotSpans: Partial<Record<SlotKey, [number, number]>> = {};
   let nonSlotKeys = 0;
@@ -236,7 +248,7 @@ function tableToSlots(node: Node): { slots: Partial<Record<SlotKey, GearEntry>>;
     if (!en.key) continue;
     if (SLOT_ALIASES.has(en.key.toLowerCase())) {
       const sk = canonSlot(en.key);
-      const g = toGear(en.value);
+      const g = toGear(en.value, refs);
       if (sk && g) { slots[sk] = g; slotSpans[sk] = en.span; }
     } else nonSlotKeys++;
   }
@@ -292,7 +304,7 @@ export function resolveSet(set: ParsedSet, byKey: Map<string, ParsedSet>): Parti
   return out;
 }
 
-export function parseGearsetFile(src: string): ParsedGearsets {
+export function parseGearsetFile(src: string, refs?: Map<string, GearEntry>): ParsedGearsets {
   const sets: ParsedSet[] = [];
   let i = 0;
   const n = src.length;
@@ -317,11 +329,15 @@ export function parseGearsetFile(src: string): ParsedGearsets {
         if (path.length && src[q] === '=' && src[q + 1] !== '=') {
           const v = readValue(src, q + 1);
           if (v.node.kind === 'table') {
-            const t = tableToSlots(v.node);
+            const t = tableToSlots(v.node, refs);
             sets.push({ path, key: path.join('.'), slots: t.slots, nonSlotKeys: t.nonSlotKeys, valueSpan: [q + 1, v.end], slotSpans: t.slotSpans });
           } else if (v.node.kind === 'combine') {
-            const t = tableToSlots(v.node.overrides);
+            const t = tableToSlots(v.node.overrides, refs);
             sets.push({ path, key: path.join('.'), slots: t.slots, combineBase: v.node.base, nonSlotKeys: t.nonSlotKeys, valueSpan: [q + 1, v.end], slotSpans: t.slotSpans });
+          } else if (v.node.kind === 'dynamic' && refToKey(v.node.raw)) {
+            // Plain set alias, e.g. `sets.WS.Evisceration = sets.WS.CRIT` or `sets.Midcast.Curaga = sets.Midcast.Cure`.
+            // Carried as a combine with no own overrides so it inherits the referenced set wholesale.
+            sets.push({ path, key: path.join('.'), slots: {}, combineBase: v.node.raw, nonSlotKeys: 0, valueSpan: [q + 1, v.end], slotSpans: {} });
           }
           i = v.end;
           continue;
@@ -337,4 +353,203 @@ export function parseGearsetFile(src: string): ParsedGearsets {
   const byKey = new Map<string, ParsedSet>();
   for (const s of sets) byKey.set(s.key, s);
   return { sets, byKey };
+}
+
+// Collect job-file-local reference tables, e.g. `Instrument.TP = { name="Linos", augments={...} }`.
+// Keyed by the dotted left-hand side ("Instrument.TP"), so a slot value of `Instrument.TP` resolves.
+// Only tables that name an item are kept; `sets.*` and `gear.*` statements are skipped.
+export function collectLocalRefs(src: string): Map<string, GearEntry> {
+  const out = new Map<string, GearEntry>();
+  let i = 0;
+  const n = src.length;
+  while (i < n) {
+    const c = src[i];
+    if (c === ' ' || c === '\t' || c === '\r' || c === '\n') { i++; continue; }
+    if (c === '-' && src[i + 1] === '-') { i = skipTrivia(src, i); continue; }
+    if (c === '"' || c === "'") { i = skipQuoted(src, i); continue; }
+    if (c === '[') { const lb = longBracketLevel(src, i); if (lb) { i = skipLongBracket(src, i); continue; } }
+    if (isIdentStart(c)) {
+      const id = readIdent(src, i);
+      let p = i + id.length;
+      if (id === 'local') { const t = skipTrivia(src, p); if (isIdentStart(src[t])) { i = t; continue; } }
+      // `sets.*` are handled as sets, not refs; skip. `gear.*` table literals (Selindrile `gear.x={name=,aug=}`)
+      // ARE collected here (keyed "gear.x"); Rahvin's `gear.x=hp_gear(...)` builder calls fall through (not a
+      // table) and are instead read by parseGearLibrary.
+      if (id === 'sets' || id === 'function') { i = p; continue; }
+      const path: string[] = [id];
+      for (;;) {
+        if (src[p] === '.') { const seg = readIdent(src, p + 1); if (!seg) break; path.push(seg); p += 1 + seg.length; }
+        else if (src[p] === '[') { const bk = readValueBracketKey(src, p); if (!bk) break; path.push(bk.key); p = bk.end; }
+        else break;
+      }
+      const q = skipTrivia(src, p);
+      if (src[q] === '=' && src[q + 1] !== '=') {
+        const v = readValue(src, q + 1);
+        if (v.node.kind === 'table') { const g = toGear(v.node); if (g && g.kind === 'item') out.set(path.join('.'), g); }
+        i = v.end;
+        continue;
+      }
+      i = p;
+      continue;
+    }
+    i++;
+  }
+  return out;
+}
+
+// Find the gear slot a job-file-local table is actually used in, e.g. `range=Instrument.Savage` -> 'range'.
+// Returns null when the table is never assigned to a slot (so incidental local tables aren't surfaced).
+function findRefSlot(src: string, key: string): SlotKey | null {
+  const esc = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // A slot-name LHS = the dotted key, not preceded by a word/dot (so `Instrument.Savage` is the whole ref)
+  // and not followed by one (so `Instrument.Savage` doesn't match `Instrument.SavageX`).
+  const re = new RegExp('(?:^|[^.\\w])([A-Za-z_]\\w*)\\s*=\\s*' + esc + '(?![\\w.])', 'g');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(src))) {
+    if (SLOT_ALIASES.has(m[1].toLowerCase())) { const sk = canonSlot(m[1]); if (sk) return sk; }
+  }
+  return null;
+}
+
+// Surface job-file-local gear tables (e.g. BRD `Instrument.Savage = { name="Linos", augments={...} }`) as
+// browsable, editable pseudo-sets. Each member's single slot carries the whole statement's byte span, so an
+// edit rewrites the table value in place without changing the file's format.
+//
+// A whole family (root identifier, e.g. `Instrument`) is surfaced only once at least one of its members is
+// assigned to a real gear slot somewhere (`range=Instrument.TP`) -- that confirms the family is gear, not an
+// incidental local table. Every item-naming member of a confirmed family is then included (so an instrument
+// that is defined but not referenced by any set, e.g. `Instrument.Ballad`, is still editable), using the
+// member's own usage slot when it has one, else the family's slot. `sets.*` / `gear.*` are skipped.
+type LocalDef = { path: string[]; key: string; root: string; gear: GearEntry; span: [number, number]; valueSpan: [number, number]; slot: SlotKey | null };
+export function collectLocalRefSets(src: string): ParsedSet[] {
+  const defs: LocalDef[] = [];
+  const seen = new Set<string>();
+  let i = 0;
+  const n = src.length;
+  while (i < n) {
+    const c = src[i];
+    if (c === ' ' || c === '\t' || c === '\r' || c === '\n') { i++; continue; }
+    if (c === '-' && src[i + 1] === '-') { i = skipTrivia(src, i); continue; }
+    if (c === '"' || c === "'") { i = skipQuoted(src, i); continue; }
+    if (c === '[') { const lb = longBracketLevel(src, i); if (lb) { i = skipLongBracket(src, i); continue; } }
+    if (isIdentStart(c)) {
+      const id = readIdent(src, i);
+      let p = i + id.length;
+      if (id === 'local') { const t = skipTrivia(src, p); if (isIdentStart(src[t])) { i = t; continue; } }
+      if (id === 'sets' || id === 'gear' || id === 'function') { i = p; continue; }
+      const path: string[] = [id];
+      for (;;) {
+        if (src[p] === '.') { const seg = readIdent(src, p + 1); if (!seg) break; path.push(seg); p += 1 + seg.length; }
+        else if (src[p] === '[') { const bk = readValueBracketKey(src, p); if (!bk) break; path.push(bk.key); p = bk.end; }
+        else break;
+      }
+      const q = skipTrivia(src, p);
+      if (src[q] === '=' && src[q + 1] !== '=') {
+        const defStart = i;
+        const v = readValue(src, q + 1);
+        if (path.length >= 2 && v.node.kind === 'table') {
+          const key = path.join('.');
+          const g = toGear(v.node);
+          if (!seen.has(key) && g && g.kind === 'item') {
+            seen.add(key);
+            defs.push({ path, key, root: path[0], gear: g, span: [defStart, v.end], valueSpan: [q + 1, v.end], slot: findRefSlot(src, key) });
+          }
+        }
+        i = v.end;
+        continue;
+      }
+      i = p;
+      continue;
+    }
+    i++;
+  }
+  // A family's slot = the first slot any of its members is assigned to. Families with none stay unsurfaced.
+  const rootSlot = new Map<string, SlotKey>();
+  for (const d of defs) if (d.slot && !rootSlot.has(d.root)) rootSlot.set(d.root, d.slot);
+  const out: ParsedSet[] = [];
+  for (const d of defs) {
+    const slot = d.slot ?? rootSlot.get(d.root);
+    if (!slot) continue;
+    out.push({
+      path: d.path, key: d.key, local: true,
+      slots: { [slot]: d.gear } as Partial<Record<SlotKey, GearEntry>>,
+      slotSpans: { [slot]: d.span } as Partial<Record<SlotKey, [number, number]>>,
+      valueSpan: d.valueSpan,
+      nonSlotKeys: 0,
+    });
+  }
+  return out;
+}
+
+function matchParen(src: string, i: number): number {
+  let depth = 0, j = i;
+  while (j < src.length) {
+    const c = src[j];
+    if (c === '"' || c === "'") { j = skipQuoted(src, j); continue; }
+    if (c === '-' && src[j + 1] === '-') { j = skipTrivia(src, j); continue; }
+    if (c === '[') { const lb = longBracketLevel(src, j); if (lb) { j = skipLongBracket(src, j); continue; } }
+    if (c === '(') depth++;
+    else if (c === ')') { depth--; if (depth === 0) return j + 1; }
+    j++;
+  }
+  return src.length;
+}
+
+// Parse a Rahvin gear library (GearSets-Include.lua), whose 4,900+ entries look like
+//   gear.nyameHead = hp_gear("Nyame Helm", 91, { augments={...}, bag="wardrobe 2" })
+// into a map keyed by the reference used in job files ("gear.nyameHead"). The numeric priority
+// argument is the item's HP/rank ordering token and is not needed for display, so it is ignored.
+export function parseGearLibrary(src: string): Map<string, GearEntry> {
+  const out = new Map<string, GearEntry>();
+  const BUILDERS = new Set(['hp_gear', 'mp_gear', 'rank_gear']);
+  let i = 0;
+  const n = src.length;
+  while (i < n) {
+    const c = src[i];
+    if (c === ' ' || c === '\t' || c === '\r' || c === '\n') { i++; continue; }
+    if (c === '-' && src[i + 1] === '-') { i = skipTrivia(src, i); continue; }
+    if (c === '"' || c === "'") { i = skipQuoted(src, i); continue; }
+    if (c === '[') { const lb = longBracketLevel(src, i); if (lb) { i = skipLongBracket(src, i); continue; } }
+    if (isIdentStart(c)) {
+      const id = readIdent(src, i);
+      let p = i + id.length;
+      if (id !== 'gear' || src[p] !== '.') { i = p; continue; }
+      const key = readIdent(src, p + 1);
+      if (!key) { i = p; continue; }
+      p += 1 + key.length;
+      let q = skipTrivia(src, p);
+      if (src[q] !== '=' || src[q + 1] === '=') { i = q; continue; }
+      q = skipTrivia(src, q + 1);
+      if (!isIdentStart(src[q])) { i = q; continue; }
+      const builder = readIdent(src, q);
+      q += builder.length;
+      q = skipTrivia(src, q);
+      if (!BUILDERS.has(builder) || src[q] !== '(') { i = q; continue; }
+      const callEnd = matchParen(src, q);
+      // First argument: the item name.
+      let a = skipTrivia(src, q + 1);
+      if (src[a] !== '"' && src[a] !== "'") { i = callEnd; continue; }
+      const nameRead = readQuoted(src, a);
+      const name = nameRead.value;
+      // Optional attributes table anywhere later in the call: pull augments / bag out of it.
+      let augments: string[] | undefined;
+      let bag: string | undefined;
+      const brace = src.indexOf('{', nameRead.end);
+      if (brace >= 0 && brace < callEnd) {
+        const bEnd = matchBrace(src, brace);
+        const tbl = parseTable(src, brace, bEnd);
+        if (tbl.kind === 'table') for (const en of tbl.entries) {
+          const k = (en.key || '').toLowerCase();
+          if (k === 'augments' && en.value.kind === 'table') augments = en.value.entries.filter((x: TEntry) => x.value.kind === 'string').map((x: TEntry) => (x.value as { value: string }).value);
+          else if (k === 'augment' && en.value.kind === 'string') augments = [en.value.value];
+          else if (k === 'bag' && en.value.kind === 'string') bag = en.value.value;
+        }
+      }
+      out.set(`gear.${key}`, { kind: 'item', name, augments, bag });
+      i = callEnd;
+      continue;
+    }
+    i++;
+  }
+  return out;
 }

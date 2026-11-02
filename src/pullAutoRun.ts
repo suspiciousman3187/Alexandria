@@ -1,9 +1,11 @@
 import { useEffect, useRef } from 'react';
-import { useKnownCharacters, axEcho, type KnownChar } from './bridge';
+import { useKnownCharacters, axEcho, useAddonInfo, type KnownChar } from './bridge';
 import { usePullRules } from './pullRules';
 import { useItemTags } from './itemTags';
 import { useSettings } from './settings';
 import { firePull, reachableBag } from './pullEngine';
+import { deriveGearswapData } from './gearset/gearsetFiles';
+import { gearsetItemIds } from './gearset/gearsetPullIds';
 
 // One in-flight auto-pull we are waiting to land, so we can confirm completion in-game.
 type Pending = { name: string; conn: number; ruleName: string; job: string; planned: number; before: Map<number, Map<number, number>>; dests: number[]; landed: number; startedAt: number; lastChange: number };
@@ -35,8 +37,10 @@ function landedNow(op: Pending, char: KnownChar) {
 export function usePullAutoRun() {
   const chars = useKnownCharacters();
   const rules = usePullRules();
-  const { assign } = useItemTags();
+  const { assign, assignAug } = useItemTags();
   const exp = useSettings().experimentalFeatures;
+  const addon = useAddonInfo();
+  const gearswapBase = useSettings().gearswapPath || (addon?.dir ? deriveGearswapData(addon.dir) : '');
   const prev = useRef<Map<string, string>>(new Map());
   const pending = useRef<Pending[]>([]);
   const charsRef = useRef(chars);
@@ -73,21 +77,27 @@ export function usePullAutoRun() {
       if (main) prev.current.set(ch.name, main); else { prev.current.delete(ch.name); continue; }
       if (last === undefined || last === main || auto.length === 0) continue; // first sighting, or no change
       const conn = ch.conn;
-      for (const r of auto) {
-        if (r.jobs && r.jobs.length > 0 && !r.jobs.includes(main)) continue; // per-job preset targeting
-        const slipsOk = !r.slips || ch.porterNear;                       // slip pulls need the Porter
-        const bagsOk = r.bags.every((b) => reachableBag(ch, exp, b));     // bag pulls need those bags reachable
-        if (!slipsOk || !bagsOk) continue;
-        const before = countByBag(ch, [...new Set([...(r.dest && r.dest.length ? r.dest : [0]), 0])]);
-        const res = firePull(ch, conn, r, { assign, exp });
-        const n = res.movedItems + res.slipTake;
-        if (n > 0) { // one pull per change so the slip ops never collide; announce + track for completion
-          axEcho(conn, `Auto-pull "${r.name}": pulling ${n} ${main} item${n === 1 ? '' : 's'}`);
-          pending.current.push({ name: ch.name, conn, ruleName: r.name, job: main, planned: n, before, dests: res.tracked, landed: 0, startedAt: Date.now(), lastChange: Date.now() });
-          break;
+      // Async so a gearsetOnly rule can resolve the job's GearSwap set items first. Still one pull per
+      // job change: the first rule that moves something wins and we stop.
+      void (async () => {
+        let gearIds: Set<number> | null | undefined; // resolved lazily, once, the first time a gearsetOnly rule needs it
+        for (const r of auto) {
+          if (r.jobs && r.jobs.length > 0 && !r.jobs.includes(main)) continue; // per-job preset targeting
+          const slipsOk = !r.slips || ch.porterNear;                       // slip pulls need the Porter
+          const bagsOk = r.bags.every((b) => reachableBag(ch, exp, b));     // bag pulls need those bags reachable
+          if (!slipsOk || !bagsOk) continue;
+          if (r.gearsetOnly && gearIds === undefined) gearIds = gearswapBase ? await gearsetItemIds(gearswapBase, ch.name, main) : null;
+          const before = countByBag(ch, [...new Set([...(r.dest && r.dest.length ? r.dest : [0]), 0])]);
+          const res = firePull(ch, conn, r, { assign, assignAug, gearIds: r.gearsetOnly ? (gearIds ?? null) : null, exp });
+          const n = res.movedItems + res.slipTake;
+          if (n > 0) { // one pull per change so the slip ops never collide; announce + track for completion
+            axEcho(conn, `Auto-pull "${r.name}": pulling ${n} ${main} item${n === 1 ? '' : 's'}`);
+            pending.current.push({ name: ch.name, conn, ruleName: r.name, job: main, planned: n, before, dests: res.tracked, landed: 0, startedAt: Date.now(), lastChange: Date.now() });
+            break;
+          }
+          if (res.blocked.length) axEcho(conn, `Auto-pull "${r.name}" skipped: ${res.blocked[0]}`);
         }
-        if (res.blocked.length) axEcho(conn, `Auto-pull "${r.name}" skipped: ${res.blocked[0]}`);
-      }
+      })();
     }
-  }, [chars, rules, assign, exp]);
+  }, [chars, rules, assign, assignAug, exp, gearswapBase]);
 }

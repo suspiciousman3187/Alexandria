@@ -1,8 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { convertFileSrc } from '@tauri-apps/api/core';
-import { useKnownCharacters, useAvailableIcons, slipStore, slipRetrieve, moveItem, inTauri, type Slip, type PorterProgress } from './bridge';
-import { useItemHover } from './ItemTooltip';
+import { useKnownCharacters, useAvailableIcons, requestIcons, slipStore, slipRetrieve, moveItem, inTauri, type Slip, type PorterProgress } from './bridge';
+import { useItemCard } from './ItemTooltip';
 import { itemNameMatches, nameMatches } from './itemNames';
 import { useJobFilter, JobFilterSelect } from './jobFilter';
 import { slipLabel } from './slipLabels';
@@ -30,7 +30,13 @@ function PorterStatus({ porter }: { porter: PorterProgress }) {
 }
 
 function Icon({ id, n, assets, count, onClick, title, selected, match }: { id: number; n: string; assets?: string; count?: number; onClick?: () => void; title?: string; selected?: boolean; match?: boolean }) {
-  const hover = useItemHover({ id, n, c: count });
+  // Open the full item card on HOVER (click is reserved for selecting the item to store/retrieve). Mirrors
+  // SlipOpPreview so slip items get the same rich tooltip as the rest of the app.
+  const card = useItemCard();
+  const hover = {
+    onMouseEnter: (e: ReactMouseEvent<HTMLElement>) => { if (id > 0) card?.hoverOpen({ id, n, c: count }, e.currentTarget.getBoundingClientRect(), e.currentTarget); },
+    onMouseLeave: () => card?.hoverHide(),
+  };
   const [broken, setBroken] = useState(false);
   const ready = useAvailableIcons().has(id);
   const src = ready && assets && inTauri ? convertFileSrc(`${assets}/icon_${id}.bmp`) : null;
@@ -64,8 +70,12 @@ function SlipCard({ slip, assets, near, q, jobMatch, onStoreIds, onRetrieveIds, 
   const hasWork = slip.storable.length > 0 || slip.stored.length > 0;
   const owned = slip.owned !== false; // false = we hold items for this slip but don't have the slip
   const showBanner = hasWork && !slip.ready;
-  const canAct = near && slip.ready; // storing/retrieving needs the slip physically in inventory
-  const tip = !near ? 'Stand next to the Porter Moogle' : !slip.ready ? (slip.getable ? 'Get this slip into your inventory first' : 'You need this slip in your bags first') : undefined;
+  // Storing/retrieving needs the slip in inventory, but the addon auto-pulls a reachable (getable) slip and
+  // puts it back, so the buttons work whenever the slip is in inventory OR in a bag we can pull from here.
+  const canAct = near && (slip.ready || slip.getable);
+  const tip = !near ? 'Stand next to the Porter Moogle'
+    : (slip.ready || slip.getable) ? undefined
+    : slip.loc >= 0 ? 'Open your Mog House to reach this slip' : 'You need this slip in your bags first';
 
   const [selStore, setSelStore] = useState<Set<number>>(() => new Set());
   const [selRet, setSelRet] = useState<Set<number>>(() => new Set());
@@ -107,7 +117,7 @@ function SlipCard({ slip, assets, near, q, jobMatch, onStoreIds, onRetrieveIds, 
           <svg viewBox="0 0 24 24" className="w-4 h-4 shrink-0 text-amber-300" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
           <span className="text-[11px] text-amber-100 flex-1 min-w-0">
             {slip.getable
-              ? `The slip is in your ${slip.locname}. Bring it to your inventory to use it.`
+              ? `The slip is in your ${slip.locname}. Store or Retrieve will pull it in and put it back automatically, or Get Slip to hold it yourself.`
               : slip.loc >= 0
                 ? `The slip is in your ${slip.locname}, which you can't reach here. Open your Mog House to get it.`
                 : `You're holding ${slip.storable.length} item${slip.storable.length === 1 ? '' : 's'} for this slip but don't own it. Get the slip into your bags to store them.`}
@@ -180,6 +190,22 @@ export default function SlipsView() {
   const slips = active?.slips ?? [];
   const conn = active?.conn;
   const near = !!active?.porterNear;
+
+  // Stored/storable slip gear isn't physically in a bag, so its icon was never generated and the tiles fell
+  // back to a 4-letter name ("Evok"). Ask the addon to render icons for every slip item we don't have yet,
+  // so the view shows real gear icons like Inventory/Wardrobe (Integrity's accessibility request). The Icon
+  // component already prefers the icon and only shows text when one is missing, so nothing else changes.
+  const iconSet = useAvailableIcons();
+  const requestedIcons = useRef<Set<number>>(new Set());
+  useEffect(() => { requestedIcons.current = new Set(); }, [conn]);
+  useEffect(() => {
+    if (conn == null) return;
+    const ids: number[] = [];
+    for (const s of slips) for (const it of [...s.storable, ...s.stored]) {
+      if (it.id > 0 && !iconSet.has(it.id) && !requestedIcons.current.has(it.id)) { requestedIcons.current.add(it.id); ids.push(it.id); }
+    }
+    if (ids.length) requestIcons(conn, ids);
+  }, [slips, conn, iconSet]);
 
   const [filter, setFilter] = useState('');
   const jf = useJobFilter('slips.jobfilter');

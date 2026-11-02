@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core';
+import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { useEffect, useMemo, useSyncExternalStore } from 'react';
 import { appDataPath, inTauri, useKnownCharacters } from './bridge';
 
@@ -11,6 +11,7 @@ import { appDataPath, inTauri, useKnownCharacters } from './bridge';
 let names: string[] = [];
 let on = true;
 let volume = 0.6;
+let sound = '';   // absolute path to a user-supplied audio file; '' = the built-in beep
 let started = false;
 let ready = false;
 const subs = new Set<() => void>();
@@ -28,6 +29,7 @@ async function load() {
       if (Array.isArray(p.names)) names = p.names.filter((x): x is string => typeof x === 'string');
       on = p.on !== false; // default ON
       if (typeof p.volume === 'number' && p.volume >= 0 && p.volume <= 1) volume = p.volume;
+      if (typeof p.sound === 'string') sound = p.sound;
     } catch { /* none saved */ }
   }
   ready = true;
@@ -39,10 +41,11 @@ if (typeof window !== 'undefined') {
   window.addEventListener('storage', (e) => {
     if (e.key !== SYNC_KEY || !e.newValue) return;
     try {
-      const p = JSON.parse(e.newValue) as { names?: string[]; on?: boolean; volume?: number };
+      const p = JSON.parse(e.newValue) as { names?: string[]; on?: boolean; volume?: number; sound?: string };
       if (Array.isArray(p.names)) names = p.names.filter((x): x is string => typeof x === 'string');
       on = p.on !== false;
       if (typeof p.volume === 'number') volume = p.volume;
+      if (typeof p.sound === 'string') { sound = p.sound; soundEl = null; }
       ready = true;
       notify();
     } catch { /* ignore */ }
@@ -51,8 +54,8 @@ if (typeof window !== 'undefined') {
 
 async function save() {
   if (!inTauri) return;
-  try { await invoke('write_text_file', { path: await appDataPath('pool_alerts.json'), contents: JSON.stringify({ names, on, volume }) }); } catch { /* ignore */ }
-  try { localStorage.setItem(SYNC_KEY, JSON.stringify({ names, on, volume, t: Date.now() })); } catch { /* ignore */ }
+  try { await invoke('write_text_file', { path: await appDataPath('pool_alerts.json'), contents: JSON.stringify({ names, on, volume, sound }) }); } catch { /* ignore */ }
+  try { localStorage.setItem(SYNC_KEY, JSON.stringify({ names, on, volume, sound, t: Date.now() })); } catch { /* ignore */ }
 }
 
 const sub = (cb: () => void) => { subs.add(cb); return () => subs.delete(cb); };
@@ -69,6 +72,8 @@ export function useAlertOn(): boolean { return useSyncExternalStore(sub, () => o
 export function setAlertOn(v: boolean) { on = v; notify(); void save(); }
 export function useAlertVolume(): number { return useSyncExternalStore(sub, () => volume, () => volume); }
 export function setAlertVolume(v: number) { volume = Math.max(0, Math.min(1, v)); notify(); void save(); }
+export function useAlertSound(): string { return useSyncExternalStore(sub, () => sound, () => sound); }
+export function setAlertSound(v: string) { sound = v || ''; soundEl = null; notify(); void save(); }
 
 // ---- runtime: which watched items are sounding right now, + dismiss ---------------------------------
 let activeNames: string[] = [];
@@ -108,9 +113,25 @@ function beep(vol: number) {
     });
   } catch { /* audio unavailable */ }
 }
-function startTone(vol: number) { if (toneTimer != null) return; beep(vol); toneTimer = window.setInterval(() => beep(vol), 2500); }
-function stopTone() { if (toneTimer != null) { clearInterval(toneTimer); toneTimer = null; } }
-export function testAlertTone() { beep(volume); }
+// A user-supplied sound file plays in place of the beep. It's retriggered on the same 2.5s cadence, but only
+// when the previous play has finished, so a clip longer than 2.5s isn't chopped off. Falls back to the beep if
+// the file is missing/unplayable (e.g. the user moved or deleted it).
+let soundEl: HTMLAudioElement | null = null;
+let soundElSrc = '';
+function playAlert(vol: number) {
+  if (sound) {
+    try {
+      if (!soundEl || soundElSrc !== sound) { soundEl = new Audio(convertFileSrc(sound)); soundElSrc = sound; }
+      soundEl.volume = Math.max(0, Math.min(1, vol));
+      if (soundEl.paused || soundEl.ended) { soundEl.currentTime = 0; void soundEl.play().catch(() => beep(vol)); }
+      return;
+    } catch { /* fall through to the beep */ }
+  }
+  beep(vol);
+}
+function startTone(vol: number) { if (toneTimer != null) return; playAlert(vol); toneTimer = window.setInterval(() => playAlert(vol), 2500); }
+function stopTone() { if (toneTimer != null) { clearInterval(toneTimer); toneTimer = null; } if (soundEl) { try { soundEl.pause(); } catch { /* ignore */ } } }
+export function testAlertTone() { playAlert(volume); }
 
 // ---- the watcher: mount ONCE (main window) ----------------------------------------------------------
 export function usePoolAlert() {

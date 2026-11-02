@@ -14,6 +14,10 @@ const BOX_PORT: u16 = 24233;
 static CONN_SEQ: AtomicU64 = AtomicU64::new(1);
 static IPC_BOUND: AtomicBool = AtomicBool::new(false);
 static USER_QUITTING: AtomicBool = AtomicBool::new(false);
+// "Show Only Over FFXI": auto-hide the Treasure Pool overlay unless FFXI
+// (pol.exe) or this app is the foreground window. Default off (opt-in).
+static POOL_FOCUS_FOLLOW: AtomicBool = AtomicBool::new(false);
+static FOCUS_WATCHER_STARTED: AtomicBool = AtomicBool::new(false);
 
 fn conns() -> &'static Mutex<HashMap<u64, TcpStream>> {
     static C: OnceLock<Mutex<HashMap<u64, TcpStream>>> = OnceLock::new();
@@ -483,6 +487,98 @@ fn setup_tray(_app: &tauri::AppHandle) -> Result<(), tauri::Error> {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+// ── "Show Only Over FFXI" (focus-follow) ────────────────────────────────────
+// True when the foreground window belongs to FFXI (pol.exe) or to this app.
+#[cfg(windows)]
+fn foreground_is_game_or_self() -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return false;
+        }
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid == 0 {
+            return false;
+        }
+        if pid == std::process::id() {
+            return true;
+        }
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return false;
+        }
+        let mut buf = [0u16; 260];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len);
+        CloseHandle(h);
+        if ok == 0 {
+            return false;
+        }
+        let full = String::from_utf16_lossy(&buf[..len as usize]);
+        let base = full.rsplit(|c| c == '\\' || c == '/').next().unwrap_or("");
+        base.eq_ignore_ascii_case("pol.exe")
+    }
+}
+
+#[cfg(not(windows))]
+fn foreground_is_game_or_self() -> bool {
+    true
+}
+
+// Polls the foreground every 250ms and hides/shows the pool overlay when
+// focus-follow is on. Only toggles visibility it changed itself, so it never
+// fights the user's own close/minimize.
+fn start_focus_watcher(app: tauri::AppHandle) {
+    use tauri::Manager;
+    if FOCUS_WATCHER_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let mut hidden_by_ff = false;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let win = match app.get_webview_window("pool") {
+                Some(w) => w,
+                None => {
+                    hidden_by_ff = false;
+                    continue;
+                }
+            };
+            if !POOL_FOCUS_FOLLOW.load(Ordering::Relaxed) {
+                if hidden_by_ff {
+                    let w = win.clone();
+                    let _ = app.run_on_main_thread(move || { let _ = w.show(); });
+                    hidden_by_ff = false;
+                }
+                continue;
+            }
+            let over = foreground_is_game_or_self();
+            if over && hidden_by_ff {
+                let w = win.clone();
+                let _ = app.run_on_main_thread(move || { let _ = w.show(); });
+                hidden_by_ff = false;
+            } else if !over && !hidden_by_ff {
+                if win.is_visible().unwrap_or(false) {
+                    let w = win.clone();
+                    let _ = app.run_on_main_thread(move || { let _ = w.hide(); });
+                    hidden_by_ff = true;
+                }
+            }
+        }
+    });
+}
+
+#[tauri::command]
+fn set_pool_focus_follow(enabled: bool) {
+    POOL_FOCUS_FOLLOW.store(enabled, Ordering::Relaxed);
+}
+
 pub fn run() {
     let builder = tauri::Builder::default();
     // Single-instance guard (release only, so a dev window can still run alongside a release build).
@@ -515,6 +611,7 @@ pub fn run() {
             }
             start_box_server(app.handle().clone());
             sage_feed::start(app.handle().clone());
+            start_focus_watcher(app.handle().clone());
             let _ = setup_tray(app.handle());
             // Force a high-res window icon. Tauri's default_window_icon resolves to a small (32px) source,
             // which Windows then upscales for the taskbar/alt-tab at higher DPI -> a blurry, mushy icon. Set
@@ -546,7 +643,20 @@ pub fn run() {
             ahsearch::ah_category,
             sage_feed::sage_pool_prices,
             sage_feed::sage_send,
+            set_pool_focus_follow,
         ])
+        .on_window_event(|window, event| {
+            // When the MAIN window is destroyed, tear down the pop-out Pool/Gearsets windows too, so closing
+            // Alexandria never leaves an orphan overlay lingering on screen (it can't be closed and keeps the
+            // process alive). A hide-to-tray uses hide(), not destroy, so this only fires on a real close.
+            use tauri::Manager;
+            if window.label() == "main" && matches!(event, tauri::WindowEvent::Destroyed) {
+                let app = window.app_handle();
+                for label in ["pool", "gearsets"] {
+                    if let Some(w) = app.get_webview_window(label) { let _ = w.destroy(); }
+                }
+            }
+        })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|_app, _event| {});

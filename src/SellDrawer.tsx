@@ -11,8 +11,8 @@ import { OpCard, OpGlyph, type OpState } from './OpCard';
 
 const toOp = (s: 'pending' | 'ok' | 'fail'): OpState => (s === 'pending' ? 'active' : s);
 
-type StageItem = { item: SelItem; single: number; price: string; qty: number };
-const priceOf = (s: string) => Number(s.replace(/[,\s]/g, '')) || 0;
+export type StageItem = { item: SelItem; single: number; price: string; qty: number };
+export const priceOf = (s: string) => Number(s.replace(/[,\s]/g, '')) || 0;
 
 function Icon({ id, n, c, assets, iconSet }: { id: number; n: string; c?: number; assets?: string; iconSet: Set<number> }) {
   const hover = useItemHover({ id, n, c });
@@ -23,7 +23,7 @@ function Icon({ id, n, c, assets, iconSet }: { id: number; n: string; c?: number
   );
 }
 
-function StageRow({ row, assets, iconSet, server, onChange, onRemove }: { row: StageItem; assets?: string; iconSet: Set<number>; server?: string; onChange: (p: Partial<StageItem>) => void; onRemove: () => void }) {
+export function StageRow({ row, assets, iconSet, server, onChange, onRemove }: { row: StageItem; assets?: string; iconSet: Set<number>; server?: string; onChange: (p: Partial<StageItem>) => void; onRemove: () => void }) {
   const [showMkt, setShowMkt] = useState(false);
   const { item, single, price, qty } = row;
   return (
@@ -55,7 +55,7 @@ function StageRow({ row, assets, iconSet, server, onChange, onRemove }: { row: S
   );
 }
 
-function BatchProgress({ batchId, onClear }: { batchId: number; onClear: () => void }) {
+export function BatchProgress({ batchId, onClear }: { batchId: number; onClear: () => void }) {
   const listings = useAhListings().filter((l) => l.batchId === batchId);
   const total = listings.length;
   const done = listings.filter((l) => l.status !== 'pending').length;

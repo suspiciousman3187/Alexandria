@@ -8,6 +8,7 @@ type Store = Record<string, PoolRules>;
 
 let store: Store = {};
 let passOnLot = true;
+let passRareOwned = false; // auto-pass a Rare item you already own (can't lot it again). Default OFF.
 let autoLotEnabled = true; // global master switch for acting on the lot list
 let autoLotOff: Record<string, boolean> = {}; // per-character overrides (true = auto-lot disabled)
 let started = false;
@@ -53,6 +54,7 @@ async function load() {
       }
       store = next;
       passOnLot = p?.passOnLot !== false; // default ON: only an explicit false disables it
+      passRareOwned = p?.passRareOwned === true; // default OFF: only an explicit true enables it
       autoLotEnabled = p?.autoLotEnabled !== false;
       autoLotOff = {};
       const alo = p?.autoLotOff;
@@ -69,9 +71,10 @@ if (typeof window !== 'undefined') {
   window.addEventListener('storage', (e) => {
     if (e.key !== POOL_SYNC_KEY || !e.newValue) return;
     try {
-      const p = JSON.parse(e.newValue) as { store?: Store; passOnLot?: boolean; autoLotEnabled?: boolean; autoLotOff?: Record<string, boolean> };
+      const p = JSON.parse(e.newValue) as { store?: Store; passOnLot?: boolean; passRareOwned?: boolean; autoLotEnabled?: boolean; autoLotOff?: Record<string, boolean> };
       if (p.store && typeof p.store === 'object') store = p.store;
       passOnLot = p.passOnLot === true;
+      passRareOwned = p.passRareOwned === true;
       autoLotEnabled = p.autoLotEnabled !== false;
       autoLotOff = (p.autoLotOff && typeof p.autoLotOff === 'object') ? { ...p.autoLotOff } : {};
       ready = true;
@@ -82,8 +85,8 @@ if (typeof window !== 'undefined') {
 
 async function save() {
   if (!inTauri) return;
-  try { await invoke('write_text_file', { path: await appDataPath('pool_rules.json'), contents: JSON.stringify({ byChar: store, passOnLot, autoLotEnabled, autoLotOff }) }); } catch { /* ignore */ }
-  try { localStorage.setItem(POOL_SYNC_KEY, JSON.stringify({ store, passOnLot, autoLotEnabled, autoLotOff, t: Date.now() })); } catch { /* ignore */ }
+  try { await invoke('write_text_file', { path: await appDataPath('pool_rules.json'), contents: JSON.stringify({ byChar: store, passOnLot, passRareOwned, autoLotEnabled, autoLotOff }) }); } catch { /* ignore */ }
+  try { localStorage.setItem(POOL_SYNC_KEY, JSON.stringify({ store, passOnLot, passRareOwned, autoLotEnabled, autoLotOff, t: Date.now() })); } catch { /* ignore */ }
 }
 
 function commit(next: Store) { store = next; notify(); void save(); }
@@ -121,6 +124,11 @@ export function usePassOnLot(): boolean {
 }
 export function setPassOnLot(v: boolean) { passOnLot = v; notify(); void save(); }
 
+export function usePassRareOwned(): boolean {
+  return useSyncExternalStore((cb) => { subs.add(cb); return () => subs.delete(cb); }, () => passRareOwned, () => passRareOwned);
+}
+export function setPassRareOwned(v: boolean) { passRareOwned = v; notify(); void save(); }
+
 export function useAutoLotEnabled(): boolean {
   return useSyncExternalStore((cb) => { subs.add(cb); return () => subs.delete(cb); }, () => autoLotEnabled, () => autoLotEnabled);
 }
@@ -142,6 +150,7 @@ export function usePoolRulesSync() {
   const boxes = useBoxes();
   const s = usePoolStore();
   const yield_ = usePassOnLot();
+  const rareOwned = usePassRareOwned();
   const enabled = useAutoLotEnabled();
   const off = useAutoLotOff();
   const onlineKey = useMemo(() => boxes.filter((b) => b.conn != null).map((b) => `${b.conn}:${b.name}`).sort().join(','), [boxes]);
@@ -149,7 +158,7 @@ export function usePoolRulesSync() {
     if (!ready) return;
     for (const b of boxes) {
       if (b.conn == null || !b.name) continue;
-      setPoolRules(b.conn, { ...(s[b.name] ?? emptyRules()), passOnLot: yield_, autoLot: enabled && !off[b.name] });
+      setPoolRules(b.conn, { ...(s[b.name] ?? emptyRules()), passOnLot: yield_, passRareOwned: rareOwned, autoLot: enabled && !off[b.name] });
     }
-  }, [onlineKey, s, yield_, enabled, off]);
+  }, [onlineKey, s, yield_, rareOwned, enabled, off]);
 }

@@ -1,12 +1,12 @@
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { appLocalDataDir } from '@tauri-apps/api/path';
-import { useEffect, useMemo, useSyncExternalStore } from 'react';
+import { useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 import { logPriceSnapshot } from './priceStore';
 
 export const inTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
-export type InvItem = { s: number; id: number; c: number; n: string; u?: number; f?: number; ms?: number; aug?: string[]; bz?: number; lk?: number };
+export type InvItem = { s: number; id: number; c: number; n: string; u?: number; f?: number; ms?: number; aug?: string[]; bz?: number; lk?: number; ur?: number; ua?: number };
 export type InvBag = { b: string; id: number; max: number; used: number; items: InvItem[] };
 export type SelItem = InvItem & { bag: number };
 export type PoolItem = { i: number; id: number; n: string; ts: number; lotter: string | null; lot: number; mylot: number | null };
@@ -22,7 +22,9 @@ export type CurioScan = { active: boolean; opt: number; max: number; count: numb
 export type ResupplyProgress = { active: boolean; item: number; have: number; target: number; phase: string };
 export type UseProgress = { active: boolean; id: number; name: string; done: number; total: number };
 export type StoreNpcItem = { id: number; n: string; c: number };
-export type StoreNpc = { npc: string; items: StoreNpcItem[]; batch?: number };
+// kind 'cipher' = a trust-cipher NPC: items are turned in (learn trusts), not stored. The UI shows a
+// single "Turn In All" action instead of per-item store steppers.
+export type StoreNpc = { npc: string; items: StoreNpcItem[]; batch?: number; kind?: 'cipher' };
 
 // Nomad Moogle zones grant access to Safe / Safe 2 / Locker (and the Delivery Box),
 // the same way a Mog House does, except Storage which needs your actual residence.
@@ -61,6 +63,7 @@ export type NpcLearn = { conn: number; npc: string; option: number; at: number }
 
 export type AugState = { active: boolean; mode?: string; attempts?: number; total?: number; status?: string; results?: Record<string, number>; manual?: boolean; awaitDecision?: boolean; awaitStep?: boolean; item?: string; id?: number; multi?: boolean; step?: number; stepCount?: number; augs?: string[] };
 export type ReforgeState = { active: boolean; phase?: string; step?: number; steps?: number; status?: string; readyAt?: number; awaitStep?: boolean; timing?: string; output?: number; outputs?: number[]; paused?: { steps: number; npc: string } };
+export type UnityState = { active: boolean; phase?: string; status?: string; done?: number; want?: number; target?: number; pieceId?: number; mode?: string };
 export type AugInfo = { cape: string | null; augments?: string[] };
 
 export type BazaarSeller = { name: string; id: number; index: number; dist: number; inrange: boolean };
@@ -68,7 +71,7 @@ export type BazaarItem = { id: number; n: string; price: number; qty: number; ta
 export type BazaarListing = { seller: string; sellerId: number; sellerIndex: number; items: BazaarItem[]; at: number };
 export type MyBazaarItem = { slot: number; id: number; n: string; count: number; listed: boolean; price: number };
 export type BazaarScan = { active: boolean; total: number; done: number; current?: string };
-export type BazaarBuyResult = { conn: number; ok: boolean; name: string; reason: string; at: number };
+export type BazaarBuyResult = { conn: number; ok: boolean; name: string; reason: string; bidx: number; qty: number; at: number };
 
 export type KeyItem = { id: number; n: string };
 
@@ -94,6 +97,7 @@ export type Box = {
   mog?: boolean;
   nomadNear?: boolean;
   ah?: AhState;
+  ahAt?: number;
   dbox?: DboxState;
   dboxStatus?: DboxStatus;
   tradeStatus?: TradeStatus;
@@ -112,6 +116,7 @@ export type Box = {
   store?: StoreProgress;
   aug?: AugState;
   reforge?: ReforgeState;
+  unity?: UnityState;
   augInfo?: AugInfo;
   bzSellers?: BazaarSeller[];
   bzListings?: Record<number, BazaarListing>;
@@ -150,6 +155,8 @@ export type PersistedChar = {
   keyAt?: number;
   cur?: Currency;
   curAt?: number;
+  ah?: AhState;   // last-known auction listings, remembered per character (the game only reveals them at an AH)
+  ahAt?: number;  // when those listings were last captured
   savedAt: number;
 };
 
@@ -184,6 +191,7 @@ export type KnownChar = {
   mog?: boolean;
   nomadNear?: boolean;
   ah?: AhState;
+  ahAt?: number;
   dbox?: DboxState;
   dboxStatus?: DboxStatus;
   tradeStatus?: TradeStatus;
@@ -202,6 +210,7 @@ export type KnownChar = {
   store?: StoreProgress;
   aug?: AugState;
   reforge?: ReforgeState;
+  unity?: UnityState;
   augInfo?: AugInfo;
   bzSellers?: BazaarSeller[];
   bzListings?: Record<number, BazaarListing>;
@@ -251,6 +260,7 @@ type Frame =
   | { t: 'npclearn'; npc: string; option: number }
   | { t: 'aug'; active: boolean; mode?: string; attempts?: number; total?: number; status?: string; results?: Record<string, number>; manual?: boolean; awaitDecision?: boolean; awaitStep?: boolean; multi?: boolean; step?: number; stepCount?: number; augs?: string[]; item?: string; id?: number }
   | { t: 'reforge'; active: boolean; phase?: string; step?: number; steps?: number; status?: string; readyAt?: number; awaitStep?: boolean; timing?: string; output?: number; outputs?: number[]; paused?: { steps: number; npc: string } }
+  | { t: 'unity'; active: boolean; phase?: string; status?: string; done?: number; want?: number; target?: number; pieceId?: number }
   | { t: 'auginfo'; cape: string | null; augments?: string[] }
   | { t: 'bzsellers'; list: BazaarSeller[]; mem?: boolean }
   | { t: 'bzitems'; seller: string | null; id?: number; index?: number; items: BazaarItem[] }
@@ -278,14 +288,14 @@ function rebuild() {
   liveSnapshot = [...byConn.values()].sort((a, b) => a.name.localeCompare(b.name));
   const known = new Map<string, KnownChar>();
   for (const [name, pc] of persisted) {
-    known.set(name, { name, online: false, main: pc.main, sub: pc.sub, zoneName: pc.zoneName, assets: pc.assets, inv: pc.inv, keyItems: pc.keyItems, keyAt: pc.keyAt, cur: pc.cur, curAt: pc.curAt, savedAt: pc.savedAt });
+    known.set(name, { name, online: false, main: pc.main, sub: pc.sub, zoneName: pc.zoneName, assets: pc.assets, inv: pc.inv, keyItems: pc.keyItems, keyAt: pc.keyAt, cur: pc.cur, curAt: pc.curAt, ah: pc.ah, ahAt: pc.ahAt, savedAt: pc.savedAt });
   }
   for (const b of liveSnapshot) {
     const pc = persisted.get(b.name);
     known.set(b.name, {
       name: b.name, id: b.id, online: true, conn: b.conn,
       main: b.main, sub: b.sub, zone: b.zone, zoneName: b.zoneName, px: b.px, py: b.py, assets: b.assets,
-      inv: b.inv ?? pc?.inv, keyItems: b.keyItems ?? pc?.keyItems, keyAt: b.keyAt ?? pc?.keyAt, pool: b.pool, party: b.party, slips: b.slips, org: b.org, orgPlan: b.orgPlan, orgPreview: b.orgPreview, orgDone: b.orgDone, orgOk: b.orgOk, cur: b.cur ?? pc?.cur, curAt: b.curAt ?? pc?.curAt, atah: b.atah, inTown: b.inTown, server: b.server, gil: b.gil, mog: b.mog, nomadNear: b.nomadNear, ah: b.ah, dbox: b.dbox, dboxStatus: b.dboxStatus, tradeStatus: b.tradeStatus, shop: b.shop, npcNear: b.npcNear, fixedNear: b.fixedNear, porter: b.porter, porterNear: b.porterNear, vendorNear: b.vendorNear, convert: b.convert, resupply: b.resupply, pvendor: b.pvendor, pvendorNear: b.pvendorNear, useProg: b.useProg, storeZone: b.storeZone, store: b.store, aug: b.aug, reforge: b.reforge, augInfo: b.augInfo, bzSellers: b.bzSellers, bzListings: b.bzListings, bzMy: b.bzMy, bzScan: b.bzScan, bzMem: b.bzMem, savedAt: pc?.savedAt,
+      inv: b.inv ?? pc?.inv, keyItems: b.keyItems ?? pc?.keyItems, keyAt: b.keyAt ?? pc?.keyAt, pool: b.pool, party: b.party, slips: b.slips, org: b.org, orgPlan: b.orgPlan, orgPreview: b.orgPreview, orgDone: b.orgDone, orgOk: b.orgOk, cur: b.cur ?? pc?.cur, curAt: b.curAt ?? pc?.curAt, atah: b.atah, inTown: b.inTown, server: b.server, gil: b.gil, mog: b.mog, nomadNear: b.nomadNear, ah: b.ah ?? pc?.ah, dbox: b.dbox, dboxStatus: b.dboxStatus, tradeStatus: b.tradeStatus, shop: b.shop, npcNear: b.npcNear, fixedNear: b.fixedNear, porter: b.porter, porterNear: b.porterNear, vendorNear: b.vendorNear, convert: b.convert, resupply: b.resupply, pvendor: b.pvendor, pvendorNear: b.pvendorNear, useProg: b.useProg, storeZone: b.storeZone, store: b.store, aug: b.aug, reforge: b.reforge, unity: b.unity, augInfo: b.augInfo, bzSellers: b.bzSellers, bzListings: b.bzListings, bzMy: b.bzMy, bzScan: b.bzScan, bzMem: b.bzMem, ahAt: b.ah ? Date.now() : pc?.ahAt, savedAt: pc?.savedAt,
     });
   }
   knownSnapshot = [...known.values()].sort((a, b) => (a.online === b.online ? a.name.localeCompare(b.name) : a.online ? -1 : 1));
@@ -481,6 +491,7 @@ function onLine(conn: number, line: string) {
       useProg: carry?.useProg,
       aug: carry?.aug,
       reforge: carry?.reforge,
+      unity: carry?.unity,
       augInfo: carry?.augInfo,
       bzSellers: carry?.bzSellers,
       bzListings: carry?.bzListings,
@@ -561,7 +572,11 @@ function onLine(conn: number, line: string) {
   } else if (f.t === 'autolot') {
     autoLotFeedCb?.(prev?.name, f.on, !!f.all);
   } else if (f.t === 'ah' && prev) {
-    byConn.set(conn, { ...prev, ah: { atah: f.atah, init: f.init, qn: f.qn, slots: f.slots }, lastSeen: Date.now() });
+    const ahState = { atah: f.atah, init: f.init, qn: f.qn, slots: f.slots };
+    byConn.set(conn, { ...prev, ah: ahState, lastSeen: Date.now() });
+    // Remember this character's listings so the All-Characters total covers every toon, not just the one
+    // currently at an auction house. Only snapshot a real (init) load, so an empty pre-load frame can't wipe it.
+    if (f.init) schedulePersist({ name: prev.name, ah: ahState, ahAt: Date.now(), savedAt: Date.now() } as PersistedChar);
     scheduleRebuild();
   } else if (f.t === 'dbox' && prev) {
     byConn.set(conn, { ...prev, dbox: { in: f.in, out: f.out }, lastSeen: Date.now() });
@@ -615,6 +630,8 @@ function onLine(conn: number, line: string) {
   } else if (f.t === 'aug' && prev) {
     byConn.set(conn, { ...prev, aug: { active: f.active, mode: f.mode, attempts: f.attempts, total: f.total, status: f.status, results: f.results, manual: f.manual, awaitDecision: f.awaitDecision, awaitStep: f.awaitStep, multi: f.multi, step: f.step, stepCount: f.stepCount, augs: f.augs, item: f.item, id: f.id }, lastSeen: Date.now() });
     scheduleRebuild();
+  } else if (f.t === 'unity' && prev) {
+    byConn.set(conn, { ...prev, unity: { active: f.active, phase: f.phase, status: f.status, done: f.done, want: f.want, target: f.target, pieceId: f.pieceId }, lastSeen: Date.now() });
   } else if (f.t === 'reforge' && prev) {
     byConn.set(conn, { ...prev, reforge: { active: f.active, phase: f.phase, step: f.step, steps: f.steps, status: f.status, readyAt: f.readyAt, awaitStep: f.awaitStep, timing: f.timing, output: f.output, outputs: f.outputs, paused: f.paused }, lastSeen: Date.now() });
     scheduleRebuild();
@@ -658,7 +675,7 @@ function onLine(conn: number, line: string) {
         scheduleRebuild();
       }
     }
-    pushBzBuy({ conn, ok: f.ok, name: f.name, reason: f.reason, at: Date.now() });
+    pushBzBuy({ conn, ok: f.ok, name: f.name, reason: f.reason, bidx: f.bidx, qty: f.qty, at: Date.now() });
   } else if (f.t === 'npclearn') {
     lastLearn = { conn, npc: f.npc, option: f.option, at: Date.now() };
     learnListeners.forEach((l) => l());
@@ -1276,6 +1293,23 @@ export function awaitSeqAck(seq: number, timeoutMs: number): Promise<SeqAck> {
   });
 }
 
+// The Rust box server binds 127.0.0.1:24233 for the in-game addon. If another Alexandria (or a leftover
+// copy still running in the tray) already holds that port, this window still opens but the game link never
+// comes up, so the addon reports "app not running" even though a window is visible. Poll the bind state so
+// the UI can say so plainly. Defaults to true so a healthy app never flashes a warning on startup.
+export function useIpcBound(): boolean {
+  const [bound, setBound] = useState(true);
+  useEffect(() => {
+    if (!inTauri) return;
+    let alive = true;
+    const tick = async () => { try { const b = await invoke<boolean>('ipc_bound'); if (alive) setBound(b); } catch { /* ignore */ } };
+    void tick();
+    const t = setInterval(tick, 3000);
+    return () => { alive = false; clearInterval(t); };
+  }, []);
+  return bound;
+}
+
 export function moveItem(conn: number, id: number, from: number, to: number, count: number, slot?: number) {
   sendBoxCommand(conn, JSON.stringify({ cmd: 'move', id, from, to, count, ...(slot != null ? { slot } : {}) }));
 }
@@ -1453,7 +1487,7 @@ export function broadcastSync(): Promise<number> { return broadcastBoxCommand(JS
 
 // lotQty: per lot-item target held count (keyed by item name). Auto-lot stops once the character already
 // holds that many. Absent/0 = lot every copy (the old behavior).
-export type PoolRules = { lot: string[]; pass: string[]; drop: string[]; passOnLot?: boolean; autoLot?: boolean; lotQty?: Record<string, number> };
+export type PoolRules = { lot: string[]; pass: string[]; drop: string[]; passOnLot?: boolean; passRareOwned?: boolean; autoLot?: boolean; lotQty?: Record<string, number> };
 
 export function lotPool(conn: number, index: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'lot', index })); }
 export function passPool(conn: number, index: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'pass', index })); }
@@ -1464,7 +1498,7 @@ let autoLotFeedCb: ((name: string | undefined, on: boolean, all: boolean) => voi
 // poolRules registers here so a //ax autolot toggle typed in-game flows back to the
 // desktop (updates the UI + persists), without bridge importing poolRules (circular).
 export function onAutoLotFeed(cb: (name: string | undefined, on: boolean, all: boolean) => void) { autoLotFeedCb = cb; }
-export function setPoolRules(conn: number, r: PoolRules) { sendBoxCommand(conn, JSON.stringify({ cmd: 'poolrules', lot: r.lot, pass: r.pass, drop: r.drop, passOnLot: r.passOnLot, autoLot: r.autoLot, lotqty: r.lotQty ?? {} })); }
+export function setPoolRules(conn: number, r: PoolRules) { sendBoxCommand(conn, JSON.stringify({ cmd: 'poolrules', lot: r.lot, pass: r.pass, drop: r.drop, passOnLot: r.passOnLot, passRareOwned: r.passRareOwned, autoLot: r.autoLot, lotqty: r.lotQty ?? {} })); }
 export function broadcastPoolRules(r: PoolRules) { return broadcastBoxCommand(JSON.stringify({ cmd: 'poolrules', ...r })); }
 
 export function setResupply(conn: number, on: boolean, items: { name: string; min: number }[], options: number[]) {
@@ -1522,6 +1556,10 @@ export function augStepContinue(conn: number) { sendBoxCommand(conn, JSON.string
 export type ReforgeStepPlan = { npc: string; input_id: number; output_id: number; ingredients: { id: number; qty: number }[]; currency?: { name: string; qty: number }[]; pending?: boolean; resume_after?: number; advance?: boolean };
 export function reforgeStart(conn: number, plan: { steps: ReforgeStepPlan[] }) { sendBoxCommand(conn, JSON.stringify({ cmd: 'reforge', ...plan })); }
 export function reforgeStop(conn: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'reforgestop' })); }
+export function unityReinforce(conn: number, a: { id: number; lus: number; count: number; target: number; bag?: number; slot?: number }) { sendBoxCommand(conn, JSON.stringify({ cmd: 'unityreinforce', id: a.id, lus: a.lus, count: a.count, target: a.target, ...(a.bag != null ? { bag: a.bag } : {}), ...(a.slot != null ? { slot: a.slot } : {}) })); }
+// Open (unlock) a brand-new +1 piece: trades the piece + one lustreless + 30,000 Unity Accolades at a concierge.
+export function unityOpen(conn: number, a: { id: number; lus: number; bag?: number; slot?: number }) { sendBoxCommand(conn, JSON.stringify({ cmd: 'unityopen', id: a.id, lus: a.lus, ...(a.bag != null ? { bag: a.bag } : {}), ...(a.slot != null ? { slot: a.slot } : {}) })); }
+export function unityStop(conn: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'unitystop' })); }
 export function reforgeStep(conn: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'reforgestep' })); }
 // Collect a reforge that was already traded (the piece is in flight at the NPC) but whose queue was lost.
 export function reforgeCollect(conn: number, npc: string, outputId?: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'reforgecollect', npc, ...(outputId ? { output_id: outputId } : {}) })); }
@@ -1534,6 +1572,9 @@ export function reforgeRemGet(conn: number, chapter: number, count: number) { se
 export function augStopAll(): Promise<number> { return broadcastBoxCommand(JSON.stringify({ cmd: 'augstop' })); }
 
 export function storeRequest(conn: number, npc: string, id: number, want: number, drop = false) { sendBoxCommand(conn, JSON.stringify({ cmd: 'store', npc, id, want, ...(drop ? { drop: true } : {}) })); }
+// Turn in every trust cipher held, at the trust NPC the character is standing next to. The addon does
+// all held ciphers in one run (trade -> echo the menu param -> consume), so no item/count is passed.
+export function cipherTurnIn(conn: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'ciphers' })); }
 export function storeStop(conn: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'storestop' })); }
 
 export function bzOpen(conn: number, id: number, index: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'bzopen', id, index })); }
@@ -1545,7 +1586,7 @@ export function bzScan(conn: number) { sendBoxCommand(conn, JSON.stringify({ cmd
 export function bzDeepScan(conn: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'bzdeepscan' })); }
 export function bzWatch(conn: number, on: boolean) { sendBoxCommand(conn, JSON.stringify({ cmd: 'bzwatch', on })); }
 export function bzScanStop(conn: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'bzscanstop' })); }
-export function bzBuy(conn: number, a: { sellerid: number; sellerindex: number; bidx: number; id: number; price: number; qty: number }) { sendBoxCommand(conn, JSON.stringify({ cmd: 'bzbuy', ...a })); }
+export function bzBuy(conn: number, a: { sellerid: number; sellerindex: number; items: { bidx: number; id: number; price: number; qty: number }[] }) { sendBoxCommand(conn, JSON.stringify({ cmd: 'bzbuy', sellerid: a.sellerid, sellerindex: a.sellerindex, items: a.items })); }
 
 export function broadcastBoxCommand(line: string): Promise<number> {
   return inTauri ? invoke<number>('broadcast_box_command', { line }).catch(() => 0) : Promise.resolve(0);

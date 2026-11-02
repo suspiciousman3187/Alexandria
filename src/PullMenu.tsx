@@ -1,14 +1,17 @@
 import { useMemo, useState, useEffect, type ReactNode } from 'react';
-import { type KnownChar, type Slip } from './bridge';
+import { type KnownChar, type Slip, useAvailableIcons, useAddonInfo } from './bridge';
 import { useSettings } from './settings';
+import { deriveGearswapData } from './gearset/gearsetFiles';
+import { gearsetItemIds } from './gearset/gearsetPullIds';
 import { slipLabel } from './slipLabels';
 import { useItemTags } from './itemTags';
 import { usePullRules, setPullRules, newPullId, type PullRule } from './pullRules';
 import { Modal } from './overlay';
 import OperationReport, { type ReportMove } from './OperationReport';
 import { Button, Toggle } from './ui';
-import { JOB_LIST } from './itemNames';
-import { SRC_BAGS, DEST_BAGS, bagLabel, destLabel, planPull, firePull, destsOf, destCapacity, type PullCtx } from './pullEngine';
+import { IconInner } from './atlasIcon';
+import { JOB_LIST, itemCategory, ITEM_CATEGORIES, type ItemCategory } from './itemNames';
+import { SRC_BAGS, DEST_BAGS, bagLabel, destLabel, planPull, planMoves, firePull, destsOf, destCapacity, type PullCtx, type PlannedMove } from './pullEngine';
 
 export default function PullButton({ char, conn, compact }: { char?: KnownChar; conn?: number; compact?: boolean }) {
   const [open, setOpen] = useState(false);
@@ -33,8 +36,12 @@ export default function PullButton({ char, conn, compact }: { char?: KnownChar; 
 
 function PullModal({ char, conn, onClose }: { char: KnownChar; conn?: number; onClose: () => void }) {
   const rules = usePullRules();
-  const { tags, assign } = useItemTags();
+  const { tags, assign, assignAug } = useItemTags();
+  const iconSet = useAvailableIcons();
   const [edit, setEdit] = useState<PullRule | null>(null);
+  const [expanded, setExpanded] = useState<string | null>(null); // preset id whose matched-item preview is open
+  const [collapsedCats, setCollapsedCats] = useState<Set<string>>(new Set()); // "<ruleId>:<slot>" headers collapsed in the preview
+  const toggleCat = (key: string) => setCollapsedCats((prev) => { const n = new Set(prev); n.has(key) ? n.delete(key) : n.add(key); return n; });
   const [note, setNote] = useState('');
   type RunState = { name: string; planned: number; blocked: string; moves: ReportMove[]; before: Map<number, Map<number, number>>; dests: number[]; startedAt: number; lastChange: number; landed: number; done: boolean };
   const [run, setRun] = useState<RunState | null>(null);
@@ -58,10 +65,25 @@ function PullModal({ char, conn, onClose }: { char: KnownChar; conn?: number; on
   }, [char.inv, run?.done, run?.startedAt]);
 
   const exp = useSettings().experimentalFeatures;
-  const ctx: PullCtx = { assign, exp };
+  // Resolve the current job's GearSwap set items, but only while a preset actually uses gearsetOnly.
+  // undefined = loading/not needed, null = no gear file for this job. gearsetOnly rules pull nothing
+  // until this is a real set, so a missing/unreadable file never degrades to "pull everything".
+  const addon = useAddonInfo();
+  const gearswapBase = useSettings().gearswapPath || (addon?.dir ? deriveGearswapData(addon.dir) : '');
+  const anyGearset = rules.some((r) => r.gearsetOnly);
+  const [gearIds, setGearIds] = useState<Set<number> | null | undefined>(undefined);
+  useEffect(() => {
+    if (!anyGearset || !gearswapBase || !char.main) { setGearIds(null); return; }
+    let alive = true;
+    setGearIds(undefined);
+    void gearsetItemIds(gearswapBase, char.name, char.main).then((s) => { if (alive) setGearIds(s); });
+    return () => { alive = false; };
+  }, [anyGearset, gearswapBase, char.name, char.main]);
+
+  const ctx: PullCtx = { assign, assignAug, gearIds: gearIds ?? null, exp };
   const planFor = useMemo(() => (r: PullRule) => planPull(char, r, ctx),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [char.inv, char.slips, char.mog, assign, exp]);
+    [char.inv, char.slips, char.mog, assign, assignAug, gearIds, exp]);
 
   const execPull = (r: PullRule) => {
     if (conn == null) { setNote('This character is offline. Connect it in-game to pull.'); return; }
@@ -121,22 +143,75 @@ function PullModal({ char, conn, onClose }: { char: KnownChar; conn?: number; on
               const srcs = [...r.bags.map(bagLabel), ...(slipSrc ? [slipSrc] : [])];
               const destStr = destsOf(r).map(destLabel).join(' > ');
               const full = p.bagOK.length > destCapacity(char, r);
+              const isExp = expanded === r.id;
               return (
-                <div key={r.id} className="flex items-center gap-3 rounded-xl border border-line bg-surface px-3 py-2.5">
-                  <div className="min-w-0 flex-1">
-                    <div className="text-[13px] font-semibold text-fg truncate">{r.name}</div>
-                    <div className="text-[10.5px] text-fg-4 truncate mt-0.5">
-                      {r.tags.map((t) => tags.find((x) => x.id === t)?.name ?? '?').join(', ') || 'no tags'} · from {srcs.join(', ') || 'no source'} · into {destStr}{r.jobOnly ? ' · current job' : ''}
+                <div key={r.id} className="rounded-xl border border-line bg-surface">
+                  <div className="flex items-center gap-2.5 px-2 py-2.5">
+                    <button onClick={() => setExpanded(isExp ? null : r.id)} title={isExp ? 'Hide the matching pieces' : 'Show the pieces this will pull'} aria-expanded={isExp}
+                      className="shrink-0 w-5 h-5 grid place-items-center rounded text-fg-4 hover:text-fg transition-colors">
+                      <svg viewBox="0 0 24 24" className={`w-3.5 h-3.5 transition-transform ${isExp ? 'rotate-90' : ''}`} fill="none" stroke="currentColor" strokeWidth={2.4} strokeLinecap="round" strokeLinejoin="round"><path d="m9 6 6 6-6 6" /></svg>
+                    </button>
+                    <div className="min-w-0 flex-1">
+                      <div className="text-[13px] font-semibold text-fg truncate">{r.name}</div>
+                      <div className="text-[10.5px] text-fg-4 truncate mt-0.5">
+                        {r.tags.map((t) => tags.find((x) => x.id === t)?.name ?? '?').join(', ') || 'no tags'} · from {srcs.join(', ') || 'no source'} · into {destStr}{r.jobOnly ? ' · current job' : ''}{r.jobSpecific ? ' · job-specific' : ''}{r.gearsetOnly ? ' · gearswap set' : ''}
+                      </div>
                     </div>
+                    {full && <span className="shrink-0 text-[9px] font-bold uppercase text-amber-300" title="Not enough room across the destination bags for everything; add more fallback bags or free space">Full</span>}
+                    {mogPending && <span className="shrink-0 text-[9px] font-bold uppercase text-amber-300" title="Some matches are in Mog House storage; go to a Mog House or Nomad Moogle">Mog</span>}
+                    {getPending && <span className="shrink-0 text-[9px] font-bold uppercase text-sky-300" title={`${p.needGet.length} slip(s) aren't in your bags${r.autoGetSlips ? '; Pull will fetch them first' : '; turn on Auto-fetch or get them first'}`}>Slip</span>}
+                    {slipPending && <span className="shrink-0 text-[9px] font-bold uppercase text-amber-300" title="Some pieces are on Storage Slips; stand by the Porter Moogle to retrieve them">Porter</span>}
+                    <span className={`shrink-0 text-[11px] font-bold tabular-nums ${n ? 'text-emerald-300' : 'text-fg-4'}`}>{n} ready</span>
+                    <Button variant="primary" size="sm" onClick={() => execPull(r)} disabled={n === 0 && !(getPending && r.autoGetSlips)}>Pull</Button>
+                    <button onClick={() => setEdit(r)} title="Edit" className="shrink-0 w-7 h-7 grid place-items-center rounded-md text-fg-4 hover:text-fg hover:bg-field transition-colors">✎</button>
+                    <button onClick={() => del(r.id)} title="Delete" className="shrink-0 w-7 h-7 grid place-items-center rounded-md text-fg-4 hover:text-rose-300 hover:bg-rose-500/10 transition-colors">🗑</button>
                   </div>
-                  {full && <span className="shrink-0 text-[9px] font-bold uppercase text-amber-300" title="Not enough room across the destination bags for everything; add more fallback bags or free space">Full</span>}
-                  {mogPending && <span className="shrink-0 text-[9px] font-bold uppercase text-amber-300" title="Some matches are in Mog House storage; go to a Mog House or Nomad Moogle">Mog</span>}
-                  {getPending && <span className="shrink-0 text-[9px] font-bold uppercase text-sky-300" title={`${p.needGet.length} slip(s) aren't in your bags${r.autoGetSlips ? '; Pull will fetch them first' : '; turn on Auto-fetch or get them first'}`}>Slip</span>}
-                  {slipPending && <span className="shrink-0 text-[9px] font-bold uppercase text-amber-300" title="Some pieces are on Storage Slips; stand by the Porter Moogle to retrieve them">Porter</span>}
-                  <span className={`shrink-0 text-[11px] font-bold tabular-nums ${n ? 'text-emerald-300' : 'text-fg-4'}`}>{n} ready</span>
-                  <Button variant="primary" size="sm" onClick={() => execPull(r)} disabled={n === 0 && !(getPending && r.autoGetSlips)}>Pull</Button>
-                  <button onClick={() => setEdit(r)} title="Edit" className="shrink-0 w-7 h-7 grid place-items-center rounded-md text-fg-4 hover:text-fg hover:bg-field transition-colors">✎</button>
-                  <button onClick={() => del(r.id)} title="Delete" className="shrink-0 w-7 h-7 grid place-items-center rounded-md text-fg-4 hover:text-rose-300 hover:bg-rose-500/10 transition-colors">🗑</button>
+                  {isExp && (() => {
+                    // Exactly what this preset would move right now, with the SAME routing the pull uses (its
+                    // "current job" filter applied, each piece's real source bag and destination resolved).
+                    const plan = planMoves(char, r, { assign, assignAug, gearIds: gearIds ?? null, exp });
+                    if (!plan.moves.length) {
+                      const gsNote = r.gearsetOnly ? (gearIds === undefined ? ' (reading GearSwap sets…)' : gearIds === null ? ` (no GearSwap file found for ${char.main ?? 'this job'})` : '') : '';
+                      return <div className="px-3 pb-2.5 pt-1.5 border-t border-line text-[11px] text-fg-4">Nothing matches right now{r.jobOnly ? ` for ${char.main ?? 'this job'}` : ''}{gsNote}.</div>;
+                    }
+                    // Group by equipment slot so the preview reads like a gear set, in slot order (weapon -> back).
+                    const byCat = new Map<ItemCategory, PlannedMove[]>();
+                    for (const m of plan.moves) { const c = itemCategory(m.id); const g = byCat.get(c) ?? []; g.push(m); byCat.set(c, g); }
+                    const groups = ITEM_CATEGORIES.filter((c) => byCat.has(c.id))
+                      .map((c) => ({ id: c.id, label: c.label, moves: byCat.get(c.id)!.sort((a, b) => a.n.localeCompare(b.n)) }));
+                    const total = plan.moves.reduce((s, m) => s + m.count, 0);
+                    return (
+                      <div className="px-2 pb-2 pt-1.5 border-t border-line flex flex-col gap-1.5 max-h-[320px] overflow-y-auto overscroll-contain">
+                        <div className="px-1 text-[9px] font-bold uppercase tracking-[0.1em] text-fg-4">Will pull {total} piece{total === 1 ? '' : 's'} · {groups.length} slot{groups.length === 1 ? '' : 's'}</div>
+                        {groups.map((g) => {
+                          const key = `${r.id}:${g.id}`;
+                          const open = !collapsedCats.has(key);
+                          const slotN = g.moves.reduce((s, m) => s + m.count, 0);
+                          return (
+                            <div key={g.id} className="flex flex-col gap-0.5">
+                              <button onClick={() => toggleCat(key)} aria-expanded={open} className="le-tap flex items-center gap-2 px-1 py-0.5 rounded hover:bg-field/50 transition-colors">
+                                <svg viewBox="0 0 24 24" className={`w-3 h-3 shrink-0 text-fg-4 transition-transform ${open ? 'rotate-90' : ''}`} fill="none" stroke="currentColor" strokeWidth={2.6} strokeLinecap="round" strokeLinejoin="round"><path d="m9 6 6 6-6 6" /></svg>
+                                <span className="text-[9px] font-bold uppercase tracking-[0.12em] text-accent/80">{g.label}</span>
+                                <span className="flex-1 h-px" style={{ background: 'var(--color-line)' }} />
+                                <span className="text-[9px] font-semibold tabular-nums text-fg-4">{slotN}</span>
+                              </button>
+                              {open && g.moves.map((m, i) => (
+                                <div key={`${m.id}:${m.from}:${i}`} className="flex items-center gap-2 pl-5 pr-1.5 py-1 rounded hover:bg-field/60">
+                                  <span className="w-6 h-6 rounded bg-field grid place-items-center overflow-hidden shrink-0"><IconInner id={m.id} size={24} name={m.n} assets={char.assets} bmpHas={m.id > 0 && iconSet.has(m.id)} /></span>
+                                  <span className="text-[11.5px] text-fg-2 truncate flex-1">{m.n}{m.count > 1 ? <span className="text-fg-4"> ×{m.count}</span> : null}</span>
+                                  <span className="shrink-0 inline-flex items-center gap-1 text-[9px] font-semibold">
+                                    <span className="text-fg-4">{m.fromLabel.replace('Mog ', '')}</span>
+                                    <svg viewBox="0 0 24 24" className="w-2.5 h-2.5 text-fg-4/70" fill="none" stroke="currentColor" strokeWidth={2.5} strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14" /><path d="m13 6 6 6-6 6" /></svg>
+                                    <span className="text-emerald-300/90">{m.toLabel.replace('Mog ', '')}</span>
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    );
+                  })()}
                 </div>
               );
             })}
@@ -243,13 +318,21 @@ function PullEditor({ rule, tags, slips, onCancel, onSave }: { rule: PullRule; t
       </Section>
 
       <Section title="Options">
-        <label className="flex items-center gap-2.5 text-[12px] text-fg-2">
+        <label className="flex items-start gap-2.5">
           <Toggle on={r.jobOnly} onChange={(v) => setR({ ...r, jobOnly: v })} />
-          Only pull gear the current job can equip
+          <span className="text-[12px] text-fg-2 leading-5">Only pull gear the current job can equip</span>
         </label>
-        <label className="flex items-center gap-2.5 text-[12px] text-fg-2">
+        <label className="flex items-start gap-2.5">
+          <Toggle on={!!r.jobSpecific} onChange={(v) => setR({ ...r, jobSpecific: v })} />
+          <span className="text-[12px] text-fg-2 leading-5">Only pull Job-specific gear<span className="block text-[11px] text-fg-4 leading-4">Excludes all-job costume/generic multi-job equipment</span></span>
+        </label>
+        <label className="flex items-start gap-2.5">
+          <Toggle on={!!r.gearsetOnly} onChange={(v) => setR({ ...r, gearsetOnly: v })} />
+          <span className="text-[12px] text-fg-2 leading-5">Only pull gear from the character's GearSwap job file<span className="block text-[11px] text-fg-4 leading-4">Reads this character's current-job .lua; pulls only pieces a set uses</span></span>
+        </label>
+        <label className="flex items-start gap-2.5">
           <Toggle on={!!r.autoOnJobChange} onChange={(v) => setR({ ...r, autoOnJobChange: v })} />
-          <span>Auto-pull on job change <span className="text-fg-4">{r.slips ? '(where the Porter and these bags are reachable, e.g. a Mog Garden)' : '(where these source bags are reachable)'}</span></span>
+          <span className="text-[12px] text-fg-2 leading-5">Auto-pull gear on Job Change<span className="block text-[11px] text-fg-4 leading-4">{r.slips ? 'When the Porter and these bags are reachable, e.g. a Mog Garden' : 'When these source bags are reachable'}</span></span>
         </label>
         {r.autoOnJobChange && (
           <div className="ml-9 flex flex-col gap-1.5">

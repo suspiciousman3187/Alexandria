@@ -145,6 +145,7 @@ export default function DuplicateView() {
   const [incRare, setIncRare] = useSticky('dupe.rare', false);
   const [incEx, setIncEx] = useSticky('dupe.ex', false);
   const [incUnstack, setIncUnstack] = useSticky('dupe.unstack', false);
+  const [incOffline, setIncOffline] = useSticky('dupe.offline', true);
   const [expanded, setExpanded] = useSticky('dupe.expanded', [] as string[]);
   const [section, setSection] = useSticky<'consolidate' | 'exceptions' | 'pref'>('dupe.section', 'consolidate');
   const [mode, setMode] = useSticky<'item' | 'char'>('dupe.view', 'char');
@@ -232,6 +233,7 @@ export default function DuplicateView() {
     const search = q.trim().toLowerCase();
     const byId = new Map<number, { n: string; f: number; assets?: string; holders: Map<string, { conn?: number; count: number }> }>();
     for (const c of withInv) {
+      if (!incOffline && !c.online) continue;
       const per = new Map<number, { n: string; f: number; count: number }>();
       for (const bg of c.inv!) for (const it of bg.items) {
         const e = per.get(it.id);
@@ -257,7 +259,7 @@ export default function DuplicateView() {
     }
     out.sort((a, b) => b.holders.length - a.holders.length || b.total - a.total || a.n.localeCompare(b.n));
     return out;
-  }, [withInv, q, incRare, incEx, incUnstack, showMeds, acById, ignoreSet, tagFilter, tagStore]);
+  }, [withInv, q, incRare, incEx, incUnstack, incOffline, showMeds, acById, ignoreSet, tagFilter, tagStore]);
 
   const toggleExpand = (name: string) => setExpanded(expanded.includes(name) ? expanded.filter((n) => n !== name) : [...expanded, name]);
   const toggleSel = (id: number) => setSel((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
@@ -314,6 +316,7 @@ export default function DuplicateView() {
                 <button onClick={() => setMode('item')} className={`px-2.5 py-1 text-[11px] font-bold rounded transition-colors ${mode === 'item' ? 'bg-accent text-on-accent' : 'text-fg-3 hover:text-fg'}`}>ITEM</button>
               </div>
               <div className="ml-auto flex items-center justify-end gap-1.5">
+                {mode === 'item' && <Chip on={incOffline} onChange={setIncOffline}>OFFLINE</Chip>}
                 <Chip on={incRare} onChange={setIncRare}>RA</Chip>
                 <Chip on={incEx} onChange={setIncEx}>EX</Chip>
                 <Chip on={incUnstack} onChange={setIncUnstack}>UNSTACKABLE</Chip>

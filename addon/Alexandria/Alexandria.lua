@@ -89,6 +89,7 @@ ah_busy = false
 ah_busy_t = 0
 AH_BUSY_TIMEOUT = 15
 ah_status_pending = false -- a queued sale-status request is the in-flight AH action; its 0x4C 0x0A reply releases ah_busy
+ah_verify_until = 0 -- os.clock() deadline: a status request from the desktop is followed by a per-slot check of listed slots
 ah_err_pending = nil
 AH_ERR_DEFER = 2.0
 ah_last_bid = nil
@@ -1917,7 +1918,7 @@ end
 local function le4(v) v = math.floor(v); return string.char(v % 256, math.floor(v / 256) % 256, math.floor(v / 65536) % 256, math.floor(v / 16777216) % 256) end
 local function le2(v) v = math.floor(v); return string.char(v % 256, math.floor(v / 256) % 256) end
 
-function ah_request_status()
+function ah_request_status(verify)
     if not packets_ok then return false end
     -- Ask only for the sale-status of all 7 slots (0x4E cmd 0x0A, slot 0xFF). The server answers with the
     -- 0x4C cmd 0x0A updates ah_handle_incoming reads. We DELIBERATELY do NOT send cmd 0x05 ("open AH menu")
@@ -1925,8 +1926,24 @@ function ah_request_status()
     -- opens the window to read status or to sell; it just listens to 0x4C. Match that.
     local work = string.char(0x4E, 0x1E, 0, 0, 0x0A, 0xFF, 0, 0) .. string.rep('\0', 52)
     ah_status_pending = true
+    -- When the desktop asked for the listings, follow the status reply with a per-slot check (see below).
+    if verify then ah_verify_until = os.clock() + 10 end
     pcall(windower.packets.inject_outgoing, 0x4E, work)
     return true
+end
+
+-- The all-slots status reply keeps reporting a finished auction as "On auction". The server only moves a slot
+-- to Sold / Not Sold when that slot is asked about on its own (0x4E cmd 0x0D), which is what the game's auction
+-- window does when it opens. Ask the same way for every slot still marked On auction, without opening the window.
+function ah_check_listed_slots()
+    if not packets_ok or not ah_box or not ah_usable() then return end
+    for s = 0, 6 do
+        local b = ah_box[s]
+        if b and b.status == 'On auction' then
+            local check = string.char(0x4E, 0x1E, 0, 0, 0x0D, s, 0, 0) .. string.rep('\0', 52)
+            pcall(windower.packets.inject_outgoing, 0x4E, check)
+        end
+    end
 end
 
 local DBOX_OP_DELAY = 1.0
@@ -5085,6 +5102,11 @@ function ah_handle_incoming(data)
         -- mid-sell must not release a listing still waiting on its 0x0B confirm). AH_DELAY still spaces the
         -- next action, which gives the remaining slot replies time to land before the first sell reads ah_box.
         if ah_status_pending then ah_status_pending = false; ah_busy = false end
+        -- Last slot of a status reply we asked for: every slot is known now, so check the ones still listed.
+        if r == 1 and data:byte(6) == 7 and os.clock() <= ah_verify_until then
+            ah_verify_until = 0
+            ah_check_listed_slots()
+        end
     elseif t == 0x0B then
         if r == 0x01 then
             ah_busy = false
@@ -6357,13 +6379,13 @@ local function dispatch(line)
         -- with the Market view open. Just report we are not at an AH so the UI stops asking.
         if ah_usable() then
             -- Status only, no window pop (was ah_open_menu(), which faked the server's open-counter reply).
-            ah_enqueue(function() return ah_request_status() end)
+            ah_enqueue(function() return ah_request_status(true) end)
         else
             queue_send(build_ah())
         end
     elseif msg.cmd == 'ahslots' then
         if ah_usable() then
-            ah_enqueue(function() return ah_request_status() end)
+            ah_enqueue(function() return ah_request_status(true) end)
         else
             queue_send(build_ah())
         end

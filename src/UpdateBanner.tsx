@@ -43,7 +43,7 @@ export default function UpdateBanner() {
     if (!getStartupCheck() || !addon?.dir) return;
     let cancelled = false;
     (async () => {
-      const r = await checkAddonUpdate(addon.dir, addon.version);
+      const r = await checkAddonUpdate(addon.dir, null);
       if (!cancelled && r.kind === 'available' && localStorage.getItem(SKIP_ADDON_KEY) !== r.manifest.version) {
         setAddonManifest(r.manifest);
       }
@@ -55,7 +55,13 @@ export default function UpdateBanner() {
   // relaunches. If only the addon has an update there is no relaunch, so we show the reload hint.
   const update = async () => {
     setBusy(true); setErr('');
-    const addonArg = addon?.dir && addonManifest ? { dir: addon.dir, manifest: addonManifest } : null;
+    let addonArg = addon?.dir && addonManifest ? { dir: addon.dir, manifest: addonManifest } : null;
+    if (app && !addonArg && addon?.dir) {
+      try {
+        const r = await checkAddonUpdate(addon.dir, null);
+        if (r.kind === 'available') addonArg = { dir: addon.dir, manifest: r.manifest };
+      } catch { setErr(''); }
+    }
     try {
       const res = await installAll(app, addonArg, (phase, pct) => {
         setLabel(phase === 'addon' ? 'Updating addon…' : pct === 0 ? 'Starting…' : `Downloading ${pct}%`);

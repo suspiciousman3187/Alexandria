@@ -2,8 +2,11 @@ import { useEffect, useState, type ReactNode } from 'react';
 import { getVersion } from '@tauri-apps/api/app';
 import { Modal } from './overlay';
 import { inTauri } from './bridge';
+import { ADDON_MANIFEST_URL } from './updater';
 
 const KEY = 'alex_whatsnew';
+const SHOWN_KEY = 'alex_whatsnew_shown';
+const APP_MANIFEST_URL = ADDON_MANIFEST_URL.replace('addon.json', 'latest.json');
 
 // After an auto-update installs and relaunches, the previous version stashed the
 // release notes under KEY. On the new version's first launch we show them once,
@@ -12,29 +15,46 @@ export default function WhatsNew() {
   const [data, setData] = useState<{ version: string; body: string } | null>(null);
   useEffect(() => {
     if (!inTauri) return;
-    let raw: string | null = null;
-    try { raw = localStorage.getItem(KEY); } catch { return; }
-    if (!raw) return;
-    let parsed: { version?: string; body?: string };
-    try { parsed = JSON.parse(raw); } catch { try { localStorage.removeItem(KEY); } catch { /* ignore */ } return; }
     void (async () => {
       let cur = '';
-      try { cur = await getVersion(); } catch { /* ignore */ }
-      try { localStorage.removeItem(KEY); } catch { /* ignore */ }
-      if (parsed.version && parsed.body && (!cur || parsed.version === cur)) {
-        setData({ version: parsed.version, body: parsed.body });
+      try { cur = await getVersion(); } catch { return; }
+      if (!cur) return;
+
+      let raw: string | null = null;
+      try { raw = localStorage.getItem(KEY); } catch { raw = null; }
+      if (raw) {
+        try { localStorage.removeItem(KEY); } catch { void 0; }
+        try {
+          const p = JSON.parse(raw) as { version?: string; body?: string };
+          if (p.version && p.body && p.version === cur) {
+            try { localStorage.setItem(SHOWN_KEY, cur); } catch { void 0; }
+            setData({ version: p.version, body: p.body });
+            return;
+          }
+        } catch { void 0; }
       }
+
+      let last: string | null = null;
+      try { last = localStorage.getItem(SHOWN_KEY); } catch { last = null; }
+      if (last === cur) return;
+      try {
+        const resp = await fetch(APP_MANIFEST_URL, { cache: 'no-cache' });
+        if (!resp.ok) return;
+        const m = (await resp.json()) as { version?: string; notes?: string };
+        try { localStorage.setItem(SHOWN_KEY, cur); } catch { void 0; }
+        if (m.version === cur && m.notes) setData({ version: cur, body: m.notes });
+      } catch { void 0; }
     })();
   }, []);
   if (!data) return null;
   return (
-    <Modal onClose={() => setData(null)} panelClass="w-[min(94vw,540px)]">
+    <Modal onClose={() => setData(null)} panelClass="w-[min(94vw,440px)]">
       {(close) => (
         <div className="flex flex-col max-h-[86vh]">
           {/* Header: version pill + "Release Notes" on a soft accent wash. */}
-          <div className="px-4 py-3.5 border-b border-line bg-accent/10">
+          <div className="px-4 py-3.5 border-b border-line bg-accent/10 flex items-center gap-2.5">
             <span className="inline-block rounded-full bg-accent text-on-accent px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wide tabular-nums">Alexandria v{data.version}</span>
-            <div className="text-[13px] font-semibold text-fg mt-1.5">Release Notes</div>
+            <div className="text-[13px] font-semibold text-fg">Release Notes</div>
           </div>
           <div className="px-4 py-3 overflow-y-auto"><Notes text={data.body} /></div>
           <div className="px-4 py-3 border-t border-line flex justify-end">

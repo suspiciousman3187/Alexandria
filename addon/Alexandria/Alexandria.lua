@@ -1,6 +1,6 @@
 _addon.name = 'Alexandria'
 _addon.author = 'Noirblanc'
-_addon.version = '0.0.33'
+_addon.version = '0.0.34'
 _addon.commands = {'alexandria', 'alex', 'ax'}
 
 local socket = require('socket')
@@ -241,7 +241,7 @@ if icon_ok and windower.dir_exists and not windower.dir_exists(icon_dir) then
 end
 
 local function queue_icon(id)
-    if not icon_ok or not icon_passive or not id or id == 0 then return end
+    if not icon_ok or not id or id == 0 then return end
     if icon_queue[id] then return end
     if windower.file_exists and windower.file_exists(icon_prefix .. id .. '.bmp') then return end
     icon_queue[id] = true
@@ -6162,6 +6162,12 @@ local function dispatch(line)
         rf_pause()
     elseif msg.cmd == 'reforgeresume' then
         rf_resume()
+    elseif msg.cmd == 'reforgediscard' then
+        -- Throw away a saved/paused queue (e.g. the gear was picked up manually, so resume can never match).
+        -- Clears the on-disk paused file AND any stalled runtime object so the view fully resets.
+        if rf and rf.active then rf_stop() end
+        rf_clear_paused()
+        alex_chat(207, '[Alexandria] paused reforge discarded', 'progress')
     elseif msg.cmd == 'remget' and msg.chapter ~= nil then
         rem_start(msg)
     elseif msg.cmd == 'remstop' then
@@ -7308,7 +7314,12 @@ do
         -- accept unconditionally -- never gate on any_match, or a keep with no criteria set (all "(any)")
         -- would reject the very roll the user chose to keep.
         aug.status = 'Kept roll ' .. (aug.attempts or 0)
-        pcall(accept_npc)
+        pcall(function()
+            packets.inject(packets.new('outgoing', 0x05B, {
+                ['Target'] = aug.npc_id, ['Option Index'] = aug.accept_option, ['Target Index'] = aug.npc_index,
+                ['Automated Message'] = false, ['Zone'] = aug.zone, ['Menu ID'] = aug.menu,
+            }))
+        end)
         alex_chat(207, '[Alexandria] kept roll: ' .. results_text(aug.results or {}), 'progress')
         aug_dirty = true
     end

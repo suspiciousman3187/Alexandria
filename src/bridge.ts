@@ -1567,6 +1567,9 @@ export function reforgeCollect(conn: number, npc: string, outputId?: number) { s
 // disk so it survives leaving the NPC/zone and even an addon reload; reforgeResume picks it back up.
 export function reforgePause(conn: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'reforgepause' })); }
 export function reforgeResume(conn: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'reforgeresume' })); }
+// Discard a saved/paused queue outright (gear picked up manually, wrong plan, etc.). Works anywhere -- you're
+// throwing the queue away, so it does NOT require standing at the NPC the way Resume does.
+export function reforgeDiscard(conn: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'reforgediscard' })); }
 // Retrieve `count` Rem's Tale Ch.`chapter` (1-10) from Monisette's storage into inventory.
 export function reforgeRemGet(conn: number, chapter: number, count: number) { sendBoxCommand(conn, JSON.stringify({ cmd: 'remget', chapter, count })); }
 export function augStopAll(): Promise<number> { return broadcastBoxCommand(JSON.stringify({ cmd: 'augstop' })); }

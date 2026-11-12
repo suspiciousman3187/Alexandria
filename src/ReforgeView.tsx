@@ -1,6 +1,6 @@
 import { useMemo, useState, useEffect, useLayoutEffect, useRef, useContext, createContext, useSyncExternalStore, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { useKnownCharacters, useAvailableIcons, reforgeStart, reforgeStop, reforgeStep, reforgeRemGet, reforgePause, reforgeResume, ahBuy, useAhCatalog, slipRetrieve, type KnownChar, type ReforgeState, type ReforgeStepPlan } from './bridge';
+import { useKnownCharacters, useAvailableIcons, reforgeStart, reforgeStop, reforgeStep, reforgeRemGet, reforgePause, reforgeResume, reforgeDiscard, ahBuy, useAhCatalog, slipRetrieve, type KnownChar, type ReforgeState, type ReforgeStepPlan } from './bridge';
 import { IconInner } from './atlasIcon';
 import { logicalRect, logicalViewport } from './uiZoom';
 import { useItemHover, type HoverMeta } from './ItemTooltip';
@@ -744,6 +744,8 @@ function ReforgeResumePanel({ rf, conn, near }: { rf?: ReforgeState | null; conn
         <div className="text-[12px] font-bold text-amber-200">Paused reforge</div>
         <div className="text-[10.5px] text-fg-4">{rf.paused.steps} step{rf.paused.steps === 1 ? '' : 's'} saved at {npcName(npc)}{atNpc ? '' : ` · go to ${npcName(npc)} to resume`}</div>
       </div>
+      {conn != null && <button onClick={() => reforgeDiscard(conn)} title="Discard this saved queue -- use when you picked the gear up manually or no longer want it"
+        className="shrink-0 text-[11.5px] font-bold rounded-lg px-3 py-1.5 border border-line bg-field text-fg-3 hover:text-fg hover:border-line-2 transition-colors">Cancel</button>}
       {conn != null && <button onClick={() => reforgeResume(conn)} disabled={!atNpc} title={atNpc ? 'Resume where you left off' : `Stand near ${npcName(npc)} to resume`}
         className="shrink-0 text-[11.5px] font-bold rounded-lg px-3.5 py-1.5 bg-accent text-on-accent enabled:hover:bg-accent-hover disabled:opacity-40 transition-colors">Resume</button>}
     </div>

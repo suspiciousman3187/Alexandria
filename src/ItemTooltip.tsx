@@ -36,7 +36,7 @@ export type HoverMeta = { id: number; n?: string; c?: number; ms?: number; f?: n
 // click-through (pointer-events: none) so moving onto the next item never gets blocked by the card.
 // `variant`: 'full' is the complete card; 'condensed' is a stats + jobs preview for hover in the gear grid.
 type CardVariant = 'full' | 'condensed';
-type HoverState = { meta: HoverMeta; rect: DOMRect; anchor: Element; pinned: boolean; variant: CardVariant } | null;
+type HoverState = { meta: HoverMeta; rect: DOMRect; anchor: Element; pinned: boolean; variant: CardVariant; sticky?: boolean } | null;
 
 type CardApi = {
   open: (m: HoverMeta, rect: DOMRect, anchor: Element) => void;
@@ -44,6 +44,7 @@ type CardApi = {
   hoverOpen: (m: HoverMeta, rect: DOMRect, anchor: Element, variant?: CardVariant) => void;
   hoverHide: () => void;
   cancelHide: () => void;
+  engage: () => void;
 };
 const Ctx = createContext<CardApi | null>(null);
 
@@ -78,8 +79,9 @@ export function ItemHoverProvider({ children }: { children: ReactNode }) {
       open: (meta, rect, anchor) => { clear(); setSt((cur) => (cur && cur.anchor === anchor && cur.pinned ? null : { meta, rect, anchor, pinned: true, variant: 'full' })); },
       hide: () => { clear(); setSt(null); },
       hoverOpen: (meta, rect, anchor, variant = 'full') => { clear(); setSt({ meta, rect, anchor, pinned: false, variant }); },
-      hoverHide: () => { clear(); hideT.current = window.setTimeout(() => setSt((cur) => (cur && cur.pinned ? cur : null)), 160); },
+      hoverHide: () => { clear(); hideT.current = window.setTimeout(() => setSt((cur) => (cur && (cur.pinned || cur.sticky || cardRef.current?.matches(':hover')) ? cur : null)), 220); },
       cancelHide: clear,
+      engage: () => { clear(); setSt((cur) => (cur && !cur.pinned && !cur.sticky ? { ...cur, sticky: true } : cur)); },
     };
   }, []);
 
@@ -94,7 +96,7 @@ export function ItemHoverProvider({ children }: { children: ReactNode }) {
     <Ctx.Provider value={api}>
       {children}
       <AnimatePresence>
-        {st && <Card key={st.meta.id} meta={st.meta} rect={st.rect} pinned={st.pinned} variant={st.variant} cardRef={cardRef} onClose={api.hide} onCardEnter={api.cancelHide} onCardLeave={api.hoverHide} />}
+        {st && <Card key={st.meta.id} meta={st.meta} rect={st.rect} pinned={st.pinned} variant={st.variant} cardRef={cardRef} onClose={api.hide} onCardEnter={api.cancelHide} onCardLeave={api.hoverHide} onEngage={api.engage} />}
       </AnimatePresence>
     </Ctx.Provider>
   );
@@ -238,7 +240,7 @@ function DescLine({ line }: { line: string }) {
   return <div className="text-fg-2">{tokenize(line)}</div>;
 }
 
-function Card({ meta, rect, pinned, variant, onClose, cardRef, onCardEnter, onCardLeave }: { meta: HoverMeta; rect: DOMRect; pinned: boolean; variant: CardVariant; onClose: () => void; cardRef: React.RefObject<HTMLDivElement | null>; onCardEnter?: () => void; onCardLeave?: () => void }) {
+function Card({ meta, rect, pinned, variant, onClose, cardRef, onCardEnter, onCardLeave, onEngage }: { meta: HoverMeta; rect: DOMRect; pinned: boolean; variant: CardVariant; onClose: () => void; cardRef: React.RefObject<HTMLDivElement | null>; onCardEnter?: () => void; onCardLeave?: () => void; onEngage?: () => void }) {
   const icons = useAvailableIcons();
   const desc = useItemDescription(meta.id);
   const chars = useKnownCharacters();
@@ -394,17 +396,18 @@ function Card({ meta, rect, pinned, variant, onClose, cardRef, onCardEnter, onCa
   return createPortal(
     <motion.div
       ref={cardRef}
-      onMouseEnter={pinned ? onCardEnter : undefined}
-      onMouseLeave={pinned ? onCardLeave : undefined}
+      onMouseEnter={onCardEnter}
+      onMouseLeave={onCardLeave}
+      onMouseDown={onEngage}
+      onClick={(e) => e.stopPropagation()}
       className="fixed z-[80] rounded-lg border border-line bg-popover shadow-2xl p-3 overscroll-contain"
       style={{
         left,
-        // Pinned cards scroll normally; hover cards shift up to fit (fit is only measured when !pinned).
         top: !pinned && fit ? fit.top : top,
         width: W,
         maxHeight: !pinned && fit && !fit.scroll ? undefined : maxHeight,
         overflowY: !pinned && fit && !fit.scroll ? 'visible' : 'auto',
-        pointerEvents: pinned ? 'auto' : 'none',
+        pointerEvents: 'auto',
         visibility: pinned || fit ? 'visible' : 'hidden',
       }}
       initial={{ opacity: 0, scale: 0.97, y: -3 }}
